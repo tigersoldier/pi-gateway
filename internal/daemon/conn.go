@@ -31,6 +31,9 @@ const (
 	// outQueueDepth bounds a connection's pending outgoing frames; a client
 	// that stops reading is disconnected (docs/design.md §7).
 	outQueueDepth = 1024
+	// replayQueueReserve keeps room in the out queue for the frames that follow
+	// a replay (gw_replay_done and the first live records).
+	replayQueueReserve = 16
 	// closeAckWait and closeFlushWait bound the best-effort final flush so an
 	// explanatory gw_error is not lost when the socket is dropped.
 	closeAckWait   = 250 * time.Millisecond
@@ -416,7 +419,8 @@ func (c *conn) handleHello(raw []byte) error {
 	var actor *session.Actor
 	var attachErr error
 	if h.Session != "" {
-		actor, attachErr = c.d.attach(h.Session, spec, cwd)
+		ref := c.Ref()
+		actor, attachErr = c.d.attach(h.Session, spec, cwd, &ref)
 	}
 	// Subscribe before reading the replay window: records published between the
 	// two must land in the subscriber buffer (the pump's watermark drops the
@@ -437,6 +441,12 @@ func (c *conn) handleHello(raw []byte) error {
 		var ok bool
 		replay, ok = actor.Replay(h.Resume.SinceSeq)
 		resync = !ok
+	}
+	// A window the out queue cannot hold would close the client as a slow
+	// consumer mid-replay, so it is treated as unreplayable and answered with
+	// a snapshot instead (docs/protocol.md §6).
+	if replayRequested && !resync && len(replay) > outQueueDepth-replayQueueReserve {
+		resync, replay = true, nil
 	}
 	if resync && actor != nil && c.Has(protocol.CapObserve) && h.Resume.LeafEntryID != "" {
 		// The cursor is not replayable, but the client's durable transcript may
@@ -491,8 +501,8 @@ func (c *conn) handleHello(raw []byte) error {
 	// records the window already covered.
 	var watermark uint64
 	switch {
-	case resync && !c.Has(protocol.CapObserve):
-		// No observe: attach without replaying or snapshotting the transcript.
+	// resync implies observe: both the replay request and the oversize check
+	// are gated on it, so there is no "resync without a transcript" case.
 	case resync:
 		if snap, err := actor.Snapshot(); err != nil {
 			c.sendError(protocol.CodeResyncRequired, err.Error())
@@ -729,7 +739,8 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 		c.sendResponse(id, "switch_session", false, protocol.CodeUnknownSession, "missing sessionPath", nil)
 		return
 	}
-	actor, err := c.d.attach(path, c.piSpec, c.cwd)
+	ref := c.Ref()
+	actor, err := c.d.attach(path, c.piSpec, c.cwd, &ref)
 	if err != nil {
 		c.d.metrics.Inc(metrics.AttachFailures)
 		c.sendResponse(id, "switch_session", false, errorCode(err), err.Error(), nil)

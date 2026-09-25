@@ -346,10 +346,13 @@ func (a *Actor) SessionID() string {
 func (a *Actor) Attached() int { return int(a.attached.Load()) }
 
 // Live reports whether the session has a running pi process. The daemon uses
-// it to decide whether a registered actor is still usable.
+// it to decide whether a registered actor must be replaced, so a reloading
+// actor counts as live: it has no *usable* pi for a moment, but it owns the
+// session and will come back. Replacing it instead would run two pi processes
+// on one session file (docs/design.md §3.2, §4.4).
 func (a *Actor) Live() bool {
 	switch a.State() {
-	case stateReady, stateStarting:
+	case stateReady, stateStarting, stateRestarting:
 		return true
 	}
 	return false

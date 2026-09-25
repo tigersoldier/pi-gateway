@@ -358,7 +358,6 @@ type Row struct {
 	MessageCount int                      `json:"messageCount"`
 	LastActivity string                   `json:"lastActivity,omitempty"`
 	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
-	Tags         map[string]string        `json:"tags,omitempty"`
 	Clients      []protocol.ClientSummary `json:"clients,omitempty"`
 }
 
@@ -511,7 +510,7 @@ func spawnCwd(path, clientCwd string) string {
 // attach resolves a target path or name, joining a live session or spawning
 // pi for a hibernated/absent one. The returned actor is live but not yet bound
 // to the client.
-func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string) (*session.Actor, error) {
+func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protocol.ClientRef) (*session.Actor, error) {
 	canon, err := d.resolveTarget(target)
 	if err != nil {
 		return nil, err
@@ -541,7 +540,7 @@ func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string) (*session.
 		return nil, &attachError{protocol.CodeSpawnParamConflict,
 			fmt.Sprintf("session is live with a different value for %s", key)}
 	}
-	d.applyRuntime(e, spec)
+	d.applyRuntime(e, spec, by)
 	return e.actor, nil
 }
 
@@ -714,7 +713,7 @@ func (d *Daemon) allActorsLocked() []*session.Actor {
 
 // applyRuntime applies runtime-applicable parameters to a live session, if the
 // requested values differ from the session's current state.
-func (d *Daemon) applyRuntime(e *entry, spec *piargs.Spec) {
+func (d *Daemon) applyRuntime(e *entry, spec *piargs.Spec, by *protocol.ClientRef) {
 	rt := spec.RuntimeValues()
 	if len(rt) == 0 {
 		return
@@ -755,8 +754,11 @@ func (d *Daemon) applyRuntime(e *entry, spec *piargs.Spec) {
 	if len(cmds) == 0 {
 		return
 	}
-	ref := protocol.ClientRef{ClientID: "daemon", Kind: "daemon", Name: "pi-gatewayd"}
-	_ = e.actor.ApplyRuntime(cmds, &ref)
+	if by == nil {
+		// No requesting client (internal/administrative attach).
+		by = &protocol.ClientRef{ClientID: "daemon", Kind: "daemon", Name: "pi-gatewayd"}
+	}
+	_ = e.actor.ApplyRuntime(cmds, by)
 }
 
 // appendChange marshals one runtime RPC and appends it to cmds.
