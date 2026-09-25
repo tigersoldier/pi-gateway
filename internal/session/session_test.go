@@ -19,7 +19,7 @@ func TestMain(m *testing.M) {
 
 func TestHubSequencesFansOutAndReplays(t *testing.T) {
 	h := NewHub(3, "s_test")
-	sub := h.Subscribe("c_1", 8)
+	sub := h.Subscribe("c_1", SubOptions{Buffer: 8})
 	defer sub.Close()
 
 	for i := 0; i < 3; i++ {
@@ -58,7 +58,7 @@ func TestHubSequencesFansOutAndReplays(t *testing.T) {
 
 func TestHubDropsSlowSubscriber(t *testing.T) {
 	h := NewHub(8, "s")
-	sub := h.Subscribe("slow", 1)
+	sub := h.Subscribe("slow", SubOptions{Buffer: 1})
 	h.Publish(protocol.Record{Raw: []byte(`{"type":"a"}`), Type: "a"})
 	h.Publish(protocol.Record{Raw: []byte(`{"type":"b"}`), Type: "b"})
 	if !sub.Dead() {
@@ -121,8 +121,8 @@ func (c *fakeClient) ID() string                 { return c.id }
 func (c *fakeClient) Kind() string               { return c.kind }
 func (c *fakeClient) Name() string               { return c.name }
 func (c *fakeClient) Has(capability string) bool { return c.caps[capability] }
-func (c *fakeClient) Info() protocol.ClientInfo {
-	return protocol.ClientInfo{Name: c.name, Kind: c.kind}
+func (c *fakeClient) Summary() protocol.ClientSummary {
+	return protocol.ClientSummary{ClientID: c.id, Name: c.name, Kind: c.kind}
 }
 func (c *fakeClient) Ref() protocol.ClientRef {
 	return protocol.ClientRef{ClientID: c.id, Kind: c.kind, Name: c.name}
@@ -180,7 +180,7 @@ func TestActorPromptThenQueue(t *testing.T) {
 	client := &fakeClient{id: "c_1", kind: "test", name: "one",
 		caps: map[string]bool{"prompt": true, "observe": true}}
 	a.Attach(client)
-	sub := a.Subscribe(client.id, 256)
+	sub := a.Subscribe(client.id, SubOptions{Buffer: 256})
 
 	if err := a.Submit(promptCmd(client, "r1", "first")); err != nil {
 		t.Fatalf("submit 1: %v", err)
@@ -223,7 +223,7 @@ func TestActorClearQueueReturnsDaemonPrompts(t *testing.T) {
 	client := &fakeClient{id: "c_1", kind: "test", name: "one",
 		caps: map[string]bool{"prompt": true, "observe": true}}
 	a.Attach(client)
-	sub := a.Subscribe(client.id, 256)
+	sub := a.Subscribe(client.id, SubOptions{Buffer: 256})
 
 	if err := a.Submit(promptCmd(client, "r1", "running")); err != nil {
 		t.Fatal(err)
@@ -310,7 +310,7 @@ func dump(recs []protocol.Record) string {
 
 func TestHubUnsubscribeRemovesSubscriber(t *testing.T) {
 	h := NewHub(4, "s")
-	sub := h.Subscribe("c_1", 2)
+	sub := h.Subscribe("c_1", SubOptions{Buffer: 2})
 	h.Unsubscribe("c_1")
 	if got := len(h.subs); got != 0 {
 		t.Fatalf("subscriber map still has %d entries", got)
@@ -327,7 +327,7 @@ func TestActorRejectedPromptReleasesTurn(t *testing.T) {
 	a := startTestActor(t, Params{SessionPath: filepath.Join(t.TempDir(), "s.jsonl"), HubCapacity: 256})
 	client := &fakeClient{id: "c_1", kind: "test", name: "one", caps: map[string]bool{"prompt": true}}
 	a.Attach(client)
-	sub := a.Subscribe(client.id, 256)
+	sub := a.Subscribe(client.id, SubOptions{Buffer: 256})
 
 	if err := a.Submit(promptCmd(client, "r1", "rejected")); err != nil {
 		t.Fatal(err)
@@ -361,7 +361,7 @@ func TestActorStaleUIResponseAfterCrash(t *testing.T) {
 	client := &fakeClient{id: "c_1", kind: "test", name: "one",
 		caps: map[string]bool{"prompt": true, "ui": true}}
 	a.Attach(client)
-	sub := a.Subscribe(client.id, 256)
+	sub := a.Subscribe(client.id, SubOptions{Buffer: 256})
 
 	if err := a.Submit(promptCmd(client, "r1", "dialog")); err != nil {
 		t.Fatal(err)
@@ -388,7 +388,8 @@ func TestActorStaleUIResponseAfterCrash(t *testing.T) {
 		t.Fatal("fake pi never asked for a dialog")
 	}
 
-	// Answering the stale dialog must not panic the actor; it gets ui_stale.
+	// Answering the stale dialog after a crash must not panic the actor; the
+	// session is gone, so the answer is rejected with session_crashed.
 	if err := a.Submit(ClientCommand{Client: client, LocalID: "ui-1", Type: "extension_ui_response",
 		Raw: []byte(`{"type":"extension_ui_response","id":"ui-1","confirmed":true}`)}); err != nil {
 		t.Fatal(err)
@@ -396,7 +397,68 @@ func TestActorStaleUIResponseAfterCrash(t *testing.T) {
 	recs := collectUntil(t, sub, func(rec protocol.Record) bool {
 		return rec.Type == "response" && strings.Contains(string(rec.Raw), `"id":"ui-1"`)
 	}, 5*time.Second)
-	if !strings.Contains(dump(recs), protocol.CodeUIStale) {
-		t.Fatalf("expected ui_stale, got %s", dump(recs))
+	if !strings.Contains(dump(recs), protocol.CodeSessionCrashed) {
+		t.Fatalf("expected session_crashed, got %s", dump(recs))
+	}
+}
+
+func TestLossySubscriberLagsInsteadOfDying(t *testing.T) {
+	h := NewHub(16, "s")
+	sub := h.Subscribe("lossy", SubOptions{Buffer: 2, AllowLossy: true})
+	for i := 0; i < 3; i++ {
+		h.Publish(protocol.Record{Raw: []byte(`{"type":"message_update"}`), Type: "message_update"})
+	}
+	if sub.Dead() {
+		t.Fatal("a lossy subscriber must not be dropped for dropping deltas")
+	}
+	// The buffer held the first two records; the third was dropped for lag.
+	first, second := <-sub.C(), <-sub.C()
+	if first.Seq != 1 || second.Seq != 2 {
+		t.Fatalf("buffered seqs = %d, %d; want 1, 2", first.Seq, second.Seq)
+	}
+	// The next delivery is preceded by a marker naming the dropped range.
+	h.Publish(protocol.Record{Raw: []byte(`{"type":"message_update"}`), Type: "message_update"})
+	lag := <-sub.C()
+	if lag.Type != "gw_lag" {
+		t.Fatalf("expected a gw_lag marker, got %v", lag.Type)
+	}
+	if got, want := protocol.NumField(lag.Raw, "oldestSeq"), 3.0; got != want {
+		t.Fatalf("gw_lag oldestSeq = %v, want %v", got, want)
+	}
+	if got, want := protocol.NumField(lag.Raw, "headSeq"), 3.0; got != want {
+		t.Fatalf("gw_lag headSeq = %v, want %v", got, want)
+	}
+	if rec := <-sub.C(); rec.Seq != 4 {
+		t.Fatalf("record after the marker = %d, want 4", rec.Seq)
+	}
+	if sub.Dead() {
+		t.Fatal("subscriber must still be alive after the lag report")
+	}
+}
+
+func TestLossySubscriberStillDiesOnUnsendableTerminalEvent(t *testing.T) {
+	h := NewHub(16, "s")
+	sub := h.Subscribe("lossy", SubOptions{Buffer: 1, AllowLossy: true})
+	h.Publish(protocol.Record{Raw: []byte(`{"type":"message_update"}`), Type: "message_update"})
+	h.Publish(protocol.Record{Raw: []byte(`{"type":"message_update"}`), Type: "message_update"})
+	// Terminal events are never dropped: the client is disconnected instead so
+	// it can reconnect and resync.
+	h.Publish(protocol.Record{Raw: []byte(`{"type":"message_end"}`), Type: "message_end"})
+	if !sub.Dead() {
+		t.Fatal("a lossy subscriber must still be dropped when a terminal event cannot be queued")
+	}
+}
+
+func TestReplayRejectsCursorAheadOfHead(t *testing.T) {
+	h := NewHub(16, "s")
+	if _, ok := h.Replay(0); !ok {
+		t.Fatal("a fresh log must accept cursor 0")
+	}
+	h.Publish(protocol.Record{Raw: []byte(`{"type":"agent_start"}`), Type: "agent_start"})
+	if _, ok := h.Replay(5); ok {
+		t.Fatal("a cursor beyond the head belongs to another log instance and must resync")
+	}
+	if _, ok := h.Replay(1); !ok {
+		t.Fatal("cursor 1 is the head and must be replayable")
 	}
 }

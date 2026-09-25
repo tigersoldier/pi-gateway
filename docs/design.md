@@ -302,8 +302,10 @@ A created session spawns:
 pi --mode rpc --session <file> [accepted piArgs...]
 ```
 
-Sessions created with `--no-session` are supported but marked `ephemeral`:
-they cannot be re-adopted after they stop.
+Sessions created with `--no-session` are supported but **ephemeral**: pi
+reports no session file, so they have no path to attach to, they cannot be
+re-adopted after they stop, and `gw_new_session` refuses them. The `ephemeral`
+marker itself is not surfaced in the catalog yet.
 
 ### 4.2 Attach and rebinding
 
@@ -311,7 +313,8 @@ they cannot be re-adopted after they stop.
 then:
 
 1. joins the live actor if the session is warm;
-2. loads the session file (spawn + `--session`) if it is hibernated or absent;
+2. loads the session file (spawn + `--session`, using the attaching client's
+   accepted parameters) if it is hibernated or absent;
 3. rebinds the requesting connection;
 4. synthesizes pi's response (`success` + `data.cancelled`) instead of
    forwarding it to the current pi.
@@ -345,7 +348,8 @@ refreshes state/history but does not restart pi. Restarting pi is explicit:
   running, unless `force: true`.
 - On success pi is stopped and respawned with the session's recorded spawn
   config; attached clients get `gw_session_state{state:"restarting"}` then
-  `{state:"ready"}` and resync.
+  `{state:"ready"}` and refresh their own view (the event log and ring survive
+  the restart, so no replay or snapshot is forced).
 
 ### 4.5 Daemon restart
 
@@ -568,9 +572,11 @@ pi emits `extension_ui_request` and blocks until a matching
   used.
 - **Fire-and-forget** methods (`notify`, `setStatus`, `setWidget`, `setTitle`,
   `set_editor_text`) are broadcast to all clients.
-- The broker keeps `pendingUI map[piRequestID]{winner, deadline}`; late or
+- The broker keeps `pendingUI map[piRequestID]{winner, request}`; late or
   non-owner responses are dropped with `ui_stale`. If the winner disconnects
-  before answering, the broker reassigns to the next candidate.
+  before answering, the broker reassigns to the next candidate; with nobody
+  left, pi's own dialog timeout resolves the default. The broker does not keep
+  its own deadline.
 - `extension_ui_request.id` is preserved; only the response routing is managed.
 
 ---
@@ -589,10 +595,13 @@ pi emits `extension_ui_request` and blocks until a matching
 |---|---|
 | `observe` | receive events; `get_*` queries |
 | `interject` | `steer` |
-| `prompt` | `prompt`, `follow_up` |
+| `prompt` | `prompt`, `follow_up`, `new_session`, `fork`/`clone` |
 | `ui` | answer extension UI dialogs |
-| `control` | `gw_reload_session`, session administration |
-| `admin` | provision sessions/config |
+| `control` | `gw_reload_session` |
+| `admin` | `gw_new_session` (provision sessions/config) |
+
+`observe` covers `gw_list_sessions` and receiving events. Per-command `get_*`
+checks are not enforced yet; that lands with token roles in M3.
 
 - **Kind is informational only** (`pilish`, `integration`, `bot`, `observer`);
   it never changes policy. Integration-specific capability handling and
@@ -641,13 +650,13 @@ internal/catalog/      session catalog: file scan + live index, name resolution
 internal/client/       bridge: gateway <-> raw pi, id restore, gw_* filtering
 internal/piargs/       accepted pi parameter parsing (shared daemon <-> client)
 internal/fakepi/       fake pi used by the end-to-end tests
+internal/gwtest/       shared daemon harness for end-to-end tests
 internal/testutil/     test helpers: build fake pi, raw protocol client
 ```
 
-M1 implements this layout. The prototype that predated the settled design
-(a single binary with `serve`/`connect` subcommands and floor arbitration) has
-been removed. `internal/catalog` (name resolution and the session catalog)
-arrives with M2.
+M1 and M2 implement this layout. The prototype that predated the settled
+design (a single binary with `serve`/`connect` subcommands and floor
+arbitration) has been removed.
 
 ---
 
@@ -656,7 +665,10 @@ arrives with M2.
 - **Protocol conformance**: run pi RPC commands through the daemon and diff
   forwarded events against a direct pi run.
 - **Ordering**: property test that every subscriber observes the same `gw_seq`
-  order with no gaps under randomized concurrency.
+  order under randomized concurrency. Coalescing deliberately skips
+  intermediate sequences (a merged delta carries the newest `gw_seq`), so the
+  property is monotonicity plus replayed-window completeness, not contiguity;
+  a raw event diff against pi is therefore only valid with coalescing off.
 - **Replay / resync**: reconnect at random `seq`; assert reconstructed state
   matches a fresh `get_messages`; test `gw_snapshot` after eviction.
 - **Queue**: N clients race to prompt; assert FIFO with author/kind tags, no
@@ -685,10 +697,10 @@ arrives with M2.
    daemon-owned queue; spawn-param conflict checks and runtime-parameter
    application; replay and `gw_snapshot` resync; bridge on stdio; hibernation
    and orphan reaping.
-2. **M2 — sessions and multi-client.** Catalog and name resolution;
-   `gw_new_session`; `gw_reload_session`; `fork`/`clone` policy; extension UI
-   broker; presence and `gw_state_changed`; kind tagging; backpressure and
-   coalescing.
+2. **M2 — sessions and multi-client (implemented).** Catalog and name
+   resolution; `gw_new_session`; `gw_reload_session`; `fork`/`clone` policy;
+   extension UI broker; presence and `gw_state_changed`; kind tagging;
+   backpressure and coalescing.
 3. **M3 — operations.** systemd user unit; separate loopback HTTP debug
    listener (status/metrics/catalog) sharing the token; token roles/capability
    provisioning; structured logging and metrics.

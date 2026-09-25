@@ -288,3 +288,31 @@ func HasMessageEnd(frames []map[string]any, text string) bool {
 	}
 	return false
 }
+
+// WriteSession writes a session file (one JSON entry per line), creating
+// parent directories. It is the shared writer for catalog and end-to-end
+// session fixtures.
+func WriteSession(t *testing.T, path string, lines ...any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	for _, line := range lines {
+		raw, err := json.Marshal(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(append(raw, '\n'))
+	}
+	if err := os.WriteFile(path, []byte(buf.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// SessionHeader builds the mandatory first entry of a session file.
+func SessionHeader(id, cwd, timestamp string) map[string]any {
+	return map[string]any{
+		"type": "session", "version": 3, "id": id, "cwd": cwd, "timestamp": timestamp,
+	}
+}

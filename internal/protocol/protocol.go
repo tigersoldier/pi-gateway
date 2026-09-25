@@ -188,16 +188,7 @@ func Stamp(raw []byte, fields map[string]any) ([]byte, error) {
 // RewriteID returns a copy of raw with its "id" field replaced. An empty id
 // removes the field.
 func RewriteID(raw []byte, id string) ([]byte, error) {
-	var obj map[string]any
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf("protocol: rewrite id: %w", err)
-	}
-	if id == "" {
-		delete(obj, "id")
-	} else {
-		obj["id"] = id
-	}
-	return json.Marshal(obj)
+	return RewriteCommand(raw, id, "")
 }
 
 // RestoreID removes a client namespace prefix from raw's id. It is a no-op
@@ -285,6 +276,38 @@ func DataField(raw []byte) json.RawMessage {
 	return obj.Data
 }
 
+// LagFrame builds a gw_lag marker naming the range of records that was
+// dropped for a lossy client. It carries no gw_seq: it is a control signal,
+// not a log record.
+func LagFrame(oldestSeq, headSeq uint64) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"type":      "gw_lag",
+		"oldestSeq": oldestSeq,
+		"headSeq":   headSeq,
+	})
+}
+
+// PiState is the subset of pi's get_state payload the gateway depends on.
+type PiState struct {
+	SessionFile   string `json:"sessionFile"`
+	SessionName   string `json:"sessionName"`
+	SessionID     string `json:"sessionId"`
+	ThinkingLevel string `json:"thinkingLevel"`
+	Model         struct {
+		ID       string `json:"id"`
+		Provider string `json:"provider"`
+	} `json:"model"`
+}
+
+// ParsePiState decodes a get_state response (or a bare state payload).
+func ParsePiState(raw []byte) PiState {
+	var st PiState
+	if err := json.Unmarshal(DataField(raw), &st); err != nil {
+		_ = json.Unmarshal(raw, &st)
+	}
+	return st
+}
+
 // BoolField returns a top-level boolean field, or def when absent.
 func BoolField(raw []byte, name string, def bool) bool {
 	var obj map[string]any
@@ -296,4 +319,15 @@ func BoolField(raw []byte, name string, def bool) bool {
 		return def
 	}
 	return v
+}
+
+// NumField returns a top-level numeric field, or 0 when absent or not a
+// number.
+func NumField(raw []byte, name string) float64 {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return 0
+	}
+	n, _ := obj[name].(float64)
+	return n
 }

@@ -113,6 +113,24 @@ func Parse(args []string) (*Spec, error) {
 	return s, nil
 }
 
+// SetName sets the session name, replacing any --name the caller passed. It
+// is used by gw_new_session, whose explicit name field wins over piArgs.
+func (s *Spec) SetName(name string) {
+	s.Values[KeyName] = []string{name}
+	out := s.Args[:0]
+	for i := 0; i < len(s.Args); i++ {
+		flag, _, hasInline := SplitFlag(s.Args[i])
+		if key, ok := valueFlags[flag]; ok && key == KeyName {
+			if !hasInline {
+				i++ // skip the value as well
+			}
+			continue
+		}
+		out = append(out, s.Args[i])
+	}
+	s.Args = append(out, "--name", name)
+}
+
 // SplitFlag splits "--flag=value" into ("--flag", "value", true). A flag
 // without '=' returns ("--flag", "", false).
 func SplitFlag(arg string) (flag, value string, hasValue bool) {

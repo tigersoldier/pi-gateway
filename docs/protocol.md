@@ -11,14 +11,14 @@ This document is the client-facing wire protocol for the settled design in
 - Every decision for this draft is settled; the one deliberately provisional
   behavior is noted in §6 (mid-turn attach) and will be revisited after
   implementation.
-- **Implementation status.** M1 is implemented: handshake/auth, token/port
-  discovery, lazy session creation, attach/rebind by path, `new_session`, the
-  daemon queue, replay (`liveOnly` / `resume.sinceSeq`), `gw_snapshot`, and
-  hibernation/reaping. The catalog (§3.2), `gw_new_session` (§3.3),
-  `gw_reload_session` (§3.6), `fork`/`clone` (§3.8), name resolution, and
-  backpressure coalescing are M2: until they land, a name target answers
-  `unknown_session` and the unimplemented `gw_*` controls answer
-  `not_supported`. See README → *Implementation status*.
+- **Implementation status.** M1 and M2 are implemented: handshake/auth,
+  token/port discovery, lazy session creation, attach/rebind by path **or
+  name**, `new_session`, the catalog (`gw_list_sessions`), `gw_new_session`,
+  `gw_reload_session`, `fork`/`clone` policy, the extension UI broker, the
+  daemon queue, replay (`liveOnly` / `resume.sinceSeq`) and durable resume
+  (`resume.leafEntryId`), `gw_snapshot`, coalescing with `allowLossy`/`gw_lag`,
+  and hibernation/reaping. Per-command `get_*` capability checks and token
+  roles are M3. See README → *Implementation status*.
 
 ---
 
@@ -141,19 +141,29 @@ message.
   Omit it for the fresh-session/rebind flow (pilish does this).
 - `piArgs` carries the pi parameters the UI was invoked with (already filtered
   by the client to the accepted set; see §4.3).
-- `resume.sinceSeq` requests replay after that sequence; `resume.leafEntryId`
-  enables durable resync after a daemon restart. **M1 note:** `leafEntryId` and
-  `allowLossy` are accepted but not yet acted on (durable resync and lossy
-  backpressure are M2); an evicted `sinceSeq` triggers `resyncRequired` plus
-  `gw_snapshot`.
+- `resume.sinceSeq` requests replay after that sequence. The cursor is
+  unreplayable when it was evicted from the ring **or** lies beyond the log
+  head (which means it belongs to a previous log instance, e.g. before a
+  daemon restart); the daemon then sets `resyncRequired` plus `gw_snapshot`.
+- `resume.leafEntryId` enables durable resume: when the cursor is unreplayable
+  but the id equals the session file's durable leaf, the client's transcript is
+  already complete, so the daemon attaches live without a snapshot. `gw_seq`
+  numbering restarts per session when the daemon restarts, so clients that
+  persist state must send `leafEntryId` to avoid an unnecessary snapshot.
+- `allowLossy` lets the daemon drop non-terminal records for this client
+  instead of dropping the connection; it then reports the gap with `gw_lag`
+  (§7).
 - `liveOnly: true` attaches at the current head without replay (the bridge
   default). `resume` is ignored when `liveOnly` is set.
 - `kind` is informational and tagged on events, queue entries, presence, and
   catalog entries. It never changes policy. Authority is capability-based.
 - An absent or empty `client.capabilities` list is treated as the full set
-  (the default daemon-generated token grants it). In M1 the daemon enforces
-  `prompt`, `interject`, and `ui`; full capability/role provisioning lands in
-  M3.
+  (the default daemon-generated token grants it). The daemon enforces
+  `prompt` (`prompt`, `follow_up`, `new_session`, `fork`/`clone`),
+  `interject` (`steer`), `ui` (answering dialogs), `observe`
+  (`gw_list_sessions`), `control` (`gw_reload_session`), and `admin`
+  (`gw_new_session`). Per-command `get_*` checks and full role provisioning
+  land with M3.
 
 ### `gw_welcome` (daemon → client)
 
@@ -255,7 +265,7 @@ Response data:
 
 `live` means a pi process is attached; non-live sessions exist only as files.
 `createdBy` carries the creating client's identity for explicitly created
-sessions, so an integration can list/delete its own.
+sessions, so an integration can list its own.
 
 ### 3.3 Creating a session
 
@@ -286,7 +296,10 @@ Attach is pi's `switch_session`, intercepted by the daemon:
   loads it if hibernated, and **rebinds the connection** (hub subscription and
   command target).
 - If the session has no live pi process, the daemon spawns one with the
-  session's recorded spawn config and the file.
+  requester's accepted parameters and the file. The daemon remembers a warm
+  session's spawn configuration for conflict detection only while it is
+  registered; a hibernated session has no persisted record (decision 6), so
+  its next attach supplies the parameters.
 - The response is pi-shaped and synthesized by the daemon, not forwarded to the
   current pi:
 
@@ -329,8 +342,8 @@ daemon operation:
 
 ### 3.7 New session (`new_session`)
 
-pi's `new_session` is intercepted. The daemon creates a new session (with the
-requester's recorded spawn config) and **rebinds only the requesting
+pi's `new_session` is intercepted. The daemon creates a new session with the
+requester's accepted parameters and **rebinds only the requesting
 connection** to it. Other clients stay on the previous session and receive no
 state change.
 
@@ -443,7 +456,8 @@ rejected with `bad_frame`.
   - runtime-applicable parameters (`--model`, `--provider`, `--thinking`,
     `--name`) are applied via RPC and change **shared** session state; this is
     session-global, and every client is notified with `gw_state_changed`;
-  - spawn-only parameters are compared to the session's recorded spawn config:
+  - spawn-only parameters are compared to the warm session's recorded spawn
+    config:
     **identical values are no-ops; a differing value fails the attach** with
     `spawn_param_conflict` (naming the parameter). A parameter the request does
     not mention is not a conflict: the session keeps its recorded value. This
@@ -495,6 +509,12 @@ clients receive a copy tagged with `gw_owner`.
 | `gw_error` | `{code, message}` | protocol-level error |
 | `gw_pong` | `{}` | liveness |
 
+`gw_lag{oldestSeq, headSeq}` names the **first and last dropped record**
+(unlike `gw_welcome`'s ring bounds of the same name). `gw_presence` currently
+emits `join` and `leave`; `update` is reserved for future identity changes.
+`gw_session_state{state:"stopped"}` is published just before a session's
+subscribers are closed.
+
 `gw_partial` (in-flight assistant prefix) is **not emitted** in this revision:
 mid-turn attach is live-only for now and will be revisited after
 implementation.
@@ -507,7 +527,9 @@ implementation.
   The UI reconstructs state with `get_state`/`get_messages`/`get_entries`.
 - `resume.sinceSeq` replays from a cursor. If the cursor was evicted, the
   daemon sets `resyncRequired` and sends `gw_snapshot`.
-- `resume.leafEntryId` enables resync across daemon restarts.
+- `resume.leafEntryId` enables durable resume across daemon restarts: a
+  matching durable leaf proves the client is up to date, so no snapshot is
+  needed even though `sinceSeq` cannot be replayed.
 - **Mid-turn attach (provisional).** A client joining a running turn receives
   live events from that point. It may see a truncated `message_update` fragment
   until `message_end` delivers the complete assistant message;
@@ -595,7 +617,7 @@ bot <- {sessions:[...]}
 bot -> switch_session{sessionPath:"auth-refactor"}
 bot <- {response switch_session, success:true}
 bot -> {id:"p1", type:"prompt", message:"Summarize the failing test"}
-bot <- {response prompt, success:true, queued:true}   # queue semantics
+bot <- {response prompt, success:true, data:{queued:true}}  # queue semantics
 ```
 
 ### 9.4 Two clients, queue semantics

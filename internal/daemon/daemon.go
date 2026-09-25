@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/internal/catalog"
 	"github.com/tigersoldier/pi-gateway/internal/config"
 	"github.com/tigersoldier/pi-gateway/internal/piargs"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
@@ -31,7 +33,14 @@ type Config struct {
 	PiBin       string
 	IdleTimeout time.Duration
 	ShortGrace  time.Duration
-	Logf        func(format string, args ...any)
+	// CatalogRoots are extra session directories to scan, on top of the ones
+	// pi itself uses (catalog.DefaultRoots).
+	CatalogRoots []string
+	// SubscriberBuffer is the per-connection delivery buffer in records.
+	SubscriberBuffer int
+	// DeltaFlush is the streaming-delta coalescing interval.
+	DeltaFlush time.Duration
+	Logf       func(format string, args ...any)
 }
 
 // entry is a registered session: the actor plus the spawn configuration it was
@@ -39,6 +48,10 @@ type Config struct {
 type entry struct {
 	actor *session.Actor
 	spawn map[string][]string
+	// createdBy records the client that explicitly created the session and the
+	// integration tags it supplied, for gw_list_sessions. It lives only as long
+	// as the session is registered (no persisted store, decision 6).
+	createdBy *protocol.ClientRef
 	// attaching counts in-flight binds; retire must not reap a session while a
 	// client is being registered to it.
 	attaching int
@@ -46,9 +59,10 @@ type entry struct {
 
 // Daemon owns the listener and the session table.
 type Daemon struct {
-	cfg  Config
-	logf func(format string, args ...any)
-	ln   net.Listener
+	cfg     Config
+	logf    func(format string, args ...any)
+	ln      net.Listener
+	scanner *catalog.Scanner
 
 	mu       sync.Mutex
 	sessions map[string]*entry // canonical path -> entry
@@ -76,9 +90,16 @@ func New(cfg Config) *Daemon {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	if cfg.SubscriberBuffer <= 0 {
+		cfg.SubscriberBuffer = 1024
+	}
+	if cfg.DeltaFlush <= 0 {
+		cfg.DeltaFlush = defaultDeltaFlush
+	}
 	return &Daemon{
 		cfg:      cfg,
 		logf:     logf,
+		scanner:  &catalog.Scanner{Roots: catalog.DefaultRoots(cfg.CatalogRoots...)},
 		sessions: make(map[string]*entry),
 		pending:  make(map[*session.Actor]*entry),
 		conns:    make(map[*conn]struct{}),
@@ -194,19 +215,238 @@ func (d *Daemon) clientID() string {
 // ---------------------------------------------------------------------------
 // Session table
 
-// attach resolves a target path, joining a live session or spawning pi for a
-// hibernated/absent one. The returned actor is live but not yet bound to the
-// client.
-func (d *Daemon) attach(target string, spec *piargs.Spec) (*session.Actor, error) {
+// resolveTarget maps a switch_session/hello target to a canonical session
+// path. A path (or something that looks like one) is used as-is; anything else
+// is resolved as a session name across session files and live actors
+// (docs/protocol.md §3.1).
+func (d *Daemon) resolveTarget(target string) (string, error) {
 	if target == "" {
-		return nil, &attachError{protocol.CodeUnknownSession, "no session path given"}
+		return "", &attachError{protocol.CodeUnknownSession, "no session path given"}
 	}
-	if !looksLikePath(target) {
-		// Name resolution lands in M2; fail clearly instead of guessing.
-		return nil, &attachError{protocol.CodeUnknownSession,
-			fmt.Sprintf("session name %q cannot be resolved yet; pass a session file path", target)}
+	if looksLikePath(target) {
+		return canonicalPath(target), nil
 	}
-	canon := canonicalPath(target)
+	files, err := d.scanner.FindName(target)
+	truncated := errors.Is(err, catalog.ErrTooManyCandidates)
+	if err != nil && !truncated {
+		return "", &attachError{protocol.CodeUnknownSession, err.Error()}
+	}
+	live := d.liveInfos()
+	info, found, resolveErr := catalog.Resolve(target, files, live)
+	if resolveErr != nil {
+		return "", &attachError{protocol.CodeAmbiguousSession, resolveErr.Error()}
+	}
+	canon := ""
+	if found {
+		canon = canonicalPath(info.Path)
+	}
+	if truncated && found && !isLivePath(live, canon) {
+		// The scan may have skipped a duplicate outside the bound, so the name
+		// cannot be resolved reliably from files alone.
+		return "", &attachError{protocol.CodeAmbiguousSession,
+			fmt.Sprintf("session name %q could not be resolved uniquely", target)}
+	}
+	if !found {
+		return "", &attachError{protocol.CodeUnknownSession,
+			fmt.Sprintf("no session named %q", target)}
+	}
+	return canon, nil
+}
+
+// isLivePath reports whether one of the live sessions owns path.
+func isLivePath(live []catalog.Info, path string) bool {
+	for _, info := range live {
+		if canonicalPath(info.Path) == path {
+			return true
+		}
+	}
+	return false
+}
+
+// liveInfos describes the sessions that currently have a pi process, using
+// pi's reported name and the actor's path. These cover sessions a file scan
+// cannot see (--no-session, custom --session-dir).
+func (d *Daemon) liveInfos() []catalog.Info {
+	d.mu.Lock()
+	entries := make([]*entry, 0, len(d.sessions))
+	for _, e := range d.sessions {
+		entries = append(entries, e)
+	}
+	d.mu.Unlock()
+	out := make([]catalog.Info, 0, len(entries))
+	for _, e := range entries {
+		if !actorLive(e) {
+			continue
+		}
+		path := e.actor.Path()
+		if path == "" {
+			continue
+		}
+		out = append(out, catalog.Info{Path: path, Name: e.actor.SessionName(), ID: e.actor.SessionID()})
+	}
+	return out
+}
+
+// liveActor resolves a target and returns its live actor.
+func (d *Daemon) liveActor(target string) (*session.Actor, error) {
+	canon, err := d.resolveTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.sessions[canon]
+	if e == nil || !actorLive(e) {
+		return nil, &attachError{protocol.CodeUnknownSession, "session is not live"}
+	}
+	return e.actor, nil
+}
+
+// setCreated records the client that explicitly created a session.
+func (d *Daemon) setCreated(a *session.Actor, ref protocol.ClientRef, tags map[string]string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e := d.entryLocked(a); e != nil {
+		ref.Tags = tags
+		e.createdBy = &ref
+	}
+}
+
+// listRow is one gw_list_sessions entry (docs/protocol.md §3.2).
+type listRow struct {
+	Path         string                   `json:"path"`
+	Name         string                   `json:"name,omitempty"`
+	Title        string                   `json:"title,omitempty"`
+	ID           string                   `json:"id,omitempty"`
+	Cwd          string                   `json:"cwd,omitempty"`
+	Live         bool                     `json:"live"`
+	IsStreaming  bool                     `json:"isStreaming,omitempty"`
+	MessageCount int                      `json:"messageCount"`
+	LastActivity string                   `json:"lastActivity,omitempty"`
+	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
+	Tags         map[string]string        `json:"tags,omitempty"`
+	Clients      []protocol.ClientSummary `json:"clients,omitempty"`
+}
+
+// listSessions builds the session catalog: files newest first, enriched with
+// the live actors' state.
+func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []listRow {
+	live := d.liveSnapshot()
+
+	rows := make([]listRow, 0, len(live)+8)
+	seen := make(map[string]bool)
+	for _, c := range d.scanner.List(cwd, limit) {
+		canon := canonicalPath(c.Path)
+		if seen[canon] {
+			continue
+		}
+		row := listRow{
+			Path:         canon,
+			Name:         c.Name,
+			Title:        c.Title,
+			ID:           c.ID,
+			Cwd:          c.Cwd,
+			MessageCount: c.MessageCount,
+		}
+		if !c.LastActivity.IsZero() {
+			row.LastActivity = c.LastActivity.UTC().Format(time.RFC3339)
+		}
+		d.decorate(&row, canon, live)
+		if liveOnly && !row.Live {
+			continue
+		}
+		seen[canon] = true
+		rows = append(rows, row)
+	}
+	// Live sessions the scan did not return (name-only, --no-session with a
+	// path pi never wrote, or a file beyond the scan bound).
+	for canon, ls := range live {
+		if seen[canon] {
+			continue
+		}
+		if cwd != "" {
+			// A live-only session has no file header to check against.
+			continue
+		}
+		row := listRow{
+			Path: canon,
+			Name: ls.actor.SessionName(),
+			ID:   ls.actor.SessionID(),
+		}
+		d.decorate(&row, canon, live)
+		rows = append(rows, row)
+		seen[canon] = true
+	}
+	if len(rows) > 1 {
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].Live != rows[j].Live {
+				return rows[i].Live
+			}
+			return rows[i].LastActivity > rows[j].LastActivity
+		})
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows
+}
+
+// liveSession is an immutable snapshot of a registered session, taken under
+// d.mu so catalog building never reads entry fields concurrently.
+type liveSession struct {
+	actor     *session.Actor
+	createdBy *protocol.ClientRef
+}
+
+// liveSnapshot copies what the catalog needs from the session table.
+func (d *Daemon) liveSnapshot() map[string]liveSession {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make(map[string]liveSession, len(d.sessions))
+	for path, e := range d.sessions {
+		if !actorLive(e) {
+			continue
+		}
+		ls := liveSession{actor: e.actor}
+		if e.createdBy != nil {
+			ref := *e.createdBy
+			ls.createdBy = &ref
+		}
+		out[path] = ls
+	}
+	return out
+}
+
+// decorate fills in live-session fields for one catalog row.
+func (d *Daemon) decorate(row *listRow, canon string, live map[string]liveSession) {
+	ls, ok := live[canon]
+	if !ok {
+		return
+	}
+	info := ls.actor.Info()
+	row.Live = true
+	row.IsStreaming = info.Turn.State == "running"
+	row.Clients = info.Clients
+	if ls.createdBy != nil {
+		ref := *ls.createdBy
+		row.CreatedBy = &ref
+	}
+	if row.Name == "" {
+		row.Name = ls.actor.SessionName()
+	}
+	if row.ID == "" {
+		row.ID = ls.actor.SessionID()
+	}
+}
+
+// attach resolves a target path or name, joining a live session or spawning
+// pi for a hibernated/absent one. The returned actor is live but not yet bound
+// to the client.
+func (d *Daemon) attach(target string, spec *piargs.Spec) (*session.Actor, error) {
+	canon, err := d.resolveTarget(target)
+	if err != nil {
+		return nil, err
+	}
 
 	d.mu.Lock()
 	e := d.sessions[canon]
@@ -268,12 +508,16 @@ func (d *Daemon) newActor(path string, spec *piargs.Spec) (*session.Actor, error
 	return a, nil
 }
 
-// onPath registers a session once pi reports its file path.
+// onPath registers a session once pi reports its file path, and re-keys it
+// when fork/clone moved a live process to a new file.
 func (d *Daemon) onPath(a *session.Actor, path string) {
 	canon := canonicalPath(path)
 	d.mu.Lock()
 	e := d.pending[a]
 	delete(d.pending, a)
+	if e == nil {
+		e = d.entryLocked(a)
+	}
 	if e == nil {
 		e = &entry{actor: a}
 	}
@@ -284,6 +528,13 @@ func (d *Daemon) onPath(a *session.Actor, path string) {
 		// for that loop to exit.
 		go a.Stop()
 		return
+	}
+	// A fork/clone leaves the old path behind: the actor serves only the new
+	// one now, so drop stale keys without touching the entry itself.
+	for old, other := range d.sessions {
+		if other == e && old != canon {
+			delete(d.sessions, old)
+		}
 	}
 	d.sessions[canon] = e
 	d.mu.Unlock()
@@ -391,15 +642,7 @@ func (d *Daemon) applyRuntime(e *entry, spec *piargs.Spec) {
 		d.logf("daemon: cannot read state to apply runtime parameters: %v", err)
 		return
 	}
-	var st struct {
-		Model struct {
-			ID       string `json:"id"`
-			Provider string `json:"provider"`
-		} `json:"model"`
-		ThinkingLevel string `json:"thinkingLevel"`
-		SessionName   string `json:"sessionName"`
-	}
-	_ = json.Unmarshal(protocol.DataField(rec.Raw), &st)
+	st := protocol.ParsePiState(rec.Raw)
 
 	var cmds []session.RuntimeCommand
 	wantModel, wantProvider := rt[piargs.KeyModel], rt[piargs.KeyProvider]

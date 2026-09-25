@@ -17,7 +17,6 @@ import (
 type PiConfig struct {
 	Bin  string
 	Args []string
-	Dir  string
 	Logf func(format string, args ...any)
 }
 
@@ -73,7 +72,6 @@ func StartPi(cfg PiConfig) (*PiProcess, error) {
 
 	// A nil Env inherits the daemon's environment.
 	proc, err := os.StartProcess(resolved, append([]string{resolved}, cfg.Args...), &os.ProcAttr{
-		Dir:   cfg.Dir,
 		Files: []*os.File{stdinR, stdoutW, stderrW},
 	})
 	if err != nil {
@@ -200,7 +198,13 @@ func (p *PiProcess) readLoop() {
 			// pi should never emit malformed JSON; skip rather than stall.
 			continue
 		}
-		p.events <- rec
+		// If the owner abandons this channel (a session reload swaps in a new
+		// process), the process exit releases the reader instead of leaking it.
+		select {
+		case p.events <- rec:
+		case <-p.done:
+			return
+		}
 	}
 }
 

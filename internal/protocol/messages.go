@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -44,11 +45,24 @@ type SessionRef struct {
 	ID   string `json:"id,omitempty"`
 }
 
-// ClientRef is the compact client identity carried on gateway events.
+// ClientSummary is the daemon's view of an attached client, used for the
+// gw_welcome roster and catalog rows. Unlike ClientInfo (what a client sends)
+// it includes the assigned clientId.
+type ClientSummary struct {
+	ClientID     string            `json:"clientId"`
+	Name         string            `json:"name,omitempty"`
+	Kind         string            `json:"kind,omitempty"`
+	Capabilities []string          `json:"capabilities,omitempty"`
+	Tags         map[string]string `json:"tags,omitempty"`
+}
+
+// ClientRef is the compact client identity carried on gateway events. Tags is
+// set where a creator's integration tags are reported (catalog rows).
 type ClientRef struct {
-	ClientID string `json:"clientId"`
-	Kind     string `json:"kind,omitempty"`
-	Name     string `json:"name,omitempty"`
+	ClientID string            `json:"clientId"`
+	Kind     string            `json:"kind,omitempty"`
+	Name     string            `json:"name,omitempty"`
+	Tags     map[string]string `json:"tags,omitempty"`
 }
 
 // TurnState reports the current turn in gw_welcome.
@@ -74,7 +88,7 @@ type Welcome struct {
 	ResyncRequired bool            `json:"resyncRequired"`
 	PiState        json.RawMessage `json:"piState"`
 	Turn           TurnState       `json:"turn"`
-	Clients        []ClientInfo    `json:"clients"`
+	Clients        []ClientSummary `json:"clients"`
 }
 
 // TurnEvent is a gw_turn lifecycle notification.
@@ -149,9 +163,20 @@ type StateChanged struct {
 	By      *ClientRef      `json:"by,omitempty"`
 }
 
+// Capabilities are the authority model (docs/design.md §10). The default
+// token grants the full set, so an empty request means everything.
+const (
+	CapObserve   = "observe"
+	CapInterject = "interject"
+	CapPrompt    = "prompt"
+	CapUI        = "ui"
+	CapControl   = "control"
+	CapAdmin     = "admin"
+)
+
 // AllCapabilities is the full capability set granted by the default token; it
 // is also what the bridge requests on a UI's behalf.
-var AllCapabilities = []string{"observe", "interject", "prompt", "ui", "control", "admin"}
+var AllCapabilities = []string{CapObserve, CapInterject, CapPrompt, CapUI, CapControl, CapAdmin}
 
 // NewError builds a gw_error frame.
 func NewError(code, msg string) ErrorEvent {
@@ -180,9 +205,11 @@ const (
 func Response(id, command string, success bool, code, errMsg string, data json.RawMessage) []byte {
 	obj := map[string]any{
 		"type":    "response",
-		"id":      id,
 		"command": command,
 		"success": success,
+	}
+	if id != "" {
+		obj["id"] = id
 	}
 	if !success {
 		obj["error"] = errMsg
@@ -200,6 +227,10 @@ func Response(id, command string, success bool, code, errMsg string, data json.R
 	return out
 }
 
+// ErrUnsupportedVersion marks a gw_hello whose protocol version the daemon
+// does not speak; the daemon answers such a frame with `not_supported`.
+var ErrUnsupportedVersion = errors.New("protocol: unsupported protocol version")
+
 // ParseHello decodes a gw_hello frame.
 func ParseHello(raw []byte) (*Hello, error) {
 	var h Hello
@@ -210,7 +241,7 @@ func ParseHello(raw []byte) (*Hello, error) {
 		return nil, fmt.Errorf("protocol: expected gw_hello, got %q", h.Type)
 	}
 	if h.Protocol != Version {
-		return nil, fmt.Errorf("protocol: unsupported protocol %d (daemon speaks %d)", h.Protocol, Version)
+		return nil, fmt.Errorf("%w: %d (daemon speaks %d)", ErrUnsupportedVersion, h.Protocol, Version)
 	}
 	return &h, nil
 }

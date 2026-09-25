@@ -15,11 +15,11 @@ import (
 // the daemon connection.
 type Client interface {
 	ID() string
-	Info() protocol.ClientInfo
 	Kind() string
 	Name() string
 	Has(capability string) bool
 	Ref() protocol.ClientRef
+	Summary() protocol.ClientSummary
 }
 
 // ClientCommand is one pi command forwarded by a client.
@@ -42,7 +42,6 @@ type Params struct {
 	PiBin       string
 	PiArgs      []string // accepted pi arguments, excluding --mode rpc/--session
 	SessionPath string   // known path; empty for implicit creation
-	Cwd         string
 	IdleTimeout time.Duration
 	ShortGrace  time.Duration
 	HubCapacity int
@@ -55,6 +54,7 @@ type snapInfo struct {
 	state       string
 	path        string
 	sessionName string
+	sessionID   string
 }
 
 // Info is a snapshot of actor state used to build gw_welcome.
@@ -64,7 +64,7 @@ type Info struct {
 	HeadSeq   uint64
 	OldestSeq uint64
 	Turn      protocol.TurnState
-	Clients   []protocol.ClientInfo
+	Clients   []protocol.ClientSummary
 }
 
 // Actor errors surfaced to the daemon.
@@ -73,11 +73,15 @@ var (
 	ErrQueueFull   = errors.New("session: command queue full")
 	ErrCallTimeout = errors.New("session: pi call timed out")
 	ErrNoPi        = errors.New("session: pi is not running")
+	// ErrReloadBusy is returned when gw_reload_session is refused because a
+	// turn is running or another client is attached.
+	ErrReloadBusy = errors.New("session: reload refused while busy")
 )
 
 const (
 	stateStarting   = "starting"
 	stateReady      = "ready"
+	stateRestarting = "restarting"
 	stateStopping   = "stopping"
 	stateHibernated = "hibernated"
 	stateStopped    = "stopped"
@@ -101,6 +105,23 @@ var globalMutations = map[string]bool{
 	"set_auto_compaction": true,
 	"set_auto_retry":      true,
 	"set_session_name":    true,
+	"gw_reload_session":   true,
+}
+
+// dialogMethods are the extension UI methods that block pi until a client
+// answers; they are routed to one client instead of broadcast
+// (docs/design.md §9).
+var dialogMethods = map[string]bool{
+	"select":  true,
+	"confirm": true,
+	"input":   true,
+	"editor":  true,
+}
+
+// uiPending is one unanswered extension UI dialog.
+type uiPending struct {
+	winner string
+	raw    []byte // original extension_ui_request, republished on reassignment
 }
 
 type callReq struct {
@@ -114,6 +135,16 @@ type applyReq struct {
 	by   *protocol.ClientRef
 }
 
+// restartReq asks the actor to stop and respawn pi for the same session. The
+// daemon connection that requested it sends the pi-shaped response itself, so
+// the answer also reaches a requester attached to a different session.
+type restartReq struct {
+	force     bool
+	requester string // client that asked; it does not count as "another client"
+	by        *protocol.ClientRef
+	done      chan error
+}
+
 type actorMsg struct {
 	cmd       *ClientCommand
 	attach    Client
@@ -121,6 +152,7 @@ type actorMsg struct {
 	detach    *string
 	call      *callReq
 	apply     *applyReq
+	restart   *restartReq
 	info      chan Info
 }
 
@@ -147,6 +179,7 @@ type Actor struct {
 	stopReason  string
 	path        string
 	sessionName string
+	sessionID   string
 	hasMessages bool
 
 	turnState  string
@@ -154,12 +187,16 @@ type Actor struct {
 	turnAuthor *protocol.ClientRef
 	turnSeq    uint64
 
-	pendingCalls map[string]chan protocol.Record
-	queueRuns    map[string]*protocol.ClientRef
-	runtimeCalls map[string]protocol.StateChanged
-	clearPending map[string][]QueuedItem
-	owners       map[string]string
-	pendingUI    map[string]bool
+	pendingCalls      map[string]chan protocol.Record
+	internalCallbacks map[string]func(protocol.Record)
+	queueRuns         map[string]*protocol.ClientRef
+	forkPending       map[string]bool
+	runtimeCalls      map[string]protocol.StateChanged
+	clearPending      map[string][]QueuedItem
+	owners            map[string]string
+	pendingUI         map[string]*uiPending
+	lastActive        map[string]time.Time
+	restarting        bool
 
 	timer      *time.Timer
 	timerArmed bool
@@ -190,22 +227,26 @@ func NewActor(p Params) *Actor {
 		logf = func(string, ...any) {}
 	}
 	a := &Actor{
-		params:       p,
-		logf:         logf,
-		hub:          NewHub(p.HubCapacity, sessionID),
-		in:           make(chan actorMsg, 512),
-		stopCh:       make(chan struct{}),
-		finished:     make(chan struct{}),
-		clients:      make(map[string]Client),
-		state:        stateStarting,
-		path:         p.SessionPath,
-		turnState:    turnIdle,
-		pendingCalls: make(map[string]chan protocol.Record),
-		queueRuns:    make(map[string]*protocol.ClientRef),
-		runtimeCalls: make(map[string]protocol.StateChanged),
-		clearPending: make(map[string][]QueuedItem),
-		owners:       make(map[string]string),
-		pendingUI:    make(map[string]bool),
+		params:            p,
+		logf:              logf,
+		hub:               NewHub(p.HubCapacity, sessionID),
+		in:                make(chan actorMsg, 512),
+		stopCh:            make(chan struct{}),
+		finished:          make(chan struct{}),
+		clients:           make(map[string]Client),
+		state:             stateStarting,
+		path:              p.SessionPath,
+		sessionID:         sessionID,
+		turnState:         turnIdle,
+		pendingCalls:      make(map[string]chan protocol.Record),
+		internalCallbacks: make(map[string]func(protocol.Record)),
+		queueRuns:         make(map[string]*protocol.ClientRef),
+		forkPending:       make(map[string]bool),
+		runtimeCalls:      make(map[string]protocol.StateChanged),
+		clearPending:      make(map[string][]QueuedItem),
+		owners:            make(map[string]string),
+		pendingUI:         make(map[string]*uiPending),
+		lastActive:        make(map[string]time.Time),
 	}
 	a.timer = time.NewTimer(time.Hour)
 	if !a.timer.Stop() {
@@ -217,12 +258,7 @@ func NewActor(p Params) *Actor {
 
 // Start spawns pi and starts the actor loop.
 func (a *Actor) Start() error {
-	args := []string{"--mode", "rpc"}
-	if a.path != "" {
-		args = append(args, "--session", a.path)
-	}
-	args = append(args, a.params.PiArgs...)
-	pi, err := StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Dir: a.params.Cwd, Logf: a.logf})
+	pi, err := a.spawnPi()
 	if err != nil {
 		a.setState(stateCrashed)
 		return err
@@ -235,6 +271,26 @@ func (a *Actor) Start() error {
 	// (for example because the bind lost a race) must not leak its pi process.
 	a.reevaluateIdle()
 	return nil
+}
+
+// spawnPi starts a pi process for this actor's session.
+func (a *Actor) spawnPi() (*PiProcess, error) {
+	args := []string{"--mode", "rpc"}
+	if a.path != "" {
+		args = append(args, "--session", a.path)
+	}
+	args = append(args, a.params.PiArgs...)
+	return StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Logf: a.logf})
+}
+
+// stopPi asks the process to abort and closes it, bounded by a grace period
+// (docs/design.md §4.7).
+func (a *Actor) stopPi() {
+	if a.pi != nil {
+		_ = a.pi.Send([]byte(`{"type":"abort"}`))
+		a.pi.Close(defaultCloseGrace)
+		a.pi = nil
+	}
 }
 
 // Stop requests a graceful shutdown and waits for the loop to finish.
@@ -270,6 +326,14 @@ func (a *Actor) SessionName() string {
 	return ""
 }
 
+// SessionID is pi's session identifier, once known.
+func (a *Actor) SessionID() string {
+	if s := a.snap.Load(); s != nil {
+		return s.sessionID
+	}
+	return ""
+}
+
 // Attached is the number of attached clients.
 func (a *Actor) Attached() int { return int(a.attached.Load()) }
 
@@ -284,8 +348,8 @@ func (a *Actor) Live() bool {
 }
 
 // Subscribe registers a client's event subscription.
-func (a *Actor) Subscribe(clientID string, buffer int) *Subscriber {
-	return a.hub.Subscribe(clientID, buffer)
+func (a *Actor) Subscribe(clientID string, opts SubOptions) *Subscriber {
+	return a.hub.Subscribe(clientID, opts)
 }
 
 // Unsubscribe removes a client's event subscription.
@@ -344,7 +408,7 @@ func (a *Actor) ApplyRuntime(cmds []RuntimeCommand, by *protocol.ClientRef) erro
 
 // Call runs one daemon-internal pi command and waits for its response.
 func (a *Actor) Call(raw []byte, timeout time.Duration) (protocol.Record, error) {
-	id := fmt.Sprintf("%sc%d", protocol.InternalIDPrefix, a.nextID.Add(1))
+	id := a.internalID("c")
 	raw2, err := protocol.RewriteID(raw, id)
 	if err != nil {
 		return protocol.Record{}, err
@@ -365,6 +429,26 @@ func (a *Actor) Call(raw []byte, timeout time.Duration) (protocol.Record, error)
 		return protocol.Record{}, ErrCallTimeout
 	case <-a.finished:
 		return protocol.Record{}, ErrStopped
+	}
+}
+
+// Restart stops pi and respawns it for the same session file (the daemon
+// operation behind gw_reload_session). It is refused with ErrReloadBusy while
+// another client is attached or a turn is running, unless force is set.
+func (a *Actor) Restart(force bool, requesterID string, by *protocol.ClientRef, timeout time.Duration) error {
+	req := &restartReq{force: force, requester: requesterID, by: by, done: make(chan error, 1)}
+	if !a.send(actorMsg{restart: req}) {
+		return ErrStopped
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-req.done:
+		return err
+	case <-t.C:
+		return ErrCallTimeout
+	case <-a.finished:
+		return ErrStopped
 	}
 }
 
@@ -412,7 +496,7 @@ func (a *Actor) loop() {
 	for !a.dead {
 		select {
 		case m := <-a.in:
-			a.handleMsg(m)
+			piEvents, piDone = a.handleMsg(m, piEvents, piDone)
 		case rec, ok := <-piEvents:
 			if !ok {
 				piEvents = nil
@@ -437,23 +521,20 @@ func (a *Actor) shutdown() {
 		a.stopReason = stateStopped
 	}
 	a.state = stateStopping
-	if a.pi != nil {
-		// Give pi a chance to stop the in-flight turn before stdin closes
-		// (docs/design.md §4.7).
-		_ = a.pi.Send([]byte(`{"type":"abort"}`))
-		a.pi.Close(defaultCloseGrace)
-		a.pi = nil
-	}
+	a.stopPi()
 	a.failQueued(protocol.CodeSessionCrashed, "session "+a.stopReason)
 	a.failPendingCalls()
-	a.hub.CloseAll()
+	a.failInternalCallbacks()
+	// Publish before closing the subscribers, or nobody sees the final state.
 	a.setState(stateStopped)
+	a.publishState(stateStopped, a.stopReason, nil)
+	a.hub.CloseAll()
 	if a.OnStopped != nil {
 		a.OnStopped(a, a.stopReason)
 	}
 }
 
-func (a *Actor) handleMsg(m actorMsg) {
+func (a *Actor) handleMsg(m actorMsg, events <-chan protocol.Record, done <-chan struct{}) (<-chan protocol.Record, <-chan struct{}) {
 	switch {
 	case m.cmd != nil:
 		a.handleCommand(*m.cmd)
@@ -468,9 +549,12 @@ func (a *Actor) handleMsg(m actorMsg) {
 		a.startCall(m.call)
 	case m.apply != nil:
 		a.applyRuntime(m.apply)
+	case m.restart != nil:
+		return a.handleRestart(m.restart, events, done)
 	case m.info != nil:
 		m.info <- a.info()
 	}
+	return events, done
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +565,7 @@ func (a *Actor) attachClient(c Client) {
 		return
 	}
 	a.clients[c.ID()] = c
+	a.lastActive[c.ID()] = time.Now()
 	a.attached.Store(int64(len(a.clients)))
 	a.publishPresence("join", c)
 	a.reevaluateIdle()
@@ -492,13 +577,31 @@ func (a *Actor) detachClient(clientID string) {
 		return
 	}
 	delete(a.clients, clientID)
+	delete(a.lastActive, clientID)
 	a.attached.Store(int64(len(a.clients)))
 	a.publishPresence("leave", c)
+	a.reassignUI(clientID)
 	if a.attached.Load() == 0 && (a.state == stateCrashed || a.state == stateStopped) {
 		a.dead = true
 		return
 	}
 	a.reevaluateIdle()
+}
+
+// reassignUI hands dialogs the departing client owned to the next candidate,
+// so a disconnected UI cannot strand pi until its timeout (design §9).
+func (a *Actor) reassignUI(clientID string) {
+	for id, p := range a.pendingUI {
+		if p.winner != clientID {
+			continue
+		}
+		if next := a.pickUIWinner(); next != "" {
+			p.winner = next
+			a.hub.Publish(protocol.Record{Raw: p.raw, Type: "extension_ui_request", Owner: next})
+			continue
+		}
+		delete(a.pendingUI, id) // nobody can answer; pi's timeout applies
+	}
 }
 
 func (a *Actor) info() Info {
@@ -515,7 +618,7 @@ func (a *Actor) info() Info {
 		},
 	}
 	for _, c := range a.clients {
-		out.Clients = append(out.Clients, c.Info())
+		out.Clients = append(out.Clients, c.Summary())
 	}
 	return out
 }
@@ -524,12 +627,12 @@ func (a *Actor) info() Info {
 // Command handling
 
 func (a *Actor) handleCommand(c ClientCommand) {
+	a.lastActive[c.Client.ID()] = time.Now()
 	switch c.Type {
 	case "prompt", "follow_up":
 		a.handlePrompt(c)
 	case "steer":
-		if !c.Client.Has("interject") {
-			a.errorResponse(c, protocol.CodeForbidden, "steer requires the interject capability")
+		if !a.requireCap(c, protocol.CapInterject) {
 			return
 		}
 		a.forward(c)
@@ -545,7 +648,7 @@ func (a *Actor) handleCommand(c ClientCommand) {
 	case "new_session":
 		a.errorResponse(c, protocol.CodeNotSupported, "new_session is handled by the daemon")
 	case "fork", "clone":
-		a.errorResponse(c, protocol.CodeNotSupported, "fork/clone are not supported in this revision")
+		a.handleFork(c)
 	case "extension_ui_response":
 		a.handleUIResponse(c)
 	default:
@@ -558,8 +661,7 @@ func (a *Actor) handleCommand(c ClientCommand) {
 }
 
 func (a *Actor) handlePrompt(c ClientCommand) {
-	if !c.Client.Has("prompt") {
-		a.errorResponse(c, protocol.CodeForbidden, "prompt requires the prompt capability")
+	if !a.requireCap(c, protocol.CapPrompt) {
 		return
 	}
 	// A follow-up submitted to an idle session runs as a normal prompt.
@@ -648,20 +750,57 @@ func (a *Actor) forwardRaw(c ClientCommand, ns string) {
 	}
 }
 
-func (a *Actor) handleUIResponse(c ClientCommand) {
-	if !c.Client.Has("ui") {
-		a.errorResponse(c, protocol.CodeForbidden, "extension_ui_response requires the ui capability")
+// handleFork forwards pi's fork/clone, which moves the live process to a new
+// session file. It is refused while other clients are attached, because they
+// would silently end up on the new session (docs/protocol.md §3.8).
+func (a *Actor) handleFork(c ClientCommand) {
+	if !a.requireCap(c, protocol.CapPrompt) {
+		return
+	}
+	if len(a.clients) > 1 {
+		a.errorResponse(c, protocol.CodeSharedSession, c.Type+" is unavailable while other clients are attached")
 		return
 	}
 	if a.state != stateReady || a.pi == nil {
-		a.errorResponse(c, protocol.CodeUIStale, "session is not running")
+		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
 		return
 	}
-	if !a.pendingUI[c.LocalID] {
+	ns := protocol.NamespaceID(c.Client.ID(), c.LocalID)
+	raw, err := protocol.RewriteID(c.Raw, ns)
+	if err != nil {
+		a.errorResponse(c, protocol.CodeBadFrame, err.Error())
+		return
+	}
+	a.owners[ns] = c.Client.ID()
+	if err := a.pi.Send(raw); err != nil {
+		delete(a.owners, ns)
+		a.errorResponse(c, protocol.CodeSessionCrashed, err.Error())
+		return
+	}
+	a.forkPending[ns] = true
+}
+
+func (a *Actor) handleUIResponse(c ClientCommand) {
+	if !a.requireCap(c, protocol.CapUI) {
+		return
+	}
+	if a.state != stateReady || a.pi == nil {
+		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
+		return
+	}
+	p, ok := a.pendingUI[c.LocalID]
+	if !ok {
 		a.errorResponse(c, protocol.CodeUIStale, "extension UI request is no longer pending")
 		return
 	}
+	if p.winner != c.Client.ID() {
+		a.errorResponse(c, protocol.CodeUIStale, "extension UI request was routed to another client")
+		return
+	}
 	delete(a.pendingUI, c.LocalID)
+	// The answer keeps pi's original request id; route any response with that
+	// id back to this client only.
+	a.owners[c.LocalID] = c.Client.ID()
 	a.forwardRaw(c, c.LocalID)
 }
 
@@ -699,7 +838,7 @@ func (a *Actor) drainQueue() {
 	if !ok {
 		return
 	}
-	id := fmt.Sprintf("%sq%d", protocol.InternalIDPrefix, a.nextID.Add(1))
+	id := a.internalID("q")
 	raw, err := protocol.RewriteCommand(it.Raw, id, "prompt")
 	if err != nil {
 		a.logf("session %s: dropping malformed queued command: %v", a.path, err)
@@ -722,7 +861,7 @@ func (a *Actor) applyRuntime(r *applyReq) {
 		return
 	}
 	for _, rc := range r.cmds {
-		id := fmt.Sprintf("%sr%d", protocol.InternalIDPrefix, a.nextID.Add(1))
+		id := a.internalID("r")
 		raw, err := protocol.RewriteID(rc.Raw, id)
 		if err != nil {
 			continue
@@ -755,6 +894,12 @@ func (a *Actor) startCall(req *callReq) {
 // pi events
 
 func (a *Actor) handlePiEvent(rec protocol.Record) {
+	// Adopt the reported session state before publishing or handing the
+	// response to a caller, so records carry the canonical gw_session and
+	// fork/clone moves are picked up even when nobody asks for get_state.
+	if rec.Type == "response" && protocol.Field(rec.Raw, "command") == "get_state" {
+		a.adoptState(rec.Raw)
+	}
 	// Internal responses never reach clients.
 	if rec.Type == "response" && protocol.IsInternalID(rec.ID) {
 		a.handleInternalResponse(rec)
@@ -775,17 +920,20 @@ func (a *Actor) handlePiEvent(rec protocol.Record) {
 				rec.Raw = raw
 			}
 		}
-		// Adopt the reported session path before publishing so the response
-		// itself already carries the canonical gw_session (not s_<nanos>).
-		if protocol.Field(rec.Raw, "command") == "get_state" {
-			a.adoptState(rec.Raw)
-		}
+	}
+	if rec.Type == "extension_ui_request" && !a.routeUI(&rec) {
+		return // no ui-capable client: pi's own dialog timeout applies
 	}
 	a.hub.Publish(rec)
 	a.postProcess(rec)
 }
 
 func (a *Actor) handleInternalResponse(rec protocol.Record) {
+	if cb, ok := a.internalCallbacks[rec.ID]; ok {
+		delete(a.internalCallbacks, rec.ID)
+		cb(rec)
+		return
+	}
 	if ch, ok := a.pendingCalls[rec.ID]; ok {
 		delete(a.pendingCalls, rec.ID)
 		ch <- rec
@@ -826,10 +974,6 @@ func (a *Actor) postProcess(rec protocol.Record) {
 	case "message_start", "message_update", "message_end",
 		"tool_execution_start", "tool_execution_update", "tool_execution_end":
 		a.hasMessages = true
-	case "extension_ui_request":
-		if rec.ID != "" {
-			a.pendingUI[rec.ID] = true
-		}
 	case "response":
 		cmd := protocol.Field(rec.Raw, "command")
 		success := protocol.BoolField(rec.Raw, "success", false)
@@ -837,6 +981,16 @@ func (a *Actor) postProcess(rec protocol.Record) {
 			// pi rejected the prompt (for example because it was still
 			// streaming): release the turn so the queue is not wedged.
 			a.failTurn()
+		}
+		if cmd == "fork" || cmd == "clone" {
+			if a.forkPending[rec.ID] {
+				delete(a.forkPending, rec.ID)
+				if success {
+					// pi moved the live process to a new session file; learn it
+					// and let the daemon re-key the session.
+					a.startInternal("get_state", func(rec protocol.Record) { a.adoptState(rec.Raw) })
+				}
+			}
 		}
 		if success && globalMutations[cmd] {
 			a.publishStateChanged(cmd, rec.Raw, rec.Owner)
@@ -859,30 +1013,29 @@ func (a *Actor) failTurn() {
 	a.reevaluateIdle()
 }
 
-// adoptState learns the session file path and name from a get_state response
-// so an implicitly created session can be registered in the catalog.
+// adoptState learns the session file, name, and id from a get_state response
+// so an implicitly created session can be registered in the catalog and a
+// fork/clone move is followed.
 func (a *Actor) adoptState(raw []byte) {
 	data := protocol.DataField(raw)
 	if len(data) == 0 {
 		return
 	}
-	var st struct {
-		SessionFile string `json:"sessionFile"`
-		SessionName string `json:"sessionName"`
-	}
-	if err := json.Unmarshal(data, &st); err != nil {
-		return
-	}
+
+	st := protocol.ParsePiState(data)
 	if st.SessionName != "" {
 		a.sessionName = st.SessionName
-		a.publishSnapshot()
 	}
-	if a.path == "" && st.SessionFile != "" {
+	if st.SessionID != "" {
+		a.sessionID = st.SessionID
+	}
+	if st.SessionFile != "" && st.SessionFile != a.path {
 		a.setPath(st.SessionFile)
 		if a.OnPath != nil {
 			a.OnPath(a, st.SessionFile)
 		}
 	}
+	a.publishSnapshot()
 }
 
 func (a *Actor) handlePiExit() {
@@ -904,7 +1057,9 @@ func (a *Actor) handlePiExit() {
 	a.publishState(stateCrashed, reason, &code)
 	a.failQueued(protocol.CodeSessionCrashed, "pi exited")
 	a.failPendingCalls()
-	a.pendingUI = make(map[string]bool)
+	a.failInternalCallbacks()
+	a.pendingUI = make(map[string]*uiPending)
+	a.forkPending = make(map[string]bool)
 	if a.attached.Load() == 0 {
 		a.dead = true
 	}
@@ -970,11 +1125,24 @@ func (a *Actor) failQueued(code, msg string) {
 	for _, it := range a.queue.Clear() {
 		a.publishError(it.Ref(), code, msg)
 	}
+	a.failQueueRuns(code, msg)
+	a.publishQueue()
+}
+
+// internalID allocates a daemon-generated command id, tagged with a one-letter
+// kind so logs can tell callbacks, queued prompts, runtime changes, and
+// generic internal calls apart.
+func (a *Actor) internalID(kind string) string {
+	return fmt.Sprintf("%s%s%d", protocol.InternalIDPrefix, kind, a.nextID.Add(1))
+}
+
+// failQueued reports prompts that were already forwarded to pi and cannot
+// be answered anymore; the not-yet-forwarded queue is left alone.
+func (a *Actor) failQueueRuns(code, msg string) {
 	for id, ref := range a.queueRuns {
 		delete(a.queueRuns, id)
 		a.publishError(ref, code, msg)
 	}
-	a.publishQueue()
 }
 
 func (a *Actor) failPendingCalls() {
@@ -982,6 +1150,148 @@ func (a *Actor) failPendingCalls() {
 		delete(a.pendingCalls, id)
 		ch <- protocol.Record{}
 	}
+}
+
+// failInternalCallbacks completes daemon-internal pi commands whose process
+// died, so no caller waits for a response that will never arrive.
+func (a *Actor) failInternalCallbacks() {
+	for id, cb := range a.internalCallbacks {
+		delete(a.internalCallbacks, id)
+		cb(protocol.Record{})
+	}
+}
+
+// startInternal sends a daemon-generated pi command and runs cb with the
+// response (an empty Record when pi is gone).
+func (a *Actor) startInternal(command string, cb func(protocol.Record)) {
+	if a.pi == nil {
+		cb(protocol.Record{})
+		return
+	}
+	id := a.internalID("x")
+	raw, err := protocol.RewriteID([]byte(`{"type":"`+command+`"}`), id)
+	if err != nil {
+		cb(protocol.Record{})
+		return
+	}
+	a.internalCallbacks[id] = cb
+	if err := a.pi.Send(raw); err != nil {
+		delete(a.internalCallbacks, id)
+		cb(protocol.Record{})
+	}
+}
+
+// handleRestart stops and respawns pi for the same session file. It runs on
+// the actor loop and returns the new process channels for the loop to use; nil
+// channels mean there is no process anymore.
+func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, done <-chan struct{}) (<-chan protocol.Record, <-chan struct{}) {
+	fail := func(err error) (<-chan protocol.Record, <-chan struct{}) {
+		req.done <- err
+		return events, done
+	}
+	if a.restarting {
+		return fail(ErrReloadBusy)
+	}
+	if a.state != stateReady && a.state != stateCrashed {
+		return fail(ErrStopped)
+	}
+	others := 0
+	for id := range a.clients {
+		if id != req.requester {
+			others++
+		}
+	}
+	if !req.force && (others > 0 || a.turnState == turnRunning) {
+		return fail(ErrReloadBusy)
+	}
+	a.setState(stateRestarting)
+	a.publishState(stateRestarting, "reload", nil)
+	a.stopPi()
+	// The old process takes the running turn with it: forwarded prompts fail,
+	// while the not-yet-forwarded daemon queue is kept (docs/design.md §4.4).
+	a.failQueueRuns(protocol.CodeSessionCrashed, "session reloaded")
+	a.failPendingCalls()
+	a.failTurn()
+	a.pendingUI = make(map[string]*uiPending)
+	a.forkPending = make(map[string]bool)
+
+	pi, err := a.spawnPi()
+	if err != nil {
+		a.setState(stateCrashed)
+		a.publishState(stateCrashed, err.Error(), nil)
+		req.done <- err
+		return nil, nil
+	}
+	a.pi = pi
+	a.restarting = true
+	a.startInternal("get_state", func(rec protocol.Record) {
+		a.restarting = false
+		if rec.Type == "" || !protocol.BoolField(rec.Raw, "success", false) {
+			a.setState(stateCrashed)
+			a.publishState(stateCrashed, "reload failed", nil)
+			req.done <- ErrNoPi
+			return
+		}
+		a.setState(stateReady)
+		a.publishState(stateReady, "reload", nil)
+		a.publishStateChanged("gw_reload_session", rec.Raw, refClientID(req.by))
+		// Prompts queued while the old process died must run again; without
+		// this the queue would be stranded (no turn is running to settle).
+		if a.queue.Len() > 0 {
+			a.drainQueue()
+		} else {
+			a.reevaluateIdle()
+		}
+		req.done <- nil
+	})
+	return pi.Events(), pi.Done()
+}
+
+// routeUI sends a dialog to one client and remembers the winner; other UI
+// methods are fire-and-forget broadcasts (docs/design.md §9). It reports
+// whether the record should be published: a dialog nobody can answer is
+// dropped so pi's own timeout resolves it.
+func (a *Actor) routeUI(rec *protocol.Record) bool {
+	if !dialogMethods[protocol.Field(rec.Raw, "method")] {
+		return true
+	}
+	winner := a.pickUIWinner()
+	if winner == "" {
+		return false
+	}
+	rec.Owner = winner
+	if rec.ID != "" {
+		a.pendingUI[rec.ID] = &uiPending{winner: winner, raw: rec.Raw}
+	}
+	return true
+}
+
+// pickUIWinner prefers the author of the running turn, then the most recently
+// active ui-capable client.
+func (a *Actor) pickUIWinner() string {
+	if a.turnAuthor != nil {
+		if c, ok := a.clients[a.turnAuthor.ClientID]; ok && c.Has(protocol.CapUI) {
+			return c.ID()
+		}
+	}
+	best, bestAt := "", time.Time{}
+	for id, c := range a.clients {
+		if !c.Has(protocol.CapUI) {
+			continue
+		}
+		at := a.lastActive[id]
+		if best == "" || at.After(bestAt) {
+			best, bestAt = id, at
+		}
+	}
+	return best
+}
+
+func refClientID(ref *protocol.ClientRef) string {
+	if ref == nil {
+		return ""
+	}
+	return ref.ClientID
 }
 
 // ---------------------------------------------------------------------------
@@ -993,6 +1303,17 @@ func (a *Actor) respond(c ClientCommand, success bool, data []byte) {
 
 func (a *Actor) errorResponse(c ClientCommand, code, msg string) {
 	a.respondFrame(c, false, code, msg, nil)
+}
+
+// requireCap reports whether the client holds a capability, replying with
+// `forbidden` when it does not.
+func (a *Actor) requireCap(c ClientCommand, capability string) bool {
+	if c.Client.Has(capability) {
+		return true
+	}
+	a.errorResponse(c, protocol.CodeForbidden,
+		fmt.Sprintf("%s requires the %s capability", c.Type, capability))
+	return false
 }
 
 // respondFrame publishes a pi-shaped response addressed to the requester.
@@ -1116,7 +1437,12 @@ func (a *Actor) Snapshot() (protocol.Snapshot, error) {
 }
 
 func (a *Actor) publishSnapshot() {
-	a.snap.Store(&snapInfo{state: a.state, path: a.path, sessionName: a.sessionName})
+	a.snap.Store(&snapInfo{
+		state:       a.state,
+		path:        a.path,
+		sessionName: a.sessionName,
+		sessionID:   a.sessionID,
+	})
 }
 
 func (a *Actor) setState(state string) {

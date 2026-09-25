@@ -13,6 +13,7 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/client"
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
+	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
 )
 
@@ -26,38 +27,16 @@ func TestMain(m *testing.M) {
 
 func startDaemon(t *testing.T) (addr, tokenFile, piBin string) {
 	t.Helper()
-	piBin, err := testutil.FakePi()
-	if err != nil {
-		t.Skipf("cannot build fake pi: %v", err)
-	}
 	dir := t.TempDir()
 	tokenFile = filepath.Join(dir, "token")
 	if err := os.WriteFile(tokenFile, []byte(bridgeToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d := daemon.New(daemon.Config{
-		Addr:        "127.0.0.1:0",
-		Token:       bridgeToken,
-		PiBin:       piBin,
-		IdleTimeout: 30 * time.Second,
-		ShortGrace:  5 * time.Second,
-		Logf:        func(format string, args ...any) { t.Logf(format, args...) },
+	addr, piBin = gwtest.StartDaemon(t, bridgeToken, func(c *daemon.Config) {
+		c.IdleTimeout = 30 * time.Second
+		c.ShortGrace = 5 * time.Second
 	})
-	if err := d.Listen(); err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = d.Serve(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-		d.Shutdown()
-	})
-	return d.Addr().String(), tokenFile, piBin
+	return addr, tokenFile, piBin
 }
 
 // ui is a test-side UI attached to a bridge process over pipes.

@@ -7,13 +7,57 @@ import (
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 )
 
+// terminalTypes are records that can flow through the hub and that a client
+// must never miss: dropping them would leave it unable to reconstruct state
+// (docs/design.md §7). Handshake and replay frames never pass through the hub.
+var terminalTypes = map[string]bool{
+	"message_end":           true,
+	"tool_execution_end":    true,
+	"turn_end":              true,
+	"agent_end":             true,
+	"agent_settled":         true,
+	"response":              true,
+	"extension_ui_request":  true,
+	"gw_session_state":      true,
+	"gw_error":              true,
+	"gw_state_changed":      true,
+	"gw_turn":               true,
+	"gw_queue":              true,
+	"gw_presence":           true,
+	"compaction_start":      true,
+	"compaction_end":        true,
+	"auto_retry_start":      true,
+	"auto_retry_end":        true,
+	"queue_update":          true,
+	"bash_execution_update": true,
+	"extension_error":       true,
+}
+
+// IsTerminal reports whether a record type must never be dropped for a lossy
+// client. It is used by both delivery hops: the hub and the connection.
+func IsTerminal(typ string) bool { return terminalTypes[typ] }
+
+// SubOptions configures a subscriber's delivery behavior.
+type SubOptions struct {
+	// Buffer is the delivery buffer size in records.
+	Buffer int
+	// AllowLossy lets the hub drop non-terminal records instead of dropping
+	// the subscriber; the client is told via a gw_lag marker so it can resync.
+	AllowLossy bool
+}
+
 // Subscriber is one client's view of a session's event stream.
 type Subscriber struct {
-	ch chan protocol.Record
+	ch   chan protocol.Record
+	opts SubOptions
 
 	mu     sync.Mutex
 	closed bool
 	dead   bool // closed because the consumer could not keep up
+	// lagFrom/lagTo track records dropped for a lossy subscriber but not yet
+	// reported with a gw_lag marker.
+	lagFrom uint64
+	lagTo   uint64
 }
 
 // C returns the receive side. The channel is closed when the subscriber is
@@ -34,15 +78,56 @@ func (s *Subscriber) deliver(rec protocol.Record) {
 	if s.closed {
 		return
 	}
+	if s.lagFrom != 0 {
+		select {
+		case s.ch <- s.lagRecord():
+			s.lagFrom, s.lagTo = 0, 0
+		default:
+			s.overflowLocked(rec)
+			return
+		}
+	}
 	select {
 	case s.ch <- rec:
 	default:
-		// A subscriber must never stall pi or the actor. Drop it; the client
-		// reconnects and resyncs.
-		s.dead = true
-		s.closed = true
-		close(s.ch)
+		s.overflowLocked(rec)
 	}
+}
+
+// overflowLocked handles a full subscriber buffer: lossy subscribers drop
+// non-terminal records and are told about the gap later; everyone else is
+// dropped so the connection can reconnect and resync.
+func (s *Subscriber) overflowLocked(rec protocol.Record) {
+	if s.opts.AllowLossy && !terminalTypes[rec.Type] {
+		s.recordLagLocked(rec.Seq)
+		return
+	}
+	s.dead = true
+	s.closed = true
+	close(s.ch)
+}
+
+// recordLagLocked remembers a dropped record so the next successful delivery
+// can be preceded by a gw_lag marker.
+func (s *Subscriber) recordLagLocked(seq uint64) {
+	if seq == 0 {
+		return
+	}
+	if s.lagFrom == 0 || seq < s.lagFrom {
+		s.lagFrom = seq
+	}
+	if seq > s.lagTo {
+		s.lagTo = seq
+	}
+}
+
+// lagRecord builds the marker telling the client which records it missed.
+func (s *Subscriber) lagRecord() protocol.Record {
+	raw, err := protocol.LagFrame(s.lagFrom, s.lagTo)
+	if err != nil {
+		return protocol.Record{}
+	}
+	return protocol.Record{Raw: raw, Type: "gw_lag"}
 }
 
 // Close unsubscribes without marking the subscriber dead.
@@ -135,11 +220,11 @@ func (h *Hub) Publish(rec protocol.Record) protocol.Record {
 }
 
 // Subscribe registers a subscriber with a bounded delivery buffer.
-func (h *Hub) Subscribe(id string, buffer int) *Subscriber {
-	if buffer < 1 {
-		buffer = 1
+func (h *Hub) Subscribe(id string, opts SubOptions) *Subscriber {
+	if opts.Buffer < 1 {
+		opts.Buffer = 1
 	}
-	s := &Subscriber{ch: make(chan protocol.Record, buffer)}
+	s := &Subscriber{ch: make(chan protocol.Record, opts.Buffer), opts: opts}
 	h.mu.Lock()
 	h.subs[id] = s
 	h.mu.Unlock()
@@ -157,12 +242,14 @@ func (h *Hub) Unsubscribe(id string) {
 	}
 }
 
-// Replay returns retained records with Seq > afterSeq. ok is false when
-// afterSeq is older than the retained window; the caller must resync.
+// Replay returns retained records with Seq > afterSeq. ok is false when the
+// cursor was evicted or lies beyond the head (which means it belongs to a
+// previous log instance, for example after a daemon restart); the caller must
+// resync.
 func (h *Hub) Replay(afterSeq uint64) ([]protocol.Record, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	if afterSeq+1 < h.oldestLocked() {
+	if afterSeq > h.seq || afterSeq+1 < h.oldestLocked() {
 		return nil, false
 	}
 	out := make([]protocol.Record, 0, h.n)

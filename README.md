@@ -24,10 +24,12 @@ unit) on the machine that owns the sessions, and to accept **local connections**
 from clients. Clients are the processes third-party UIs spawn in place of `pi`.
 
 > **Status.** The design is settled (see [Design decisions](#design-decisions))
-> and **M1 is implemented**: the `pi-gatewayd` daemon and the `pi-gateway`
-> bridge, with token auth, port discovery, session attach/rebinding, the
-> daemon-owned queue, replay, hibernation, and orphan reaping. See
-> [Implementation status](#implementation-status) for M1 scope and what is
+> and **M2 is implemented**: the `pi-gatewayd` daemon and the `pi-gateway`
+> bridge, with token auth, port discovery, session attach/rebinding by path or
+> name, the session catalog, reload and fork/clone policies, turn-author UI
+> routing, the daemon-owned queue, replay/durable resume, coalescing,
+> hibernation, and orphan reaping. See
+> [Implementation status](#implementation-status) for scope and what is
 > deliberately deferred.
 
 ## Background: why pi alone cannot do this
@@ -71,8 +73,8 @@ survives client death, and non-pi integrations.
 |------|----------|
 | [`docs/design.md`](docs/design.md) | Full architecture, invariants, arbitration, replay, failure modes |
 | [`docs/protocol.md`](docs/protocol.md) | Client-facing wire protocol (pi-compatible + thin gateway envelope) |
-| [`cmd/pi-gatewayd`](cmd/pi-gatewayd) | M1 daemon: owns pi sessions, serves the gateway protocol on loopback TCP |
-| [`cmd/pi-gateway`](cmd/pi-gateway) | M1 bridge: the binary UIs spawn in place of `pi` |
+| [`cmd/pi-gatewayd`](cmd/pi-gatewayd) | daemon: owns pi sessions, serves the gateway protocol on loopback TCP |
+| [`cmd/pi-gateway`](cmd/pi-gateway) | bridge: the binary UIs spawn in place of `pi` |
 
 ## TL;DR of the design
 
@@ -183,7 +185,7 @@ unless it is explicitly marked so.
 - **Session creation** (operator). **Explicit create + creator tags.** Non-pi
   clients may create sessions explicitly (a control command returning path and
   name); sessions record the creating client identity/tags, exposed in the
-  catalog, so an integration can list and delete its own. pilish's implicit
+  catalog, so an integration can list its own. pilish's implicit
   creation (fresh client → `get_state` → new session) keeps working. Any client
   may attach to any existing session by path or name — including a pilish
   session. The Slack integration itself is out of scope for this repository.
@@ -251,26 +253,28 @@ implemented.
 
 ## Implementation status
 
-**M1 (core daemon and client) is implemented.**
+**M2 (sessions and multi-client) is implemented.**
 
-| Area | M1 |
+| Area | Status |
 | --- | --- |
 | Binaries | `pi-gatewayd` (daemon), `pi-gateway` (bridge) |
 | Transport/auth | loopback TCP, token file (0600), `--server`/`--port`/`--token-file`, port-file discovery with fallback to `127.0.0.1:7331` |
-| Sessions | attach by path, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester |
-| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping of never-messaged sessions |
-| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed` |
+| Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags |
+| Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags |
+| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise) |
+| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, capability checks on the control surfaces (`observe`/`prompt`/`ui`/`control`/`admin`) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
-| Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state`, `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync |
-| Extension UI | broadcast plus first-response-wins with `ui_stale` (full turn-author routing lands in M2) |
+| Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state`, `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
+| Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
+| Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
 
-Deliberately deferred to M2+ (roadmap in `docs/design.md` §14): session
-catalog and name resolution (`gw_list_sessions`), `gw_new_session`,
-`gw_reload_session`, `fork`/`clone` adoption, backpressure coalescing and
-`gw_lag`, and the HTTP debug listener. Until then those commands answer
-`not_supported`, and `switch_session` accepts file paths only.
+Deliberately deferred to M3+ (roadmap in `docs/design.md` §14): the systemd
+user unit, the separate loopback HTTP debug listener (status/metrics/catalog),
+token roles and capability provisioning, and structured logging/metrics.
+Enforcement today covers the gateway control surfaces listed above;
+per-command `get_*` checks arrive with role provisioning.
 
-### Running M1
+### Running the daemon and bridge
 
 ```bash
 go build ./cmd/pi-gatewayd ./cmd/pi-gateway
@@ -285,6 +289,12 @@ go build ./cmd/pi-gatewayd ./cmd/pi-gateway
 # The managed pi version, answered by the daemon (pilish's dependency check).
 ./pi-gateway --version
 
+# Gateways are also integration clients: list sessions, create one, reload it.
+# (See docs/protocol.md for the frame shapes.)
+#   gw_list_sessions -> {"sessions":[{path,name,title,cwd,live,clients,...}]}
+#   gw_new_session   -> {"path","name","sessionId"} (requester is rebound)
+#   gw_reload_session-> restart pi for a session (control capability)
+
 # Unit + daemon/bridge end-to-end tests (fake pi, no real pi needed).
 go test -race ./...
 ```
@@ -297,6 +307,7 @@ Point `pilish-executable` (local) at the `pi-gateway` binary, or the layer's
 ```text
 cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
 cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
+internal/catalog/   session file scanning, name resolution, durable leaf ids
 internal/client/     bridge implementation (argv, token/port, relay)
 internal/config/     token and port file paths, defaults
 internal/daemon/     session table, attach/rebind, spawn-param checks
@@ -304,5 +315,6 @@ internal/piargs/     accepted pi parameter parsing (shared daemon/client)
 internal/protocol/   strict JSONL codec, gw_* messages, id namespacing
 internal/session/    SessionActor, Hub, PromptQueue, PiProcess
 internal/fakepi/     fake pi used by the tests
+internal/gwtest/     shared daemon harness for end-to-end tests
 internal/testutil/   test helpers (build fake pi, raw protocol client)
 ```

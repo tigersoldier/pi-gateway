@@ -1,7 +1,6 @@
 package daemon_test
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
+	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
 )
@@ -26,33 +26,15 @@ func TestMain(m *testing.M) {
 // pi binary path (used to count live pi processes).
 func startDaemon(t *testing.T, idle, shortGrace time.Duration) (string, string) {
 	t.Helper()
-	piBin, err := testutil.FakePi()
-	if err != nil {
-		t.Skipf("cannot build fake pi: %v", err)
-	}
-	d := daemon.New(daemon.Config{
-		Addr:        "127.0.0.1:0",
-		Token:       testToken,
-		PiBin:       piBin,
-		IdleTimeout: idle,
-		ShortGrace:  shortGrace,
-		Logf:        func(format string, args ...any) { t.Logf(format, args...) },
+	return startDaemonOpts(t, func(c *daemon.Config) {
+		c.IdleTimeout, c.ShortGrace = idle, shortGrace
 	})
-	if err := d.Listen(); err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = d.Serve(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-		d.Shutdown()
-	})
-	return d.Addr().String(), piBin
+}
+
+// startDaemonOpts starts a daemon and lets the test adjust its configuration.
+func startDaemonOpts(t *testing.T, mutate func(*daemon.Config)) (string, string) {
+	t.Helper()
+	return gwtest.StartDaemon(t, testToken, mutate)
 }
 
 func dial(t *testing.T, addr string, mutate func(*protocol.Hello)) *testutil.Conn {
@@ -417,7 +399,7 @@ func TestNewSessionRebindsOnlyRequester(t *testing.T) {
 	}
 }
 
-func TestSwitchSessionErrorsAndUnsupportedCommands(t *testing.T) {
+func TestSwitchSessionUnknownNameAndUnsupportedCommands(t *testing.T) {
 	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
 	c := dial(t, addr, nil)
 	c.WaitType("gw_welcome", testutil.DefaultTimeout)
@@ -425,18 +407,20 @@ func TestSwitchSessionErrorsAndUnsupportedCommands(t *testing.T) {
 	c.Send(map[string]any{"type": "switch_session", "id": "r1", "sessionPath": "auth-refactor"})
 	resp := c.WaitResponse("r1", testutil.DefaultTimeout)
 	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUnknownSession {
-		t.Fatalf("name attach must fail clearly in M1: %v", resp)
+		t.Fatalf("unknown name must fail with unknown_session: %v", resp)
 	}
 
+	// fork/clone need a bound session before the actor can judge sharing.
 	c.Send(map[string]any{"type": "clone", "id": "r2"})
 	resp = c.WaitResponse("r2", testutil.DefaultTimeout)
-	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeNotSupported {
-		t.Fatalf("clone must be not_supported: %v", resp)
+	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUnknownSession {
+		t.Fatalf("clone without a session must fail: %v", resp)
 	}
 
-	c.Send(map[string]any{"type": "gw_list_sessions", "id": "r3"})
+	// A gateway message from the removed draft is still rejected politely.
+	c.Send(map[string]any{"type": "gw_take_turn", "id": "r3"})
 	if f := c.WaitType("gw_error", testutil.DefaultTimeout); testutil.Str(f, "code") != protocol.CodeNotSupported {
-		t.Fatalf("gw_list_sessions must be not_supported in M1: %v", f)
+		t.Fatalf("gw_take_turn must be not_supported: %v", f)
 	}
 }
 

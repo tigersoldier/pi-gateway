@@ -1,7 +1,8 @@
 // Command fakepi is a minimal pi RPC stand-in for the gateway's tests. It
 // implements just enough of pi's command/event surface: get_state reports a
-// session file, prompt runs a short synthetic turn, and everything else gets a
-// success response.
+// session file, prompt runs a short synthetic turn with streaming deltas, and
+// everything else gets a success response. It writes a real session file
+// (header, message entries, session_info) so the catalog can scan it.
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/internal/catalog"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 )
 
@@ -27,6 +29,7 @@ func main() {
 		sessionFile string
 		sessionDir  string
 		sessionName string
+		noSession   bool
 		model       = "fake-model"
 		provider    = "fake-provider"
 		thinking    = "medium"
@@ -54,23 +57,15 @@ func main() {
 			provider = next()
 		case "--thinking":
 			thinking = next()
+		case "--no-session":
+			noSession = true
 		}
 	}
-	if sessionFile == "" {
-		dir := sessionDir
-		if dir == "" {
-			dir = os.TempDir()
-		}
-		sessionFile = filepath.Join(dir, fmt.Sprintf("fakepi-%d.jsonl", os.Getpid()))
-	}
-	_ = os.MkdirAll(filepath.Dir(sessionFile), 0o755)
-	if f, err := os.OpenFile(sessionFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-		_ = f.Close()
-	}
-
 	s := &state{
 		sessionFile:    sessionFile,
+		sessionDir:     sessionDir,
 		sessionName:    sessionName,
+		noSession:      noSession,
 		model:          model,
 		provider:       provider,
 		thinking:       thinking,
@@ -80,6 +75,7 @@ func main() {
 		uiRequest:      os.Getenv("FAKEPI_UI_REQUEST") != "",
 		exitAfterFirst: os.Getenv("FAKEPI_EXIT_AFTER_FIRST_TURN") != "",
 	}
+	s.open()
 	codec := protocol.NewCodec(os.Stdin, os.Stdout)
 	for {
 		raw, err := codec.Read()
@@ -97,7 +93,11 @@ func main() {
 type state struct {
 	mu             sync.Mutex
 	sessionFile    string
+	sessionDir     string
+	sessionID      string
 	sessionName    string
+	leafID         string
+	noSession      bool
 	model          string
 	provider       string
 	thinking       string
@@ -109,56 +109,134 @@ type state struct {
 	uiRequest      bool
 	exitAfterFirst bool
 	turns          int
+	forks          int
+	nextEntry      int
+}
+
+// open adopts an existing session file or creates one with a header.
+func (s *state) open() {
+	if s.sessionFile == "" {
+		if s.noSession {
+			return
+		}
+		dir := s.sessionDir
+		if dir == "" {
+			dir = os.TempDir()
+		}
+		s.sessionFile = filepath.Join(dir, fmt.Sprintf("fakepi-%d.jsonl", os.Getpid()))
+	}
+	if info, err := catalog.Parse(s.sessionFile); err == nil {
+		s.sessionID = info.ID
+		s.sessionName = firstNonEmpty(s.sessionName, info.Name)
+		s.messageCount = info.MessageCount
+		if leaf, err := catalog.LeafID(s.sessionFile); err == nil {
+			s.leafID = leaf
+		}
+		return
+	}
+	if s.noSession {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(s.sessionFile), 0o755); err != nil {
+		return
+	}
+	s.sessionID = fmt.Sprintf("fake-%d", os.Getpid())
+	s.writeHeader()
+	if s.sessionName != "" {
+		s.appendEntry(map[string]any{"type": "session_info", "name": s.sessionName})
+	}
+}
+
+// writeHeader writes the mandatory first line of a session file. Every other
+// entry chains off the header, so it must come first.
+func (s *state) writeHeader() {
+	s.appendEntry(map[string]any{
+		"type": "session", "version": 3, "id": s.sessionID,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"cwd":       mustGetwd(),
+	})
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// appendEntry writes one session line, chaining parentId to the current leaf
+// (except for the header, which stays root).
+func (s *state) appendEntry(entry map[string]any) {
+	if s.sessionFile == "" {
+		return
+	}
+	s.nextEntry++
+	if entry["type"] != "session" {
+		if _, ok := entry["id"]; !ok {
+			entry["id"] = fmt.Sprintf("e%d", s.nextEntry)
+		}
+		entry["parentId"] = s.leafID
+		if _, ok := entry["timestamp"]; !ok {
+			entry["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		s.leafID, _ = entry["id"].(string)
+	}
+	appendLine(s.sessionFile, entry)
 }
 
 func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 	typ, _ := msg["type"].(string)
 	id, _ := msg["id"].(string)
 	respond := func(command string, success bool, data any, errMsg string) {
-		obj := map[string]any{"type": "response", "command": command, "success": success}
-		if id != "" {
-			obj["id"] = id
-		}
+		var payload json.RawMessage
 		if data != nil {
-			obj["data"] = data
+			if raw, err := json.Marshal(data); err == nil {
+				payload = raw
+			}
 		}
-		if !success {
-			obj["error"] = errMsg
-		}
-		_ = c.WriteJSON(obj)
+		_ = c.WriteRaw(protocol.Response(id, command, success, "", errMsg, payload))
 	}
 
 	switch typ {
 	case "get_state":
-		s.mu.Lock()
-		data := map[string]any{
-			"model":                 map[string]any{"id": s.model, "provider": s.provider, "name": "Fake Model"},
-			"thinkingLevel":         s.thinking,
-			"isStreaming":           s.streaming,
-			"isCompacting":          false,
-			"steeringMode":          "all",
-			"followUpMode":          "one-at-a-time",
-			"sessionFile":           s.sessionFile,
-			"sessionId":             "fake-session",
-			"autoCompactionEnabled": true,
-			"messageCount":          s.messageCount,
-			"pendingMessageCount":   0,
-		}
-		if s.sessionName != "" {
-			data["sessionName"] = s.sessionName
-		}
-		s.mu.Unlock()
-		respond("get_state", true, data, "")
+		respond("get_state", true, s.stateData(), "")
 	case "get_entries":
-		respond("get_entries", true, map[string]any{"entries": []any{}, "leafId": nil}, "")
+		s.mu.Lock()
+		leaf := s.leafID
+		s.mu.Unlock()
+		respond("get_entries", true, map[string]any{"entries": []any{}, "leafId": leaf}, "")
 	case "get_messages":
 		respond("get_messages", true, map[string]any{"messages": []any{}}, "")
+	case "get_commands":
+		respond("get_commands", true, map[string]any{"commands": []any{}}, "")
 	case "prompt":
-		s.handlePrompt(c, id, msg, respond)
+		s.handlePrompt(c, msg, respond)
 	case "steer", "follow_up", "abort", "abort_retry", "abort_bash":
 		respond(typ, true, map[string]any{}, "")
 	case "clear_queue":
 		respond("clear_queue", true, map[string]any{"steering": []any{}, "followUp": []any{}}, "")
+	case "extension_ui_response":
+		// pi does not answer dialog responses, but the gateway tests need to
+		// see which id pi was handed.
+		respond(typ, true, map[string]any{"id": id}, "")
+	case "clone", "fork":
+		if s.newFile() != nil {
+			respond(typ, true, map[string]any{"cancelled": true}, "")
+			break
+		}
+		data := map[string]any{"cancelled": false}
+		if typ == "fork" {
+			data["text"] = "forked"
+		}
+		respond(typ, true, data, "")
 	case "set_model":
 		s.mu.Lock()
 		if v, ok := msg["modelId"].(string); ok {
@@ -182,6 +260,7 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 		s.mu.Lock()
 		if v, ok := msg["name"].(string); ok {
 			s.sessionName = v
+			s.appendEntry(map[string]any{"type": "session_info", "name": v})
 		}
 		data := map[string]any{"name": s.sessionName}
 		s.mu.Unlock()
@@ -191,7 +270,54 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 	}
 }
 
-func (s *state) handlePrompt(c *protocol.Codec, _ string, msg map[string]any,
+// stateData mirrors pi's get_state payload for the fields the gateway uses.
+func (s *state) stateData() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data := map[string]any{
+		"model":                 map[string]any{"id": s.model, "provider": s.provider, "name": "Fake Model"},
+		"thinkingLevel":         s.thinking,
+		"isStreaming":           s.streaming,
+		"isCompacting":          false,
+		"steeringMode":          "all",
+		"followUpMode":          "one-at-a-time",
+		"sessionId":             s.sessionID,
+		"autoCompactionEnabled": true,
+		"messageCount":          s.messageCount,
+		"pendingMessageCount":   0,
+	}
+	if s.sessionFile != "" {
+		data["sessionFile"] = s.sessionFile
+	}
+	if s.sessionName != "" {
+		data["sessionName"] = s.sessionName
+	}
+	return data
+}
+
+// newFile switches to a fresh session file (pi's fork/clone behavior). It
+// returns an error when there is nothing to fork.
+func (s *state) newFile() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionFile == "" {
+		return fmt.Errorf("no session file")
+	}
+	s.forks++
+	dir := s.sessionDir
+	if dir == "" {
+		dir = filepath.Dir(s.sessionFile)
+	}
+	s.sessionFile = filepath.Join(dir, fmt.Sprintf("fakepi-fork-%d-%d.jsonl", os.Getpid(), s.forks))
+	s.sessionID = fmt.Sprintf("fake-fork-%d", s.forks)
+	s.sessionName = ""
+	s.leafID = ""
+	s.messageCount = 0
+	s.writeHeader()
+	return nil
+}
+
+func (s *state) handlePrompt(c *protocol.Codec, msg map[string]any,
 	respond func(string, bool, any, string)) {
 	s.mu.Lock()
 	if s.rejectPrompt {
@@ -205,6 +331,10 @@ func (s *state) handlePrompt(c *protocol.Codec, _ string, msg map[string]any,
 		return
 	}
 	s.streaming = true
+	s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
+		"role": "user", "content": msg["message"],
+	}})
+	s.messageCount++
 	events, delay := s.events, s.delay
 	uiRequest := s.uiRequest
 	s.mu.Unlock()
@@ -234,28 +364,40 @@ func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay
 	}
 	emit(map[string]any{"type": "turn_start"})
 	emit(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}})
+	emit(map[string]any{"type": "message_update",
+		"assistantMessageEvent": map[string]any{"type": "text_start", "contentIndex": 0}})
 	for i := 0; i < events; i++ {
 		emit(map[string]any{
 			"type":  "message_update",
-			"delta": fmt.Sprintf("%s[%d]", text, i),
+			"usage": map[string]any{"output": i + 1, "totalTokens": i + 1},
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0,
+				"delta": fmt.Sprintf("%s[%d]", text, i),
+			},
 		})
 	}
+	emit(map[string]any{"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type": "text_end", "contentIndex": 0, "content": "echo: " + text,
+		}})
 	emit(map[string]any{"type": "message_end", "message": map[string]any{
-		"role":    "assistant",
-		"content": []any{map[string]any{"type": "text", "text": "echo: " + text}},
+		"role":       "assistant",
+		"stopReason": "stop",
+		"content":    []any{map[string]any{"type": "text", "text": "echo: " + text}},
 	}})
 	emit(map[string]any{"type": "turn_end"})
 	emit(map[string]any{"type": "agent_end"})
 
 	s.mu.Lock()
 	s.streaming = false
+	s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "echo: " + text}},
+	}})
 	s.messageCount++
 	s.turns++
-	file := s.sessionFile
 	exitAfter := s.exitAfterFirst && s.turns >= 1
 	s.mu.Unlock()
 	emit(map[string]any{"type": "agent_settled"})
-	appendLine(file, map[string]any{"type": "message", "message": map[string]any{"role": "user", "content": text}})
 	if exitAfter {
 		// Let the settle event drain before simulating a pi crash.
 		time.Sleep(50 * time.Millisecond)

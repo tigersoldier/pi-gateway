@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,9 +36,14 @@ func main() {
 			"keep a session warm this long after the last client detaches")
 		shortGrace = fs.Duration("short-grace", 10*time.Second,
 			"grace for sessions that never received a message and have no clients")
+		sessionDirs = &stringList{}
+		deltaFlush  = fs.Duration("delta-flush", 50*time.Millisecond,
+			"coalescing window for streaming deltas (per client)")
 		verbose     = fs.Bool("verbose", false, "log session lifecycle and errors")
 		showVersion = fs.Bool("version", false, "print pi-gatewayd's own version and exit")
 	)
+	fs.Var(sessionDirs, "session-dir",
+		"extra session directory to scan for the catalog (repeatable)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: pi-gatewayd [options]\n\nOptions:\n")
 		fs.PrintDefaults()
@@ -75,13 +81,15 @@ func main() {
 	}
 
 	d := daemon.New(daemon.Config{
-		Addr:        addr,
-		Token:       token,
-		PortFile:    config.PortPath(dir),
-		PiBin:       *piBin,
-		IdleTimeout: *idleTimeout,
-		ShortGrace:  *shortGrace,
-		Logf:        logf,
+		Addr:         addr,
+		Token:        token,
+		PortFile:     config.PortPath(dir),
+		PiBin:        *piBin,
+		IdleTimeout:  *idleTimeout,
+		ShortGrace:   *shortGrace,
+		CatalogRoots: sessionDirs.Values,
+		DeltaFlush:   *deltaFlush,
+		Logf:         logf,
 	})
 	if err := d.Listen(); err != nil {
 		fatal(err)
@@ -103,4 +111,19 @@ func main() {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "pi-gatewayd: %v\n", err)
 	os.Exit(1)
+}
+
+// stringList collects a repeatable string flag.
+type stringList struct {
+	Values []string
+}
+
+func (s *stringList) String() string { return strings.Join(s.Values, ", ") }
+
+func (s *stringList) Set(value string) error {
+	if value == "" {
+		return fmt.Errorf("empty value")
+	}
+	s.Values = append(s.Values, value)
+	return nil
 }
