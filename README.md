@@ -144,8 +144,10 @@ unless it is explicitly marked so.
   exits. Every other non-RPC mode, including TUI, errors.
 - **Common pi parameters** (operator). **Split by applicability.** Accepted:
   trust, extensions, resource/tool toggles, `--provider`, `--model`,
-  `--thinking`, `--name`, `--session-dir`, `--no-session`, `--api-key`. Other
-  pi options error. Not live → applied at spawn. Live → runtime-applicable
+  `--models`, `--thinking`, `--name`, `--session-dir`, `--no-session`,
+  `--api-key`, `--offline`, `--verbose`, plus pi's short aliases (`-a`, `-na`,
+  `-ne`, `-ns`, `-np`, `-nc`, `-nbt`, `-nt`, `-t`, `-xt`, `-n`, `-e`). The
+  authoritative list is `docs/protocol.md` §4.3. Other pi options error. Not live → applied at spawn. Live → runtime-applicable
   params (`--model`, `--provider`, `--thinking`, `--name`) are applied via RPC
   to shared session state. Spawn-only params are compared against the session's
   recorded spawn config: **identical values are no-ops; only a conflicting
@@ -282,6 +284,11 @@ unless it is explicitly marked so.
   and a session whose file already exists is always respawned in the directory
   recorded in its header — hibernation and daemon restarts ignore the
   attaching client's directory.
+- **pi crash** (implementation policy settled). **No auto-respawn.** A crashed
+  pi is reported with `gw_session_state{state:"crashed"}`, its pending work
+  fails, and the session file is left intact. The daemon does **not** restart
+  pi on its own: the next attach re-adopts the session and respawns it (lazy
+  re-adoption), so a crash loop cannot burn model quota unattended.
 - **pi option aliases** (found by the end-to-end suite). **Accepted.**
   pi's short forms (`-a`, `-na`, `-ne`, `-ns`, `-np`, `-nc`, `-nbt`, `-nt`,
   `-e`, `-t`, `-xt`, `-n`) map to the same canonical parameters as their long
@@ -315,7 +322,7 @@ is implemented.
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
 | Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics |
-| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject` |
+| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session` requires `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
 Deferred to M4 (optional, `docs/design.md` §14): session groups across
 daemons, WebSocket transport for non-local clients, and other transport
@@ -366,6 +373,54 @@ go test -race ./...
 
 Point `pilish-executable` (local) at the `pi-gateway` binary, or the layer's
 `pilish/remote-executables` path (remote). Do not shadow the real `pi`.
+
+### `pi-gatewayd` reference
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--listen <host:port>` | `127.0.0.1:7331` | loopback address for the session listener |
+| `--port <n>` | — | port shorthand; overrides `--listen` |
+| `--state-dir <dir>` | `~/.config/pi-gateway` | where `token`, `tokens.json`, `port` and `debug-port` live |
+| `--token-file <path>` | `<state>/token` | token file (mode `0600`) |
+| `--tokens-file <path>` | `<state>/tokens.json` | restricted-token file (mode `0600`) |
+| `--pi <path>` | `pi` | the pi binary to manage |
+| `--idle-timeout <dur>` | `15m` | keep a session warm this long after the last client detaches |
+| `--short-grace <dur>` | `10s` | grace for a session that never received a message and has no clients |
+| `--session-dir <dir>` | — | extra session directory to scan for the catalog (repeatable) |
+| `--delta-flush <dur>` | `50ms` | coalescing window for streaming deltas, per client |
+| `--log-level <level>` | `info` | `debug`, `info`, `warn`/`warning`, `error` (case-insensitive) |
+| `--log-format <fmt>` | `text` | `text` or `json` |
+| `--debug-addr <host:port>` | `127.0.0.1:7332` | read-only, unauthenticated debug listener |
+| `--debug-port <n>` | — | port shorthand; overrides `--debug-addr` |
+| `--no-debug` | off | disable the debug listener |
+| `--provision-token` | — | mint a restricted token and print it (needs `--token-name` and `--token-role` or `--token-caps`) |
+| `--token-name <name>` | — | name for `--provision-token` |
+| `--token-role <role>` | — | `admin`, `operator` or `observer` |
+| `--token-caps <csv>` | — | explicit capability list instead of a role |
+| `--version` | — | print the daemon's own version |
+
+`SIGINT`/`SIGTERM` stop all sessions (abort, close stdin, grace, then `SIGKILL`);
+`SIGHUP` re-reads `tokens.json` without restarting. Both listeners refuse
+non-loopback addresses. The state directory also follows `PI_GATEWAY_CONFIG_DIR`
+for the daemon (and `XDG_CONFIG_HOME` when that is unset).
+
+### `pi-gateway` (bridge) reference
+
+| Flag | Meaning |
+|---|---|
+| `--server <host:port>` | daemon address (default: the `port` file, then `127.0.0.1:7331`) |
+| `--port <n>` | daemon port on `127.0.0.1` |
+| `--token-file <path>` | token file (default `<state>/token`) |
+| `--mode rpc` | accepted and consumed; any other mode is an error |
+| `--version` | print the managed pi version (answered by the daemon) |
+| `--help`, `-h` | client-local usage |
+
+It also accepts the pi options listed in `docs/protocol.md` §4.3 and forwards
+them to the daemon; anything else is refused before connecting. Environment:
+`PI_GATEWAY_CLIENT_NAME` (default `pi-gateway`), `PI_GATEWAY_CLIENT_KIND`
+(default `pilish`), `PI_GATEWAY_CONFIG_DIR`. Exit codes: `0` success, `2` usage
+error (bad flag, unsupported pi option), `3` daemon unreachable or handshake
+refused.
 
 ## Repository layout
 

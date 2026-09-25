@@ -18,7 +18,7 @@ This document is the client-facing wire protocol for the settled design in
   `gw_reload_session`, `fork`/`clone` policy, the extension UI broker, the
   daemon queue, replay (`liveOnly` / `resume.sinceSeq`) and durable resume
   (`resume.leafEntryId`), `gw_snapshot`, coalescing with `allowLossy`/`gw_lag`,
-  hibernation/reaping, and the read-only HTTP debug endpoints (§12). See
+  hibernation/reaping, and the read-only HTTP debug endpoints (§13). See
   README → *Implementation status*.
 
 ---
@@ -74,17 +74,22 @@ binary at that path is invoked directly. Local pilish points
 - Port discovery is **hybrid**: the daemon writes the bound port to
   `~/.config/pi-gateway/port`; clients prefer that file and fall back to
   `127.0.0.1:7331`. `--server`/`--port` override.
-- Authentication: the daemon generates `~/.config/pi-gateway/token` (mode
-  `0600`) on first start. Every `gw_hello` must carry it; missing or wrong
-  tokens get `gw_error{code:"unauthorized"}` and the connection closes.
-  The client reads the file by default; `--token-file` overrides.
+- The state directory is `~/.config/pi-gateway` by default; the
+  `PI_GATEWAY_CONFIG_DIR` environment variable (or `XDG_CONFIG_HOME`) overrides
+  it for clients, and the daemon's `--state-dir` overrides it for the daemon.
+- Authentication: the daemon generates `<state>/token` (mode `0600`) on first
+  start. Every `gw_hello` must carry it; missing or wrong tokens get
+  `gw_error{code:"unauthorized"}` and the connection closes. The client reads
+  the file by default; `--token-file` overrides.
+- `port`, `debug-port` (the bound debug-listener port) and `tokens.json` live
+  in the same directory and are written `0600` by atomic rename.
 - That token always grants every capability. Additional restricted tokens come
   from `~/.config/pi-gateway/tokens.json` (mode `0600`), each naming a preset
   role (`admin`, `operator`, `observer`) or an explicit capability list; the
   file is re-read on SIGHUP. `gw_welcome.granted` is the intersection of the
   client's request with the token's role (§2).
 - The HTTP debug listener is a **separate loopback port**, read-only and
-  **unauthenticated**; §12 documents its endpoints.
+  **unauthenticated**; §13 documents its endpoints.
 - There is no TLS and no network listener (all clients are local).
 
 ---
@@ -132,7 +137,7 @@ message.
   "client": {
     "name": "pilish-on-laptop",
     "kind": "pilish",
-    "capabilities": ["observe", "interject", "prompt", "ui", "control"],
+    "capabilities": ["observe", "interject", "prompt", "ui", "control", "admin"],
     "tags": {"host": "laptop"}
   },
   "cwd": "/home/u/proj",
@@ -182,7 +187,17 @@ message.
 
 The `granted` array in the reply is the intersection of the requested
 capabilities with the token's role. The default daemon-generated token grants
-all of them; a token from `tokens.json` grants only its role.
+all of them (including `admin`); a token from `tokens.json` grants only its
+role. When a client omits `client.name`/`client.kind`, they default to
+`client` and `integration`.
+
+Session creation is not a privileged operation: `gw_hello.session`, the first
+session-scoped command (implicit creation) and `get_state` may start a session
+for any client that may use those commands, because the session it starts is
+its own. What a client may do *inside* a session is governed entirely by the
+capability table (§10).
+
+A second `gw_hello` on the same connection is `bad_frame`.
 
 ### `gw_welcome` (daemon → client)
 
@@ -283,6 +298,15 @@ Response data:
 ```
 
 `live` means a pi process is attached; non-live sessions exist only as files.
+Rows are ordered live sessions first, then by `lastActivity` descending — the
+same order `/catalog` returns.
+
+Discovery: the daemon scans the session roots in this order —
+`$PI_CODING_AGENT_SESSION_DIR`, then `$PI_CODING_AGENT_DIR/sessions`, then
+`~/.pi/agent/sessions`, plus every `--session-dir` the operator passed
+(repeatable) — one level of `<encoded-cwd>/` deeper. A scan is bounded to 1000
+files per root; if the bound is hit before a name resolves, the daemon answers
+`ambiguous_session` rather than guessing.
 `createdBy` carries the creating client's identity for explicitly created
 sessions, so an integration can list its own.
 
@@ -331,6 +355,8 @@ Attach is pi's `switch_session`, intercepted by the daemon:
 - The client's immediately following `get_state` / `get_messages` /
   `get_commands` are routed to the newly bound session, in order.
 - Rebinding does not affect other clients attached to the old or new session.
+- `switch_session` accepts `session` as an alias for `sessionPath`, matching
+  `gw_reload_session`.
 
 ### 3.5 Hibernation
 
@@ -517,7 +543,9 @@ Forwarded verbatim with `gw_seq`, `gw_session`, `gw_ts` added:
 `extension_error`, `extension_ui_request`.
 
 `bash_execution_update` goes to its originator with the original `id`; other
-clients receive a copy tagged with `gw_owner`.
+direct gateway clients receive a copy tagged with `gw_owner`. A **bridge**
+suppresses `gw_owner`-tagged frames, so a raw pi UI never sees another
+client's command output.
 
 ### 5.2 Gateway events (daemon → client)
 
@@ -531,9 +559,9 @@ clients receive a copy tagged with `gw_owner`.
 | `gw_queue` | `{pending:[{id, mode:"followUp", author:{clientId,kind,name}, preview}]}` | daemon-owned pending prompts, tagged by client kind; immediate `steer` interjections are not listed |
 | `gw_presence` | `{event:"join"\|"leave"\|"update", client}` | roster |
 | `gw_state_changed` | `{command, data, by}` | shared-state mutation |
-| `gw_session_state` | `{state:"ready"\|"starting"\|"hibernated"\|"restarting"\|"crashed"\|"stopped", reason?, exitCode?}` | session process lifecycle |
+| `gw_session_state` | `{state:"ready"\|"hibernated"\|"restarting"\|"crashed"\|"stopped", reason?, exitCode?}` | session process lifecycle |
 | `gw_lag` | `{oldestSeq, headSeq}` | client fell behind; resync |
-| `gw_error` | `{code, message}` | protocol-level error |
+| `gw_error` | `{code, message, id?}` (`id` set when the error answers a specific request) | protocol-level error |
 | `gw_pong` | `{}` | liveness |
 
 `gw_lag{oldestSeq, headSeq}` names the **first and last dropped record**
@@ -592,12 +620,12 @@ validated and forwarded to pi.
 | `spawn_param_conflict` | spawn-only parameter differs from the live session config |
 | `shared_session` | `fork`/`clone` requested while other clients are attached |
 | `reload_busy` | reload refused: other clients attached or a turn running |
-| `queue_full` | per-session or per-client command queue full |
+| `queue_full` | command rejected: the session actor is busy or shutting down (its inbound queue is full) |
 | `slow_consumer` | client disconnected for not reading |
 | `ui_stale` | extension UI response arrived after resolution |
 | `session_crashed` | pi exited; command not accepted |
 | `resync_required` | cursor too old or unknown |
-| `not_supported` | mode/command outside the supported surface (e.g. TUI) |
+| `not_supported` | unsupported protocol version, unknown `gw_*` message, or a command outside the supported surface (e.g. TUI) |
 
 Errors stay pi-shaped where a `response` is expected:
 
@@ -697,7 +725,7 @@ reads the transcript. The cancellation primitives share `interject` with
 **Event delivery follows `observe`.** A client without `observe` receives only
 records addressed to it — its own responses, errors, and dialogs — and gets no
 event stream, no replay, and no `gw_snapshot`; its `gw_welcome` reports
-`resyncRequired: false`. The debug endpoints are documented in §12.
+`resyncRequired: false`. The debug endpoints are documented in §13.
 
 ## 11. Open semantics
 
@@ -708,7 +736,7 @@ will be revisited after implementation.
 
 ---
 
-## 11. Compatibility notes for client authors
+## 12. Compatibility notes for client authors
 
 1. **Always send `id`** on commands; the daemon namespaces it per client, so a
    client can freely reuse `req-1`.
@@ -724,7 +752,7 @@ will be revisited after implementation.
 
 ---
 
-## 12. HTTP debug endpoints
+## 13. HTTP debug endpoints
 
 The daemon also serves a **read-only, unauthenticated** HTTP listener on a
 second loopback port (`127.0.0.1:7332`; `--debug-addr`/`--debug-port`,
@@ -733,7 +761,8 @@ second loopback port (`127.0.0.1:7332`; `--debug-addr`/`--debug-port`,
 expose a mutating route, and any data it returns must be safe for any local
 process to read.
 
-Non-`GET`/`HEAD` methods get `405` with `Allow: GET, HEAD`.
+Non-`GET`/`HEAD` methods get `405` with `Allow: GET, HEAD`; unknown paths get
+`404` with `{"error": "...", "paths": ["/status", "/catalog", "/metrics"]}`.
 
 ### `GET /status`
 
@@ -766,8 +795,8 @@ Non-`GET`/`HEAD` methods get `405` with `Allow: GET, HEAD`.
 
 `registered` counts every session the daemon tracks, including one a client
 created before pi reported its file path; `live` counts those with a running
-pi. `state` is the `gw_session_state` value (`starting`, `ready`,
-`restarting`, `stopping`, `hibernated`, `stopped`, or `crashed`).
+pi. `state` is the `gw_session_state` value (`ready`, `restarting`,
+`hibernated`, `stopped`, or `crashed`).
 
 ### `GET /catalog`
 

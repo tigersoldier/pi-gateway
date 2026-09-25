@@ -1,6 +1,7 @@
 # Design: `pi-gateway` — a pi session daemon and `pi` replacement
 
-Status: draft · Target: Go 1.22+ · Depends on: `pi --mode rpc`
+Status: implemented (M1–M3; mid-turn attach provisional) · Target: Go 1.22+ ·
+Depends on: `pi --mode rpc`
 
 > **Reading order.** `README.md` → *Design decisions* is the canonical decision
 > log, and `docs/protocol.md` draft 2 is the authoritative protocol. This whole
@@ -322,7 +323,8 @@ hibernation or a daemon restart always happens in the session's own project
 
 Sessions created with `--no-session` are supported but **ephemeral**: pi
 reports no session file, so they have no path to attach to, they cannot be
-re-adopted after they stop, and `gw_new_session` refuses them. The `ephemeral`
+re-adopted after they stop, and `gw_new_session` refuses them with
+`session_crashed` (pi reports no file). The `ephemeral`
 marker itself is not surfaced in the catalog yet.
 
 ### 4.2 Attach and rebinding
@@ -383,10 +385,12 @@ are lost on daemon restart (accepted).
 2. fails pending requests and drains the prompt queue with `session_crashed`;
 3. leaves the session file intact for re-attach.
 
-With lazy re-adoption, a crashed session is loaded again on the next attach.
-Whether the daemon **also** auto-respawns while clients remain attached is an
-implementation policy to settle during implementation; the protocol only
-requires the `gw_session_state` signal and a resync after recovery.
+**Settled: the daemon does not auto-respawn.** A crashed session stays
+registered but dead until the next `attach`/`switch_session`, which respawns pi
+and resumes from the session file (lazy re-adoption, §4.5); clients that stayed
+attached get `gw_session_state{state:"crashed"}` and resync when it comes back.
+Auto-respawning a crash loop would burn the operator's model quota without a
+client asking for it.
 
 ### 4.7 Graceful shutdown
 
@@ -489,10 +493,11 @@ rewritten.
 
 ### 6.3 Spawn parameters
 
-Accepted from the client: trust (`--approve`/`--no-approve`), extensions
-(`-e`, `--no-extensions`), resource/tool toggles, `--provider`, `--model`,
-`--thinking`, `--name`, `--session-dir`, `--no-session`, `--api-key`. Other pi
-options are rejected.
+Accepted from the client: the set listed in `docs/protocol.md` §4.3,
+including pi's short aliases (`-a`, `-nt`, `-t`, `-n`, …) and `--models`,
+`--offline`, `--verbose`. Aliases record the same canonical parameter as their
+long form. Other pi options — session selection and one-shot modes the gateway
+owns — are rejected.
 
 - Not-live session: all accepted parameters apply at spawn.
 - Live session: runtime-applicable parameters (`--model`, `--provider`,
@@ -523,10 +528,15 @@ id-addressed and delivered only to the originator.
 
 Fan-out to a slow client must never stall pi:
 
-- Each connection has a bounded queue (e.g. 1024 records / 4 MB).
+- Each connection has a bounded queue (1024 records; a replay window that
+  cannot fit is answered with a resync/snapshot instead of a slow-consumer
+  close, §5.2).
 - **Delta coalescing**: per connection, `message_update` text/thinking deltas
   are merged to at most one record per flush interval (default 50 ms) or 8 KB.
-- **Terminal events are never dropped**: `message_end`, `tool_execution_end`,
+- **Terminal events are never dropped** — the gateway's own lifecycle and
+  control frames (`gw_*`) are terminal as well, so the guarantee covers the
+  complete list in `internal/session/hub.go`; pi's are `message_end`,
+  `tool_execution_end`,
   `turn_end`, `agent_end`, `agent_settled`, `response`, `extension_ui_request`.
   If a queue is saturated with terminal events, the connection is closed with
   `gw_error{code:"slow_consumer"}` so it can reconnect and resync.
@@ -647,9 +657,13 @@ can withdraw work another client queued.
 - Per-integration tokens are local files under the operator's control; there
   is no token database, expiry, or revocation beyond editing `tokens.json` and
   sending SIGHUP.
-- Limits: max frame size, commands/s, connections per session, sessions per
-  daemon. Never accept arbitrary `sessionFile`/`cwd`/argv from an untrusted
-  client. Tool output is untrusted data; the daemon does not sanitize it.
+- Limits: **max frame size is enforced**; the planned commands-per-second,
+  connections-per-session and sessions-per-daemon caps are **not implemented
+  yet** (the daemon is a single-user loopback service). The daemon never
+  accepts an arbitrary `sessionFile` to read or write: paths a client names are
+  resolved against the catalog, and the `cwd` it sends is validated as an
+  absolute existing directory used only as pi's spawn directory. Tool output is
+  untrusted data; the daemon does not sanitize it.
 
 ---
 
@@ -738,7 +752,14 @@ arbitration) has been removed.
 - **Auth/limits**: missing/wrong token rejected; oversized frames rejected.
 - **Crash / slow consumer**: `kill -9` pi mid-turn and a client that stops
   reading; assert `gw_session_state`, disconnect/resync, and that pi latency is
-  unaffected for healthy clients.
+  unaffected for healthy clients. A replay window too large for the connection's
+  out queue must resync from a snapshot instead of closing the client.
+- **Single-writer invariant**: attaching while a reload is mid-restart joins the
+  reloading actor; assert one pi process and one catalog row for the session
+  file, and that runtime parameters applied on attach are attributed to the
+  attaching client.
+- **Session directory**: a new session runs pi in the client's `cwd`; a
+  respawned session uses the directory recorded in its header.
 - **Race detector**: `go test -race` on all packages.
 
 ---
