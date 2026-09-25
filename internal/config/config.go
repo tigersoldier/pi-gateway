@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -48,6 +49,9 @@ func TokenPath(dir string) string { return filepath.Join(dir, "token") }
 // PortPath returns the default port file path inside dir.
 func PortPath(dir string) string { return filepath.Join(dir, "port") }
 
+// DebugPortPath returns the port file for the read-only debug listener.
+func DebugPortPath(dir string) string { return filepath.Join(dir, "debug-port") }
+
 // LoadOrCreateToken reads the token at path, generating a stable random token
 // on first use. The file is written mode 0600.
 func LoadOrCreateToken(path string) (string, error) {
@@ -58,16 +62,13 @@ func LoadOrCreateToken(path string) (string, error) {
 	if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("config: create %s: %w", filepath.Dir(path), err)
-	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("config: generate token: %w", err)
 	}
 	tok = hex.EncodeToString(buf)
-	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
-		return "", fmt.Errorf("config: write token: %w", err)
+	if err := writeFileMode(path, []byte(tok+"\n"), 0o600); err != nil {
+		return "", err
 	}
 	return tok, nil
 }
@@ -87,15 +88,47 @@ func ReadToken(path string) (string, error) {
 
 // WritePort atomically records the bound port.
 func WritePort(path string, port int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("config: create %s: %w", filepath.Dir(path), err)
+	return writeFileMode(path, []byte(strconv.Itoa(port)+"\n"), 0o600)
+}
+
+// RemovePortFile deletes a port file, ignoring a missing file.
+func RemovePortFile(path string) {
+	_ = os.Remove(path)
+}
+
+// RemovePortIfMatches deletes a port file only while it still holds port, so a
+// shutting-down instance never removes a newer instance's file.
+func RemovePortIfMatches(path string, port int) {
+	if p, err := ReadPort(path); err == nil && p == port {
+		_ = os.Remove(path)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.Itoa(port)+"\n"), 0o600); err != nil {
-		return fmt.Errorf("config: write port: %w", err)
+}
+
+// RequireLoopback rejects an address that is not loopback. Both listeners are
+// documented as local-only (docs/design.md §10), so this is enforced rather
+// than trusted to the operator.
+func RequireLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("config: invalid address %q: %w", addr, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("config: rename port file: %w", err)
+	if host == "" {
+		return fmt.Errorf("config: %q listens on every interface; use the loopback address %s", addr, DefaultAddr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("config: %q is not a loopback address", addr)
+	}
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("config: cannot resolve %q: %w", host, err)
+	}
+	for _, resolved := range ips {
+		if ip := net.ParseIP(resolved); ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("config: %q is not a loopback address", addr)
+		}
 	}
 	return nil
 }

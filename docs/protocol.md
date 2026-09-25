@@ -11,14 +11,15 @@ This document is the client-facing wire protocol for the settled design in
 - Every decision for this draft is settled; the one deliberately provisional
   behavior is noted in §6 (mid-turn attach) and will be revisited after
   implementation.
-- **Implementation status.** M1 and M2 are implemented: handshake/auth,
+- **Implementation status.** M1, M2, and M3 are implemented: handshake/auth
+  with token roles and capability provisioning (`tokens.json`, SIGHUP reload, per-command `get_*` checks),
   token/port discovery, lazy session creation, attach/rebind by path **or
   name**, `new_session`, the catalog (`gw_list_sessions`), `gw_new_session`,
   `gw_reload_session`, `fork`/`clone` policy, the extension UI broker, the
   daemon queue, replay (`liveOnly` / `resume.sinceSeq`) and durable resume
   (`resume.leafEntryId`), `gw_snapshot`, coalescing with `allowLossy`/`gw_lag`,
-  and hibernation/reaping. Per-command `get_*` capability checks and token
-  roles are M3. See README → *Implementation status*.
+  hibernation/reaping, and the read-only HTTP debug endpoints (§12). See
+  README → *Implementation status*.
 
 ---
 
@@ -77,8 +78,13 @@ binary at that path is invoked directly. Local pilish points
   `0600`) on first start. Every `gw_hello` must carry it; missing or wrong
   tokens get `gw_error{code:"unauthorized"}` and the connection closes.
   The client reads the file by default; `--token-file` overrides.
-- The future HTTP debug listener is a **separate loopback port**, added later,
-  sharing the same token. It is not part of this document.
+- That token always grants every capability. Additional restricted tokens come
+  from `~/.config/pi-gateway/tokens.json` (mode `0600`), each naming a preset
+  role (`admin`, `operator`, `observer`) or an explicit capability list; the
+  file is re-read on SIGHUP. `gw_welcome.granted` is the intersection of the
+  client's request with the token's role (§2).
+- The HTTP debug listener is a **separate loopback port**, read-only and
+  **unauthenticated**; §12 documents its endpoints.
 - There is no TLS and no network listener (all clients are local).
 
 ---
@@ -163,7 +169,11 @@ message.
   `interject` (`steer`), `ui` (answering dialogs), `observe`
   (`gw_list_sessions`), `control` (`gw_reload_session`), and `admin`
   (`gw_new_session`). Per-command `get_*` checks and full role provisioning
-  land with M3.
+  are enforced as of M3 (see §10).
+
+The `granted` array in the reply is the intersection of the requested
+capabilities with the token's role. The default daemon-generated token grants
+all of them; a token from `tokens.json` grants only its role.
 
 ### `gw_welcome` (daemon → client)
 
@@ -391,8 +401,8 @@ for cross-client ordering.
 Because the daemon holds the queue, `clear_queue` and `abort` are defined in
 terms of the daemon queue and pi's turn:
 
-- `abort` may be called by any client. It stops the shared current turn;
-  daemon-queued prompts remain and run afterwards (pi-native behavior).
+- `abort` stops the shared current turn; daemon-queued prompts remain and run
+  afterwards (pi-native behavior). Like `steer` it requires `interject` (§10).
 - `clear_queue` is **session-wide**: it clears the entire daemon queue and is
   forwarded to pi to clear forwarded steers, returning all cleared text
   (`{steering:[...], followUp:[...]}`) to the caller. That text may include
@@ -438,8 +448,9 @@ Intercepted (not forwarded to the current pi):
 | `new_session` | create a new session, rebind **only this connection**, synthesize response (§3.7) |
 | `fork`, `clone` | sole client: forward, adopt the new file, rebind requester; shared: `shared_session` (§3.8) |
 
-`abort` and `clear_queue` are **session-wide** and may be called by any client
-(§3.9).
+`abort` and `clear_queue` are **session-wide** and require `interject`, the
+same capability as `steer` (§3.9, §10): clearing can withdraw prompts another
+client queued or had forwarded.
 
 ### 4.3 Spawn parameters (`piArgs`)
 
@@ -643,7 +654,36 @@ all <- gw_session_state{state:"ready"}
 
 ---
 
-## 10. Open semantics
+## 10. Capability enforcement
+
+Every command is checked once, before dispatch, against the token's role
+(docs/design.md §10). Command types are canonical: a frame whose `type` is not
+lowercase is rejected with `bad_frame` rather than forwarded, so case variants
+cannot dodge the table. A missing capability answers `forbidden` without
+dispatching the command, so a refused command never lazily creates a session,
+starts pi, or changes shared state.
+
+| Capability | Commands |
+|---|---|
+| `observe` | `get_*`, `export_html`, `gw_list_sessions`, receiving the event stream |
+| `prompt` | `prompt`, `follow_up`, `new_session`, `fork`, `clone`, `bash`, `switch_session` |
+| `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
+| `ui` | `extension_ui_response`, `notify` |
+| `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
+| `admin` | `gw_new_session` |
+| *(none)* | `gw_ping`, `gw_bye` |
+
+`bash` requires `prompt` because a prompt-capable client can already cause
+shell work through the agent; `export_html` requires `observe` because it only
+reads the transcript. The cancellation primitives share `interject` with
+`steer`, because `clear_queue` can withdraw work another client queued.
+
+**Event delivery follows `observe`.** A client without `observe` receives only
+records addressed to it — its own responses, errors, and dialogs — and gets no
+event stream, no replay, and no `gw_snapshot`; its `gw_welcome` reports
+`resyncRequired: false`. The debug endpoints are documented in §12.
+
+## 11. Open semantics
 
 None. Every gap found while reviewing this draft has been resolved with the
 operator and recorded in `README.md` → Design decisions. The only deliberately
@@ -665,3 +705,67 @@ will be revisited after implementation.
 6. **Never use readline-style splitters**; split on LF only.
 7. **Treat `extension_ui_request` as possibly not yours** unless you are the
    turn author or the daemon addressed it to you (§7).
+
+---
+
+## 12. HTTP debug endpoints
+
+The daemon also serves a **read-only, unauthenticated** HTTP listener on a
+second loopback port (`127.0.0.1:7332`; `--debug-addr`/`--debug-port`,
+`--no-debug` to disable). The bound port is written to
+`~/.config/pi-gateway/debug-port`. Because it takes no token, it must never
+expose a mutating route, and any data it returns must be safe for any local
+process to read.
+
+Non-`GET`/`HEAD` methods get `405` with `Allow: GET, HEAD`.
+
+### `GET /status`
+
+```json
+{
+  "version": "0.2.0",
+  "protocol": 1,
+  "piVersion": "1.2.3",
+  "addr": "127.0.0.1:7331",
+  "debugAddr": "127.0.0.1:7332",
+  "startedAt": "2026-01-01T00:00:00Z",
+  "uptimeSeconds": 12.5,
+  "sessions": {
+    "piVersion": "1.2.3",
+    "registered": 2,
+    "live": 1,
+    "streaming": 0,
+    "clients": 1,
+    "connections": 2,
+    "queueDepth": 0,
+    "subscribers": 1,
+    "tokens": 2,
+    "liveSessions": [
+      {"path": "/home/u/.pi/agent/sessions/x/a.jsonl", "name": "auth",
+       "state": "ready", "clients": 1, "queueDepth": 0, "streaming": false}
+    ]
+  }
+}
+```
+
+`registered` counts every session the daemon tracks, including one a client
+created before pi reported its file path; `live` counts those with a running
+pi. `state` is the `gw_session_state` value (`starting`, `ready`,
+`restarting`, `stopping`, `hibernated`, `stopped`, or `crashed`).
+
+### `GET /catalog`
+
+`{"sessions": [...]}` — the same rows `gw_list_sessions` returns (§3.2),
+newest first. Optional query parameters: `cwd` (exact working-directory
+filter) and `limit`.
+
+### `GET /metrics`
+
+Prometheus text exposition format (version 0.0.4), no labels. Names are
+prefixed `pi_gateway_`; counters end in `_total`. Counters cover sessions
+started/ended/reaped, attaches and failures, unauthorized connections, turns
+started/settled, prompts queued/rejected, reloads and refusals, pi exits, UI
+dialog routing, subscriber drops, `gw_lag` markers, frames/bytes in and out,
+and lossy drops. Gauges report registered/live/streaming sessions, attached
+clients, connections, queue depth, subscribers, configured tokens, and
+uptime.

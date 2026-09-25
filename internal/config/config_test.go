@@ -1,8 +1,10 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -79,5 +81,51 @@ func TestPortOf(t *testing.T) {
 	}
 	if _, err := PortOf("127.0.0.1"); err == nil {
 		t.Fatal("address without port must fail")
+	}
+}
+
+func TestRequireLoopback(t *testing.T) {
+	allowed := []string{"127.0.0.1:7331", "127.0.0.1:0", "[::1]:7331", "localhost:7331"}
+	for _, addr := range allowed {
+		if err := RequireLoopback(addr); err != nil {
+			t.Errorf("RequireLoopback(%q) = %v, want nil", addr, err)
+		}
+	}
+	rejected := []string{"0.0.0.0:7331", ":7331", "10.1.2.3:7331", "example.com:80", "not-an-address"}
+	for _, addr := range rejected {
+		err := RequireLoopback(addr)
+		if err == nil {
+			t.Errorf("RequireLoopback(%q) was accepted", addr)
+			continue
+		}
+		if !strings.Contains(err.Error(), "loopback") && !strings.Contains(err.Error(), "address") {
+			t.Errorf("RequireLoopback(%q) error = %v", addr, err)
+		}
+	}
+}
+
+func TestPortFileHelpers(t *testing.T) {
+	dir := t.TempDir()
+	path := PortPath(dir)
+	if err := WritePort(path, 7331); err != nil {
+		t.Fatal(err)
+	}
+	// A different port must not be deleted (a newer instance owns the file).
+	RemovePortIfMatches(path, 99)
+	if got, err := ReadPort(path); err != nil || got != 7331 {
+		t.Fatalf("RemovePortIfMatches removed a foreign port file: %d, %v", got, err)
+	}
+	RemovePortIfMatches(path, 7331)
+	if _, err := ReadPort(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("port file survived RemovePortIfMatches: %v", err)
+	}
+	// RemovePortFile ignores a missing file and removes a stale one.
+	RemovePortFile(path)
+	if err := WritePort(path, 7331); err != nil {
+		t.Fatal(err)
+	}
+	RemovePortFile(path)
+	if _, err := ReadPort(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("port file survived RemovePortFile: %v", err)
 	}
 }

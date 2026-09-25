@@ -24,13 +24,14 @@ unit) on the machine that owns the sessions, and to accept **local connections**
 from clients. Clients are the processes third-party UIs spawn in place of `pi`.
 
 > **Status.** The design is settled (see [Design decisions](#design-decisions))
-> and **M2 is implemented**: the `pi-gatewayd` daemon and the `pi-gateway`
-> bridge, with token auth, port discovery, session attach/rebinding by path or
-> name, the session catalog, reload and fork/clone policies, turn-author UI
-> routing, the daemon-owned queue, replay/durable resume, coalescing,
-> hibernation, and orphan reaping. See
-> [Implementation status](#implementation-status) for scope and what is
-> deliberately deferred.
+> and **M3 is implemented**: the `pi-gatewayd` daemon and the `pi-gateway`
+> bridge, with token auth and capability roles, port discovery, session
+> attach/rebinding by path or name, the session catalog, reload and fork/clone
+> policies, turn-author UI routing, the daemon-owned queue, replay/durable
+> resume, coalescing, hibernation, orphan reaping, a systemd user unit, the
+> read-only debug listener (`/status` `/catalog` `/metrics`), and structured
+> logging. See [Implementation status](#implementation-status) for scope and
+> what is deliberately deferred.
 
 ## Background: why pi alone cannot do this
 
@@ -119,7 +120,8 @@ unless it is explicitly marked so.
   `switch_session` is the attach/route operation. Full contract and citations:
   `docs/design.md` §1.2.
 - **Local transport** (operator). **Loopback TCP** (`127.0.0.1:<port>`), chosen
-  so an HTTP debug endpoint can be added later. All clients are local. A
+  so the HTTP debug endpoint can share the same local transport. All clients
+  are local. A
   **token** is required because any local process can reach a loopback port.
 - **Network surface** (operator). **Local-only** — no network listener, no TLS.
 - **Session lifecycle** (operator). **Idle timeout.** After the last client
@@ -151,9 +153,35 @@ unless it is explicitly marked so.
   re-sends `--approve` on every reload.) **Confirmed:** runtime parameter
   changes are session-global, and every client is notified with
   `gw_state_changed`.
-- **HTTP debug endpoint** (operator). **Two ports.** The session listener stays
-  raw TCP + JSONL; a separate loopback HTTP listener is added later for
-  debug/status/metrics, sharing the same token.
+- **HTTP debug endpoint** (operator). **Two ports, no auth on the debug port.**
+  The session listener stays raw TCP + JSONL; a separate loopback HTTP listener
+  serves read-only `debug/status/metrics/catalog`. It requires **no token**
+  (loopback-only, like the session port is reachable only locally, but with no
+  authentication at all), so it exposes operational metadata and catalog
+  metadata (paths, names, titles) to any local process. It must never gain a
+  mutating endpoint; putting it behind the token again is a one-line change if
+  that exposure is unwanted.
+- **Token roles and provisioning** (operator). **Default token full authority;
+  optional `tokens.json` for restricted tokens.** The daemon-generated
+  `~/.config/pi-gateway/token` always grants every capability.
+  `~/.config/pi-gateway/tokens.json` (mode 0600) may add tokens that name a
+  preset role (`admin`, `operator`, `observer`) or an explicit capability list;
+  `gw_welcome.granted` is the intersection of the client's request with the
+  token's role. `pi-gatewayd --provision-token --token-name X --token-role Y`
+  mints one and appends it; SIGHUP reloads the file, so no restart is needed.
+  Unknown keys are rejected, and each entry sets **either** `role` **or**
+  `capabilities`:
+  ```json
+  {"tokens": [
+    {"name": "slack", "token": "<hex>", "role": "operator"},
+    {"name": "dashboard", "token": "<hex>", "capabilities": ["observe"]},
+    {"name": "audit", "token": "<hex>", "role": "observer", "comment": "read-only"}
+  ]}
+  ```
+- **Logging and metrics** (operator). **Structured `log/slog`, Prometheus text.**
+  `--log-format text|json` and `--log-level` on the daemon (text suits journald);
+  counters and gauges are exposed on the debug listener's `/metrics` in
+  Prometheus text format with no extra dependencies.
 - **Daemon restart** (operator). **Lazy re-adoption.** No pi processes at boot;
   the next attach loads the session file. In-flight turns are lost (accepted).
 - **Mid-turn attach** (operator, *provisional — revisit after implementation*).
@@ -177,8 +205,9 @@ unless it is explicitly marked so.
   On first start the daemon creates a random token at
   `~/.config/pi-gateway/token` (mode `0600`); the client reads it by default and
   `--token-file` overrides. The token is stable across daemon restarts;
-  rotating means deleting/regenerating the file. The future HTTP debug
-  endpoints use the same token.
+  rotating means deleting/regenerating the file. It always grants the full
+  capability set; restricted tokens come from `tokens.json` (see **Token roles
+  and provisioning** above), and the debug listener takes no token at all.
 - **Port discovery** (operator). **Hybrid.** The daemon always writes the bound
   port to `~/.config/pi-gateway/port`; the client prefers that file and falls
   back to the fixed default `127.0.0.1:7331`; `--server`/`--port` override.
@@ -214,9 +243,10 @@ unless it is explicitly marked so.
   mid-turn prompt. `gw_queue` reports the daemon queue with author/kind tags.
   pi's own queue is not used for cross-client ordering.
 - **`abort` / `clear_queue` under sharing** (operator). **pi-native,
-  session-wide.** Any client may `abort`; it stops the shared turn, and queued
-  prompts remain and run afterwards (pi-native behavior). `clear_queue` clears
-  the entire daemon queue plus pi's forwarded steer queue and returns all
+  session-wide, requiring `interject`.** `abort` stops the shared turn, and
+  queued prompts remain and run afterwards (pi-native behavior);
+  `clear_queue` clears the entire daemon queue plus pi's forwarded steer queue
+  and returns all
   cleared text to the caller — which may include prompts queued by other
   clients. A forwarded `steer` cannot be withdrawn except by this session-wide
   clear.
@@ -248,12 +278,12 @@ unless it is explicitly marked so.
 
 None. Every gap found while reviewing `docs/protocol.md` draft 2 has been
 resolved and recorded above. The **mid-turn attach** entry is deliberately
-provisional (live-only) and is the first item to revisit now that M1 is
-implemented.
+provisional (live-only) and is the first item to revisit now that the daemon
+is implemented.
 
 ## Implementation status
 
-**M2 (sessions and multi-client) is implemented.**
+**M3 (operations) is implemented: M1 + M2 + M3 are in.**
 
 | Area | Status |
 | --- | --- |
@@ -262,17 +292,17 @@ implemented.
 | Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags |
 | Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags |
 | Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise) |
-| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, capability checks on the control surfaces (`observe`/`prompt`/`ui`/`control`/`admin`) |
+| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
 | Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state`, `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
+| Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics |
+| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject` |
 
-Deliberately deferred to M3+ (roadmap in `docs/design.md` §14): the systemd
-user unit, the separate loopback HTTP debug listener (status/metrics/catalog),
-token roles and capability provisioning, and structured logging/metrics.
-Enforcement today covers the gateway control surfaces listed above;
-per-command `get_*` checks arrive with role provisioning.
+Deferred to M4 (optional, `docs/design.md` §14): session groups across
+daemons, WebSocket transport for non-local clients, and other transport
+adapters behind the same protocol.
 
 ### Running the daemon and bridge
 
@@ -280,8 +310,23 @@ per-command `get_*` checks arrive with role provisioning.
 go build ./cmd/pi-gatewayd ./cmd/pi-gateway
 
 # Daemon: owns pi sessions (run as a systemd user unit in production).
-# It writes the token and port file under ~/.config/pi-gateway/.
-./pi-gatewayd --pi /usr/local/bin/pi
+# It writes the token, port, and tokens file under ~/.config/pi-gateway/.
+./pi-gatewayd --pi /usr/local/bin/pi                 # text logs at info level
+./pi-gatewayd --log-format json --log-level debug    # structured, verbose
+
+# Restricted token for an integration, then reload without a restart.
+./pi-gatewayd --provision-token --token-name slack --token-role operator
+systemctl --user reload pi-gatewayd     # or: kill -HUP <pid>
+
+# Operational endpoints (read-only, loopback, no token).
+curl -s 127.0.0.1:7332/status    # version, uptime, sessions, clients, queue
+curl -s 127.0.0.1:7332/catalog   # same rows as gw_list_sessions
+curl -s 127.0.0.1:7332/metrics   # Prometheus text
+
+# systemd user unit (Type=simple, Restart=on-failure, ExecReload=SIGHUP).
+install -Dm644 packaging/pi-gatewayd.service ~/.config/systemd/user/pi-gatewayd.service
+systemctl --user daemon-reload && systemctl --user enable --now pi-gatewayd
+journalctl --user -u pi-gatewayd -f
 
 # A UI spawns this instead of `pi`; --mode rpc is accepted and consumed.
 ./pi-gateway --mode rpc --approve
@@ -294,6 +339,9 @@ go build ./cmd/pi-gatewayd ./cmd/pi-gateway
 #   gw_list_sessions -> {"sessions":[{path,name,title,cwd,live,clients,...}]}
 #   gw_new_session   -> {"path","name","sessionId"} (requester is rebound)
 #   gw_reload_session-> restart pi for a session (control capability)
+# Capabilities are granted per token: an observer may read (list sessions,
+# get_*, export) but not prompt, steer/abort, switch sessions, or run bash;
+# shared-state mutations need `control`.
 
 # Unit + daemon/bridge end-to-end tests (fake pi, no real pi needed).
 go test -race ./...
@@ -309,12 +357,16 @@ cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
 cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
 internal/catalog/   session file scanning, name resolution, durable leaf ids
 internal/client/     bridge implementation (argv, token/port, relay)
-internal/config/     token and port file paths, defaults
+internal/config/     token/port/tokens-file paths, roles, provisioning
 internal/daemon/     session table, attach/rebind, spawn-param checks
+internal/debughttp/  read-only /status /catalog /metrics over loopback HTTP
+internal/gwlog/      structured logging (log/slog: text for journald, or JSON)
+internal/metrics/    Prometheus-text counters and gauges
 internal/piargs/     accepted pi parameter parsing (shared daemon/client)
 internal/protocol/   strict JSONL codec, gw_* messages, id namespacing
 internal/session/    SessionActor, Hub, PromptQueue, PiProcess
 internal/fakepi/     fake pi used by the tests
 internal/gwtest/     shared daemon harness for end-to-end tests
 internal/testutil/   test helpers (build fake pi, raw protocol client)
+packaging/           systemd user unit
 ```

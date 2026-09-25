@@ -59,12 +59,19 @@ Settled deployment facts:
   integrations — runs on the daemon's machine. The daemon has **no network
   listener**.
 - Clients reach the daemon over **loopback TCP** (`127.0.0.1:<port>`), chosen
-  so an HTTP debug endpoint can be added later (separate loopback port, raw
+  so an HTTP debug endpoint can share the same local transport (separate
+  loopback port, raw
   JSONL session port unchanged).
 - Because any local process can reach a loopback port, clients authenticate
   with a **token**: the daemon generates `~/.config/pi-gateway/token` (mode
   `0600`) on first start, the client reads it by default (`--token-file`
-  overrides), and the future HTTP debug endpoints share it.
+  overrides). The token always grants the full capability set; restricted
+  tokens live in `~/.config/pi-gateway/tokens.json` (§10).
+- The **HTTP debug listener** is a second loopback port (`127.0.0.1:7332` by
+  default) serving read-only `/status`, `/catalog`, and `/metrics`. It is
+  deliberately **unauthenticated** (recorded in README → Design decisions), so
+  it exposes operational and catalog metadata — paths, names, titles — to any
+  local process, and must never gain a mutating endpoint.
 - **Port discovery is hybrid**: the daemon writes the bound port to
   `~/.config/pi-gateway/port`; the client prefers that file and falls back to
   `127.0.0.1:7331` (`--server` overrides).
@@ -543,9 +550,9 @@ preview}`; author/kind tags are informational and never change order.
 
 ### 8.3 `abort` and `clear_queue`
 
-- `abort` may be called by any client. It stops the shared turn; daemon-queued
-  prompts remain and run afterwards (pi-native behavior). Other clients are
-  notified through `gw_turn`/`gw_queue`.
+- `abort` stops the shared turn; daemon-queued prompts remain and run
+  afterwards (pi-native behavior). Other clients are notified through
+  `gw_turn`/`gw_queue`. Like `steer`, it requires `interject` (§10).
 - `clear_queue` is **session-wide**: it clears the entire daemon queue and is
   forwarded to pi to clear forwarded steers, returning all cleared text
   (`{steering, followUp}`) to the caller. That text may include prompts queued
@@ -584,30 +591,51 @@ pi emits `extension_ui_request` and blocks until a matching
 ## 10. Security model
 
 - **Local-only, token-authenticated.** The daemon listens on loopback TCP and
-  requires the token from `~/.config/pi-gateway/token` in `gw_hello`. There is
-  no TLS and no network listener; the future HTTP debug endpoint is a separate
-  loopback port sharing the same token.
+  requires a token from `~/.config/pi-gateway/token` (or `tokens.json`) in
+  `gw_hello`. There is no TLS and no network listener. The debug listener is a
+  separate loopback port with **no authentication**; its routes are read-only
+  by construction and it exposes no session content beyond the catalog
+  metadata (path, name, title, message count) that `gw_list_sessions` also
+  returns.
 - **Capabilities are authority.** A client requests capabilities at
-  `gw_hello`; the daemon grants the intersection with the token's role. The
-  default daemon-generated token grants the full set.
+  `gw_hello`; the daemon grants the intersection with the token's role. Every
+  command is checked once, before dispatch, against that role and a refused
+  command is never executed (docs/protocol.md §10 lists the exact mapping);
+  command types are canonical, so a case variant cannot dodge the check. The
+  default daemon-generated token grants the full set. A token identifies
+  itself as `admin`, `operator` (observe + interject + prompt + ui), or
+  `observer` (observe), or names an explicit capability list; tokens live
+  either in the generated `token` file or in `tokens.json`, which the daemon
+  re-reads on SIGHUP. `pi-gatewayd --provision-token` appends one and prints
+  only the token so scripts can capture it.
 
 | Capability | Allows |
 |---|---|
-| `observe` | receive events; `get_*` queries |
-| `interject` | `steer` |
-| `prompt` | `prompt`, `follow_up`, `new_session`, `fork`/`clone` |
-| `ui` | answer extension UI dialogs |
-| `control` | `gw_reload_session` |
+| `observe` | receiving the event stream, `get_*` queries, `export_html`, `gw_list_sessions` |
+| `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
+| `prompt` | `prompt`, `follow_up`, `new_session`, `fork`/`clone`, `bash`, `switch_session` |
+| `ui` | answer extension UI dialogs, `notify` |
+| `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
 | `admin` | `gw_new_session` (provision sessions/config) |
+| *(none)* | `gw_ping`, `gw_bye` |
 
-`observe` covers `gw_list_sessions` and receiving events. Per-command `get_*`
-checks are not enforced yet; that lands with token roles in M3.
+Non-lowercase command types are rejected (`bad_frame`) instead of forwarded, so
+a case variant cannot dodge the table.
+
+`observe` covers `gw_list_sessions`, pi's `get_*` queries, `export_html`, and
+receiving the event stream: a client without it receives only records
+addressed to it (its own responses and dialogs), no replay, and no snapshot.
+`bash` is gated by `prompt` (a prompt-capable client can already run shell
+work through the agent), the shared-state mutations by `control`, and the
+cancellation primitives `abort`/`clear_queue` by `interject`, because clearing
+can withdraw work another client queued.
 
 - **Kind is informational only** (`pilish`, `integration`, `bot`, `observer`);
   it never changes policy. Integration-specific capability handling and
   formatting live in the integration, not the gateway.
-- Per-integration tokens/roles are **out of scope** here; with the single
-  daemon token every local client currently has the full set.
+- Per-integration tokens are local files under the operator's control; there
+  is no token database, expiry, or revocation beyond editing `tokens.json` and
+  sending SIGHUP.
 - Limits: max frame size, commands/s, connections per session, sessions per
   daemon. Never accept arbitrary `sessionFile`/`cwd`/argv from an untrusted
   client. Tool output is untrusted data; the daemon does not sanitize it.
@@ -648,13 +676,17 @@ internal/daemon/       listener, auth, connection table, binding/rebinding
 internal/session/      SessionActor, Hub, PromptQueue, UIBroker, PiProcess
 internal/catalog/      session catalog: file scan + live index, name resolution
 internal/client/       bridge: gateway <-> raw pi, id restore, gw_* filtering
+internal/debughttp/    read-only /status, /catalog, /metrics HTTP endpoints
+internal/gwlog/        structured logging (text or JSON via log/slog)
+internal/metrics/      Prometheus-text counters, gauges, metric names
 internal/piargs/       accepted pi parameter parsing (shared daemon <-> client)
 internal/fakepi/       fake pi used by the end-to-end tests
 internal/gwtest/       shared daemon harness for end-to-end tests
 internal/testutil/     test helpers: build fake pi, raw protocol client
 ```
 
-M1 and M2 implement this layout. The prototype that predated the settled
+M1, M2, and M3 implement this layout, plus `packaging/pi-gatewayd.service` for
+the systemd user unit. The prototype that predated the settled
 design (a single binary with `serve`/`connect` subcommands and floor
 arbitration) has been removed.
 
@@ -673,6 +705,18 @@ arbitration) has been removed.
   matches a fresh `get_messages`; test `gw_snapshot` after eviction.
 - **Queue**: N clients race to prompt; assert FIFO with author/kind tags, no
   lost or duplicated prompts, and no `turn_held`.
+- **Roles**: a provisioned token gets exactly its role in `gw_welcome.granted`;
+  every command in the §10 table answers `forbidden` without its capability
+  (and without creating a session or starting pi); a non-`observe` token
+  receives no transcript, replay, or snapshot; a case-variant command type is
+  `bad_frame`; SIGHUP-style `SetTokens` swaps the table for new handshakes
+  only; an empty default token authenticates nobody.
+- **Listener safety**: `RequireLoopback` refuses `0.0.0.0`, `:port`, and
+  routable addresses for both listeners, so the unauthenticated debug
+  endpoints cannot leave the host.
+- **Operations**: `/status`, `/catalog`, and `/metrics` serve live daemon state
+  without a token; counters advance for real turns; the listener rejects
+  non-GET methods.
 - **Rebinding**: `switch_session` joins a live session without restarting pi;
   assert subsequent `get_state`/`get_messages` land on the new actor and that
   no orphan session outlives the short grace.
@@ -701,8 +745,10 @@ arbitration) has been removed.
    resolution; `gw_new_session`; `gw_reload_session`; `fork`/`clone` policy;
    extension UI broker; presence and `gw_state_changed`; kind tagging;
    backpressure and coalescing.
-3. **M3 — operations.** systemd user unit; separate loopback HTTP debug
-   listener (status/metrics/catalog) sharing the token; token roles/capability
-   provisioning; structured logging and metrics.
+3. **M3 — operations (implemented).** systemd user unit; separate loopback
+   HTTP debug listener (status/metrics/catalog, unauthenticated and read-only);
+   token roles and capability provisioning (`tokens.json`, SIGHUP reload,
+   `--provision-token`, per-command `get_*` checks); structured logging
+   (`--log-format`/`--log-level`) and Prometheus-text metrics.
 4. **M4 (optional).** Session groups across daemons, WebSocket transport for
    non-local clients, and other transport adapters behind the same protocol.

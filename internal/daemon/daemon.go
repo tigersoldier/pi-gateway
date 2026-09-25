@@ -20,6 +20,8 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/catalog"
 	"github.com/tigersoldier/pi-gateway/internal/config"
+	"github.com/tigersoldier/pi-gateway/internal/gwlog"
+	"github.com/tigersoldier/pi-gateway/internal/metrics"
 	"github.com/tigersoldier/pi-gateway/internal/piargs"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/session"
@@ -40,7 +42,13 @@ type Config struct {
 	SubscriberBuffer int
 	// DeltaFlush is the streaming-delta coalescing interval.
 	DeltaFlush time.Duration
-	Logf       func(format string, args ...any)
+	// Log receives structured operational records.
+	Log gwlog.Logger
+	// Metrics collects counters and gauges; nil creates a private registry.
+	Metrics *metrics.Registry
+	// Tokens are additional token grants (tokens.json). The primary Token
+	// always grants the full capability set.
+	Tokens []protocol.TokenGrant
 }
 
 // entry is a registered session: the actor plus the spawn configuration it was
@@ -60,9 +68,19 @@ type entry struct {
 // Daemon owns the listener and the session table.
 type Daemon struct {
 	cfg     Config
-	logf    func(format string, args ...any)
+	log     gwlog.Logger
+	metrics *metrics.Registry
 	ln      net.Listener
 	scanner *catalog.Scanner
+	// tokens is the accepted token table: the default (full authority) grant
+	// plus the provisioned ones. Replaced atomically on SIGHUP.
+	tokens  atomic.Pointer[[]protocol.TokenGrant]
+	started time.Time
+	// gauges caches the actor-derived gauge values for one scrape interval
+	// (see ops.go), so the debug listener cannot amplify actor round-trips.
+	gaugeMu     sync.Mutex
+	gaugeAt     time.Time
+	gaugeCounts gaugeCounts
 
 	mu       sync.Mutex
 	sessions map[string]*entry // canonical path -> entry
@@ -86,9 +104,13 @@ func New(cfg Config) *Daemon {
 	if cfg.PiBin == "" {
 		cfg.PiBin = "pi"
 	}
-	logf := cfg.Logf
-	if logf == nil {
-		logf = func(string, ...any) {}
+	log := cfg.Log
+	if log == nil {
+		log = gwlog.Nop()
+	}
+	m := cfg.Metrics
+	if m == nil {
+		m = metrics.New()
 	}
 	if cfg.SubscriberBuffer <= 0 {
 		cfg.SubscriberBuffer = 1024
@@ -96,20 +118,32 @@ func New(cfg Config) *Daemon {
 	if cfg.DeltaFlush <= 0 {
 		cfg.DeltaFlush = defaultDeltaFlush
 	}
-	return &Daemon{
+	d := &Daemon{
 		cfg:      cfg,
-		logf:     logf,
+		log:      log,
+		metrics:  m,
 		scanner:  &catalog.Scanner{Roots: catalog.DefaultRoots(cfg.CatalogRoots...)},
 		sessions: make(map[string]*entry),
 		pending:  make(map[*session.Actor]*entry),
 		conns:    make(map[*conn]struct{}),
 		done:     make(chan struct{}),
+		started:  time.Now(),
 	}
+	m.Declare()
+	if err := d.SetTokens(cfg.Tokens); err != nil {
+		log.Error("invalid token configuration", "err", err)
+		_ = d.SetTokens(nil)
+	}
+	d.registerGauges()
+	return d
 }
 
 // Listen binds the loopback listener, writes the port file, and discovers the
 // managed pi version.
 func (d *Daemon) Listen() error {
+	if err := config.RequireLoopback(d.cfg.Addr); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", d.cfg.Addr)
 	if err != nil {
 		return fmt.Errorf("daemon: listen %s: %w", d.cfg.Addr, err)
@@ -120,7 +154,7 @@ func (d *Daemon) Listen() error {
 		if err == nil {
 			d.port = port
 			if err := config.WritePort(d.cfg.PortFile, port); err != nil {
-				d.logf("daemon: write port file: %v", err)
+				d.log.Warn("cannot write port file", "err", err)
 			}
 		}
 	}
@@ -188,7 +222,7 @@ func (d *Daemon) Shutdown() {
 			a.Stop()
 		}
 		if d.cfg.PortFile != "" {
-			removePortFile(d.cfg.PortFile, d.port)
+			config.RemovePortIfMatches(d.cfg.PortFile, d.port)
 		}
 	})
 	d.wg.Wait()
@@ -312,15 +346,15 @@ func (d *Daemon) setCreated(a *session.Actor, ref protocol.ClientRef, tags map[s
 	}
 }
 
-// listRow is one gw_list_sessions entry (docs/protocol.md §3.2).
-type listRow struct {
+// Row is one gw_list_sessions entry (docs/protocol.md §3.2).
+type Row struct {
 	Path         string                   `json:"path"`
 	Name         string                   `json:"name,omitempty"`
 	Title        string                   `json:"title,omitempty"`
 	ID           string                   `json:"id,omitempty"`
 	Cwd          string                   `json:"cwd,omitempty"`
 	Live         bool                     `json:"live"`
-	IsStreaming  bool                     `json:"isStreaming,omitempty"`
+	IsStreaming  bool                     `json:"isStreaming"`
 	MessageCount int                      `json:"messageCount"`
 	LastActivity string                   `json:"lastActivity,omitempty"`
 	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
@@ -330,17 +364,17 @@ type listRow struct {
 
 // listSessions builds the session catalog: files newest first, enriched with
 // the live actors' state.
-func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []listRow {
+func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []Row {
 	live := d.liveSnapshot()
 
-	rows := make([]listRow, 0, len(live)+8)
+	rows := make([]Row, 0, len(live)+8)
 	seen := make(map[string]bool)
 	for _, c := range d.scanner.List(cwd, limit) {
 		canon := canonicalPath(c.Path)
 		if seen[canon] {
 			continue
 		}
-		row := listRow{
+		row := Row{
 			Path:         canon,
 			Name:         c.Name,
 			Title:        c.Title,
@@ -368,7 +402,7 @@ func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []listRow {
 			// A live-only session has no file header to check against.
 			continue
 		}
-		row := listRow{
+		row := Row{
 			Path: canon,
 			Name: ls.actor.SessionName(),
 			ID:   ls.actor.SessionID(),
@@ -418,15 +452,15 @@ func (d *Daemon) liveSnapshot() map[string]liveSession {
 }
 
 // decorate fills in live-session fields for one catalog row.
-func (d *Daemon) decorate(row *listRow, canon string, live map[string]liveSession) {
+func (d *Daemon) decorate(row *Row, canon string, live map[string]liveSession) {
 	ls, ok := live[canon]
 	if !ok {
 		return
 	}
-	info := ls.actor.Info()
+	state := stateOf(ls.actor)
 	row.Live = true
-	row.IsStreaming = info.Turn.State == "running"
-	row.Clients = info.Clients
+	row.IsStreaming = state.Streaming
+	row.Clients = state.Clients
 	if ls.createdBy != nil {
 		ref := *ls.createdBy
 		row.CreatedBy = &ref
@@ -463,7 +497,7 @@ func (d *Daemon) attach(target string, spec *piargs.Spec) (*session.Actor, error
 		e = &entry{actor: a, spawn: spec.SpawnValues()}
 		d.sessions[canon] = e
 		d.mu.Unlock()
-		d.logf("daemon: session %s spawned (pid managed by actor)", canon)
+		d.log.Info("session started", "session", canon)
 		return e.actor, nil
 	}
 	d.mu.Unlock()
@@ -497,7 +531,8 @@ func (d *Daemon) newActor(path string, spec *piargs.Spec) (*session.Actor, error
 		SessionPath: path,
 		IdleTimeout: d.cfg.IdleTimeout,
 		ShortGrace:  d.cfg.ShortGrace,
-		Logf:        d.logf,
+		Log:         d.log.With("session", path),
+		Metrics:     d.metrics,
 	})
 	a.OnPath = d.onPath
 	a.OnStopped = d.onStopped
@@ -505,6 +540,9 @@ func (d *Daemon) newActor(path string, spec *piargs.Spec) (*session.Actor, error
 	if err := a.Start(); err != nil {
 		return nil, err
 	}
+	// Count here so both entry points are covered: attach (a session file) and
+	// create (a client's implicit session before pi reports its path).
+	d.metrics.Inc(metrics.SessionsStarted)
 	return a, nil
 }
 
@@ -523,7 +561,7 @@ func (d *Daemon) onPath(a *session.Actor, path string) {
 	}
 	if existing, ok := d.sessions[canon]; ok && existing.actor != a {
 		d.mu.Unlock()
-		d.logf("daemon: session path %s is already registered; retiring duplicate actor", canon)
+		d.log.Warn("session path already registered; retiring duplicate actor", "session", canon)
 		// Stop asynchronously: onPath runs on the actor loop, and Stop waits
 		// for that loop to exit.
 		go a.Stop()
@@ -538,7 +576,7 @@ func (d *Daemon) onPath(a *session.Actor, path string) {
 	}
 	d.sessions[canon] = e
 	d.mu.Unlock()
-	d.logf("daemon: session %s registered", canon)
+	d.log.Debug("session registered", "session", canon)
 }
 
 // onStopped drops a finished actor from the table.
@@ -551,7 +589,8 @@ func (d *Daemon) onStopped(a *session.Actor, reason string) {
 	}
 	delete(d.pending, a)
 	d.mu.Unlock()
-	d.logf("daemon: session %s stopped (%s)", a.Path(), reason)
+	d.metrics.Inc(metrics.SessionsEnded)
+	d.log.Info("session stopped", "session", a.Path(), "reason", reason)
 }
 
 // retire removes an idle actor from the table so a later attach respawns pi.
@@ -571,6 +610,8 @@ func (d *Daemon) retire(a *session.Actor) bool {
 		}
 	}
 	delete(d.pending, a)
+	d.metrics.Inc(metrics.SessionsReaped)
+	d.log.Info("session retired", "session", a.Path())
 	return true
 }
 
@@ -592,6 +633,11 @@ func (d *Daemon) registerClient(a *session.Actor, c *conn) bool {
 	d.mu.Unlock()
 
 	ok := a.AttachSync(c, 2*time.Second)
+	if ok {
+		d.metrics.Inc(metrics.Attaches)
+	} else {
+		d.metrics.Inc(metrics.AttachFailures)
+	}
 
 	d.mu.Lock()
 	e.attaching--
@@ -639,7 +685,7 @@ func (d *Daemon) applyRuntime(e *entry, spec *piargs.Spec) {
 	}
 	rec, err := e.actor.Call([]byte(`{"type":"get_state"}`), 5*time.Second)
 	if err != nil {
-		d.logf("daemon: cannot read state to apply runtime parameters: %v", err)
+		d.log.Warn("cannot read state to apply runtime parameters", "session", e.actor.Path(), "err", err)
 		return
 	}
 	st := protocol.ParsePiState(rec.Raw)
@@ -759,10 +805,4 @@ func runVersionCommand(binary string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-func removePortFile(path string, port int) {
-	if p, err := config.ReadPort(path); err == nil && p == port {
-		_ = os.Remove(path)
-	}
 }

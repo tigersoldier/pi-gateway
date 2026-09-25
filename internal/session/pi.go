@@ -10,14 +10,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/internal/gwlog"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 )
 
 // PiConfig describes how to spawn pi in RPC mode for one session.
 type PiConfig struct {
+	// Log receives pi's stderr lines (at debug level) and process errors.
+	Log  gwlog.Logger
 	Bin  string
 	Args []string
-	Logf func(format string, args ...any)
 }
 
 // PiProcess owns exactly one `pi --mode rpc` child. All writes go through
@@ -209,7 +211,7 @@ func (p *PiProcess) readLoop() {
 }
 
 func (p *PiProcess) stderrLoop(stderr io.Reader) {
-	if p.cfg.Logf == nil {
+	if p.cfg.Log == nil {
 		_, _ = io.Copy(io.Discard, stderr)
 		return
 	}
@@ -224,7 +226,7 @@ func (p *PiProcess) stderrLoop(stderr io.Reader) {
 				if i < 0 {
 					break
 				}
-				p.cfg.Logf("pi: %s", buf[:i])
+				p.cfg.Log.Debug("pi output", "line", string(buf[:i]))
 				buf = buf[i+1:]
 			}
 			if len(buf) > 64<<10 {
@@ -233,7 +235,7 @@ func (p *PiProcess) stderrLoop(stderr io.Reader) {
 		}
 		if err != nil {
 			if len(buf) > 0 {
-				p.cfg.Logf("pi: %s", buf)
+				p.cfg.Log.Debug("pi output", "line", string(buf))
 			}
 			return
 		}

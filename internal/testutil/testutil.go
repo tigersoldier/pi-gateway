@@ -256,6 +256,18 @@ func Obj(f map[string]any, key string) map[string]any {
 	return m
 }
 
+// StrSlice converts an array field to a string slice, skipping non-strings.
+func StrSlice(f map[string]any, key string) []string {
+	arr := Arr(f, key)
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // Arr reads a nested array from a decoded frame.
 func Arr(f map[string]any, key string) []any {
 	a, _ := f[key].([]any)

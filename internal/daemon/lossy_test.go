@@ -3,11 +3,13 @@ package daemon
 import (
 	"testing"
 
+	"github.com/tigersoldier/pi-gateway/internal/metrics"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 )
 
 func TestLossyTailTracksDroppedRange(t *testing.T) {
-	var l lossyTail
+	reg := metrics.New()
+	l := lossyTail{metrics: reg}
 	if _, ok := l.frame(); ok {
 		t.Fatal("an empty tail must not produce a marker")
 	}
@@ -31,6 +33,10 @@ func TestLossyTailTracksDroppedRange(t *testing.T) {
 	l.reset()
 	if _, ok := l.frame(); ok {
 		t.Fatal("reset must clear the range")
+	}
+	// Every dropped frame is counted once (sequence 0 is not a record).
+	if got := reg.Value(metrics.FramesDropped); got != 3 {
+		t.Fatalf("frames_dropped = %d, want 3", got)
 	}
 }
 

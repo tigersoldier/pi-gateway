@@ -8,13 +8,28 @@ import (
 	"testing"
 
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
+	"github.com/tigersoldier/pi-gateway/internal/gwlog"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
 )
+
+// Logger routes a daemon's log records through the test log.
+func Logger(t *testing.T) gwlog.Logger {
+	t.Helper()
+	return gwlog.FromLogf(func(format string, args ...any) { t.Logf(format, args...) })
+}
 
 // StartDaemon runs a daemon with the fake pi binary for the test's duration
 // and returns its address and the fake pi binary path (used to count live pi
 // processes). mutate may adjust the configuration before it starts.
 func StartDaemon(t *testing.T, token string, mutate func(*daemon.Config)) (addr, piBin string) {
+	t.Helper()
+	d, piBin := StartDaemonHandle(t, token, mutate)
+	return d.Addr().String(), piBin
+}
+
+// StartDaemonHandle is StartDaemon but also returns the daemon, for tests that
+// exercise the operational surface (status, catalog, metrics).
+func StartDaemonHandle(t *testing.T, token string, mutate func(*daemon.Config)) (*daemon.Daemon, string) {
 	t.Helper()
 	piBin, err := testutil.FakePi()
 	if err != nil {
@@ -27,7 +42,7 @@ func StartDaemon(t *testing.T, token string, mutate func(*daemon.Config)) (addr,
 		Addr:  "127.0.0.1:0",
 		Token: token,
 		PiBin: piBin,
-		Logf:  func(format string, args ...any) { t.Logf(format, args...) },
+		Log:   Logger(t),
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -47,5 +62,5 @@ func StartDaemon(t *testing.T, token string, mutate func(*daemon.Config)) (addr,
 		<-done
 		d.Shutdown()
 	})
-	return d.Addr().String(), piBin
+	return d, piBin
 }

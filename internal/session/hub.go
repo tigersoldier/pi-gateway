@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/internal/metrics"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 )
 
@@ -44,12 +45,23 @@ type SubOptions struct {
 	// AllowLossy lets the hub drop non-terminal records instead of dropping
 	// the subscriber; the client is told via a gw_lag marker so it can resync.
 	AllowLossy bool
+	// FilterUnowned delivers only records addressed to this subscriber: used
+	// for clients that lack the `observe` capability, which must not read the
+	// session's event stream or transcript (docs/design.md §10). The zero
+	// value delivers every record, which is what internal subscribers want.
+	FilterUnowned bool
 }
 
 // Subscriber is one client's view of a session's event stream.
 type Subscriber struct {
+	// id is the owning client; with FilterUnowned, records addressed to it are
+	// still delivered.
+	id   string
 	ch   chan protocol.Record
 	opts SubOptions
+	// subscriberMetrics is copied from the hub so delivery can count drops and
+	// lags without reaching back into the hub.
+	subscriberMetrics *metrics.Registry
 
 	mu     sync.Mutex
 	closed bool
@@ -78,9 +90,15 @@ func (s *Subscriber) deliver(rec protocol.Record) {
 	if s.closed {
 		return
 	}
+	if s.opts.FilterUnowned && rec.Owner != s.id {
+		// Not this client's business: it lacks `observe`. The records it may
+		// see are addressed to it (its responses, errors, and dialogs).
+		return
+	}
 	if s.lagFrom != 0 {
 		select {
 		case s.ch <- s.lagRecord():
+			s.subscriberMetrics.Inc(metrics.ClientLags)
 			s.lagFrom, s.lagTo = 0, 0
 		default:
 			s.overflowLocked(rec)
@@ -99,9 +117,11 @@ func (s *Subscriber) deliver(rec protocol.Record) {
 // dropped so the connection can reconnect and resync.
 func (s *Subscriber) overflowLocked(rec protocol.Record) {
 	if s.opts.AllowLossy && !terminalTypes[rec.Type] {
+		s.subscriberMetrics.Inc(metrics.FramesDropped)
 		s.recordLagLocked(rec.Seq)
 		return
 	}
+	s.subscriberMetrics.Inc(metrics.SubscriberDrops)
 	s.dead = true
 	s.closed = true
 	close(s.ch)
@@ -146,6 +166,9 @@ func (s *Subscriber) Close() {
 // every subscriber observes records in non-decreasing Seq order. Publish is
 // called from the SessionActor loop only.
 type Hub struct {
+	// metrics is optional instrumentation; a nil registry records nothing.
+	metrics *metrics.Registry
+
 	mu      sync.RWMutex
 	seq     uint64
 	buf     []protocol.Record
@@ -165,6 +188,17 @@ func NewHub(capacity int, session string) *Hub {
 		subs:    make(map[string]*Subscriber),
 		session: session,
 	}
+}
+
+// SetMetrics attaches the metrics registry. It must be called before the hub
+// is shared with other goroutines.
+func (h *Hub) SetMetrics(r *metrics.Registry) { h.metrics = r }
+
+// Count reports how many subscribers are attached.
+func (h *Hub) Count() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.subs)
 }
 
 // HeadSeq is the most recently assigned sequence.
@@ -224,7 +258,12 @@ func (h *Hub) Subscribe(id string, opts SubOptions) *Subscriber {
 	if opts.Buffer < 1 {
 		opts.Buffer = 1
 	}
-	s := &Subscriber{ch: make(chan protocol.Record, opts.Buffer), opts: opts}
+	s := &Subscriber{
+		id:                id,
+		ch:                make(chan protocol.Record, opts.Buffer),
+		opts:              opts,
+		subscriberMetrics: h.metrics,
+	}
 	h.mu.Lock()
 	h.subs[id] = s
 	h.mu.Unlock()

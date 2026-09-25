@@ -1,16 +1,17 @@
 package daemon
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/catalog"
+	"github.com/tigersoldier/pi-gateway/internal/metrics"
 	"github.com/tigersoldier/pi-gateway/internal/piargs"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/session"
@@ -42,12 +43,15 @@ const (
 type lossyTail struct {
 	mu       sync.Mutex
 	from, to uint64
+	// metrics is copied from the connection so a drop is counted here.
+	metrics *metrics.Registry
 }
 
 func (l *lossyTail) note(seq uint64) {
 	if seq == 0 {
 		return
 	}
+	l.metrics.Inc(metrics.FramesDropped)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.from == 0 || seq < l.from {
@@ -122,6 +126,7 @@ func newConn(d *Daemon, nc net.Conn) *conn {
 		out:      make(chan outFrame, outQueueDepth),
 		done:     make(chan struct{}),
 		flushReq: make(chan chan struct{}, 1),
+		lossy:    lossyTail{metrics: d.metrics},
 	}
 }
 
@@ -163,6 +168,8 @@ func (c *conn) readLoop() {
 		if err != nil {
 			return
 		}
+		c.d.metrics.Inc(metrics.FramesIn)
+		c.d.metrics.Add(metrics.BytesIn, int64(len(raw)))
 		if !c.helloDone {
 			if err := c.handleHello(raw); err != nil {
 				c.closeAfterFlush()
@@ -213,6 +220,8 @@ func (c *conn) writeOne(f outFrame) bool {
 		c.close()
 		return false
 	}
+	c.d.metrics.Inc(metrics.FramesOut)
+	c.d.metrics.Add(metrics.BytesOut, int64(len(raw)))
 	return true
 }
 
@@ -262,6 +271,7 @@ func (c *conn) send(f outFrame) bool {
 	if marker, ok := c.lossy.frame(); ok {
 		select {
 		case c.out <- outFrame{gen: f.gen, rec: marker}:
+			c.d.metrics.Inc(metrics.ClientLags)
 			c.lossy.reset()
 		default:
 			if c.droppable(f) {
@@ -371,7 +381,9 @@ func (c *conn) handleHello(raw []byte) error {
 		c.sendError(code, err.Error())
 		return err
 	}
-	if subtle.ConstantTimeCompare([]byte(h.Token), []byte(c.d.cfg.Token)) != 1 {
+	grant, ok := c.d.lookUpToken(h.Token)
+	if !ok {
+		c.d.metrics.Inc(metrics.Unauthorized)
 		c.sendError(protocol.CodeUnauthorized, "missing or wrong token")
 		return errUnauthorized
 	}
@@ -383,7 +395,7 @@ func (c *conn) handleHello(raw []byte) error {
 	if c.info.Kind == "" {
 		c.info.Kind = "integration"
 	}
-	c.granted, c.caps = grantCapabilities(h.Client.Capabilities)
+	c.granted, c.caps = grantCapabilities(h.Client.Capabilities, grant.Capabilities)
 
 	spec, err := piargs.Parse(h.PiArgs)
 	if err != nil {
@@ -408,7 +420,8 @@ func (c *conn) handleHello(raw []byte) error {
 	}
 
 	// Decide replay before sending the welcome so resyncRequired is accurate.
-	replayRequested := h.Resume != nil && !h.LiveOnly
+	// Without observe there is no transcript: no replay and no snapshot.
+	replayRequested := h.Resume != nil && !h.LiveOnly && c.Has(protocol.CapObserve)
 	var replay []protocol.Record
 	resync := false
 	if actor != nil && replayRequested {
@@ -416,7 +429,7 @@ func (c *conn) handleHello(raw []byte) error {
 		replay, ok = actor.Replay(h.Resume.SinceSeq)
 		resync = !ok
 	}
-	if resync && actor != nil && h.Resume.LeafEntryID != "" {
+	if resync && actor != nil && c.Has(protocol.CapObserve) && h.Resume.LeafEntryID != "" {
 		// The cursor is not replayable, but the client's durable transcript may
 		// already match the session file: a daemon restart empties the ring
 		// while the file keeps the leaf (docs/protocol.md §6).
@@ -456,6 +469,7 @@ func (c *conn) handleHello(raw []byte) error {
 	c.sendJSON(&w)
 
 	if attachErr != nil {
+		c.d.metrics.Inc(metrics.AttachFailures)
 		c.sendError(errorCode(attachErr), attachErr.Error())
 		return nil
 	}
@@ -468,6 +482,8 @@ func (c *conn) handleHello(raw []byte) error {
 	// records the window already covered.
 	var watermark uint64
 	switch {
+	case resync && !c.Has(protocol.CapObserve):
+		// No observe: attach without replaying or snapshotting the transcript.
 	case resync:
 		if snap, err := actor.Snapshot(); err != nil {
 			c.sendError(protocol.CodeResyncRequired, err.Error())
@@ -514,6 +530,9 @@ func (c *conn) bind(a *session.Actor, startLive bool) error {
 	sub := a.Subscribe(c.id, session.SubOptions{
 		Buffer:     c.d.cfg.SubscriberBuffer,
 		AllowLossy: c.allowLossy,
+		// A client without observe receives only records addressed to it (its
+		// own responses and dialogs), never the session's event stream.
+		FilterUnowned: !c.Has(protocol.CapObserve),
 	})
 	c.gen.Add(1) // invalidate frames queued for the previous binding
 	if !c.d.registerClient(a, c) {
@@ -621,6 +640,21 @@ func (c *conn) handleFrame(raw []byte) {
 		c.sendError(protocol.CodeBadFrame, "frame has no type")
 		return
 	}
+	if typ != strings.ToLower(typ) {
+		// Command types are canonical; a case variant would dodge the
+		// capability table and could lazily create a session.
+		c.sendError(protocol.CodeBadFrame, fmt.Sprintf("unknown command %q", typ))
+		return
+	}
+	id := protocol.Field(raw, "id")
+	// Capability enforcement happens here, once, before any command is
+	// dispatched or can lazily create a session (docs/design.md §10). The
+	// actor only enforces ownership (for example which client owns a dialog).
+	if capability := protocol.CommandCapability(typ); capability != "" {
+		if !c.require(id, typ, capability) {
+			return
+		}
+	}
 	switch typ {
 	case "gw_ping":
 		c.sendJSON(protocol.Pong{Type: "gw_pong"})
@@ -646,7 +680,6 @@ func (c *conn) handleFrame(raw []byte) {
 		return
 	}
 
-	id := protocol.Field(raw, "id")
 	switch typ {
 	case "switch_session":
 		c.handleSwitch(raw, id)
@@ -689,6 +722,7 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 	}
 	actor, err := c.d.attach(path, c.piSpec)
 	if err != nil {
+		c.d.metrics.Inc(metrics.AttachFailures)
 		c.sendResponse(id, "switch_session", false, errorCode(err), err.Error(), nil)
 		return
 	}
@@ -701,9 +735,6 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 
 // handleNewSession creates a session and rebinds only this connection.
 func (c *conn) handleNewSession(id string) {
-	if !c.require(id, "new_session", protocol.CapPrompt) {
-		return
-	}
 	if _, ok := c.bindNew(id, "new_session", c.piSpec); !ok {
 		return
 	}
@@ -739,9 +770,6 @@ func (c *conn) require(id, command, capability string) bool {
 // handleListSessions answers the session catalog query (docs/protocol.md §3.2).
 func (c *conn) handleListSessions(raw []byte) {
 	id := protocol.Field(raw, "id")
-	if !c.require(id, "gw_list_sessions", protocol.CapObserve) {
-		return
-	}
 	var req struct {
 		Filter struct {
 			Cwd   string `json:"cwd"`
@@ -766,9 +794,6 @@ func (c *conn) handleListSessions(raw []byte) {
 // (docs/protocol.md §3.3).
 func (c *conn) handleGWNewSession(raw []byte) {
 	id := protocol.Field(raw, "id")
-	if !c.require(id, "gw_new_session", protocol.CapAdmin) {
-		return
-	}
 	var req struct {
 		Name   string            `json:"name"`
 		PiArgs []string          `json:"piArgs"`
@@ -816,9 +841,6 @@ func (c *conn) handleGWNewSession(raw []byte) {
 // handleReload restarts pi for a session (docs/protocol.md §3.6).
 func (c *conn) handleReload(raw []byte) {
 	id := protocol.Field(raw, "id")
-	if !c.require(id, "gw_reload_session", protocol.CapControl) {
-		return
-	}
 	var req struct {
 		Session string `json:"session"`
 		Force   bool   `json:"force"`
@@ -857,33 +879,4 @@ func (c *conn) handleReload(raw []byte) {
 	default:
 		c.sendResponse(id, "gw_reload_session", false, protocol.CodeSessionCrashed, err.Error(), nil)
 	}
-}
-
-// grantCapabilities intersects requested capabilities with the token's role.
-// The daemon-generated token grants the full set, so a request for nothing
-// means everything (see docs/protocol.md §2).
-func grantCapabilities(requested []string) ([]string, map[string]bool) {
-	known := make(map[string]bool, len(protocol.AllCapabilities))
-	for _, cap := range protocol.AllCapabilities {
-		known[cap] = true
-	}
-	set := make(map[string]bool)
-	if len(requested) == 0 {
-		for _, cap := range protocol.AllCapabilities {
-			set[cap] = true
-		}
-	} else {
-		for _, cap := range requested {
-			if known[cap] {
-				set[cap] = true
-			}
-		}
-	}
-	granted := make([]string, 0, len(set))
-	for _, cap := range protocol.AllCapabilities {
-		if set[cap] {
-			granted = append(granted, cap)
-		}
-	}
-	return granted, set
 }

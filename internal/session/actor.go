@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/internal/gwlog"
+	"github.com/tigersoldier/pi-gateway/internal/metrics"
 	"github.com/tigersoldier/pi-gateway/internal/protocol"
 )
 
@@ -46,7 +48,8 @@ type Params struct {
 	ShortGrace  time.Duration
 	HubCapacity int
 	SessionID   string // gw_session value before a path is known
-	Logf        func(format string, args ...any)
+	Log         gwlog.Logger
+	Metrics     *metrics.Registry
 }
 
 // snapInfo is the race-free view of fields read from outside the actor loop.
@@ -59,12 +62,13 @@ type snapInfo struct {
 
 // Info is a snapshot of actor state used to build gw_welcome.
 type Info struct {
-	Path      string
-	State     string
-	HeadSeq   uint64
-	OldestSeq uint64
-	Turn      protocol.TurnState
-	Clients   []protocol.ClientSummary
+	Path        string
+	State       string
+	HeadSeq     uint64
+	OldestSeq   uint64
+	Turn        protocol.TurnState
+	Clients     []protocol.ClientSummary
+	Subscribers int
 }
 
 // Actor errors surfaced to the daemon.
@@ -159,11 +163,12 @@ type actorMsg struct {
 // Actor owns one pi process, its ordered event log, and the daemon queue.
 // All state transitions happen on its single loop goroutine.
 type Actor struct {
-	params Params
-	logf   func(format string, args ...any)
-	hub    *Hub
-	pi     *PiProcess
-	queue  Queue
+	params  Params
+	log     gwlog.Logger
+	metrics *metrics.Registry
+	hub     *Hub
+	pi      *PiProcess
+	queue   Queue
 
 	in       chan actorMsg
 	stopCh   chan struct{}
@@ -222,13 +227,14 @@ func NewActor(p Params) *Actor {
 			sessionID = fmt.Sprintf("s_%d", time.Now().UnixNano())
 		}
 	}
-	logf := p.Logf
-	if logf == nil {
-		logf = func(string, ...any) {}
+	log := p.Log
+	if log == nil {
+		log = gwlog.Nop()
 	}
 	a := &Actor{
 		params:            p,
-		logf:              logf,
+		log:               log,
+		metrics:           p.Metrics,
 		hub:               NewHub(p.HubCapacity, sessionID),
 		in:                make(chan actorMsg, 512),
 		stopCh:            make(chan struct{}),
@@ -248,6 +254,7 @@ func NewActor(p Params) *Actor {
 		pendingUI:         make(map[string]*uiPending),
 		lastActive:        make(map[string]time.Time),
 	}
+	a.hub.SetMetrics(p.Metrics)
 	a.timer = time.NewTimer(time.Hour)
 	if !a.timer.Stop() {
 		<-a.timer.C
@@ -280,7 +287,7 @@ func (a *Actor) spawnPi() (*PiProcess, error) {
 		args = append(args, "--session", a.path)
 	}
 	args = append(args, a.params.PiArgs...)
-	return StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Logf: a.logf})
+	return StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Log: a.log})
 }
 
 // stopPi asks the process to abort and closes it, bounded by a grace period
@@ -481,7 +488,7 @@ func (a *Actor) send(m actorMsg) bool {
 		return false
 	default:
 		// The channel is full: never block the connection goroutine.
-		a.logf("session %s: actor input queue full, dropping message", a.Path())
+		a.log.Warn("actor input queue full, dropping message", "session", a.Path())
 		return false
 	}
 }
@@ -606,10 +613,11 @@ func (a *Actor) reassignUI(clientID string) {
 
 func (a *Actor) info() Info {
 	out := Info{
-		Path:      a.path,
-		State:     a.state,
-		HeadSeq:   a.hub.HeadSeq(),
-		OldestSeq: a.hub.OldestSeq(),
+		Path:        a.path,
+		State:       a.state,
+		HeadSeq:     a.hub.HeadSeq(),
+		OldestSeq:   a.hub.OldestSeq(),
+		Subscribers: a.hub.Count(),
 		Turn: protocol.TurnState{
 			State:  a.turnState,
 			TurnID: a.turnID,
@@ -632,12 +640,9 @@ func (a *Actor) handleCommand(c ClientCommand) {
 	case "prompt", "follow_up":
 		a.handlePrompt(c)
 	case "steer":
-		if !a.requireCap(c, protocol.CapInterject) {
-			return
-		}
 		a.forward(c)
 	case "abort":
-		// Session-wide and open to any client (docs/protocol.md §3.9).
+		// Session-wide; requires `interject`, like steer (docs/protocol.md §10).
 		a.forward(c)
 	case "clear_queue":
 		a.handleClearQueue(c)
@@ -661,9 +666,6 @@ func (a *Actor) handleCommand(c ClientCommand) {
 }
 
 func (a *Actor) handlePrompt(c ClientCommand) {
-	if !a.requireCap(c, protocol.CapPrompt) {
-		return
-	}
 	// A follow-up submitted to an idle session runs as a normal prompt.
 	raw, err := protocol.RewriteCommand(c.Raw, c.LocalID, "prompt")
 	if err != nil {
@@ -680,6 +682,7 @@ func (a *Actor) handlePrompt(c ClientCommand) {
 		Message:  protocol.Field(c.Raw, "message"),
 	}
 	if a.state != stateReady {
+		a.metrics.Inc(metrics.PromptsRejected)
 		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
 		return
 	}
@@ -688,6 +691,7 @@ func (a *Actor) handlePrompt(c ClientCommand) {
 		return
 	}
 	a.queue.Push(item)
+	a.metrics.Inc(metrics.PromptsQueued)
 	a.respond(c, true, []byte(`{"queued":true}`))
 	a.publishQueue()
 }
@@ -754,9 +758,6 @@ func (a *Actor) forwardRaw(c ClientCommand, ns string) {
 // session file. It is refused while other clients are attached, because they
 // would silently end up on the new session (docs/protocol.md §3.8).
 func (a *Actor) handleFork(c ClientCommand) {
-	if !a.requireCap(c, protocol.CapPrompt) {
-		return
-	}
 	if len(a.clients) > 1 {
 		a.errorResponse(c, protocol.CodeSharedSession, c.Type+" is unavailable while other clients are attached")
 		return
@@ -781,22 +782,22 @@ func (a *Actor) handleFork(c ClientCommand) {
 }
 
 func (a *Actor) handleUIResponse(c ClientCommand) {
-	if !a.requireCap(c, protocol.CapUI) {
-		return
-	}
 	if a.state != stateReady || a.pi == nil {
 		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
 		return
 	}
 	p, ok := a.pendingUI[c.LocalID]
 	if !ok {
+		a.metrics.Inc(metrics.UIStale)
 		a.errorResponse(c, protocol.CodeUIStale, "extension UI request is no longer pending")
 		return
 	}
 	if p.winner != c.Client.ID() {
+		a.metrics.Inc(metrics.UIStale)
 		a.errorResponse(c, protocol.CodeUIStale, "extension UI request was routed to another client")
 		return
 	}
+	a.metrics.Inc(metrics.UIAnswered)
 	delete(a.pendingUI, c.LocalID)
 	// The answer keeps pi's original request id; route any response with that
 	// id back to this client only.
@@ -808,6 +809,7 @@ func (a *Actor) handleUIResponse(c ClientCommand) {
 // Turn and queue
 
 func (a *Actor) startTurn(author *protocol.ClientRef) {
+	a.metrics.Inc(metrics.TurnsStarted)
 	a.turnState = turnRunning
 	a.turnSeq++
 	a.turnID = fmt.Sprintf("t_%d", a.turnSeq)
@@ -819,6 +821,7 @@ func (a *Actor) startTurn(author *protocol.ClientRef) {
 
 func (a *Actor) onSettled() {
 	if a.turnState == turnRunning {
+		a.metrics.Inc(metrics.TurnsSettled)
 		a.turnState = turnIdle
 		a.publishTurn("settled")
 	}
@@ -841,7 +844,7 @@ func (a *Actor) drainQueue() {
 	id := a.internalID("q")
 	raw, err := protocol.RewriteCommand(it.Raw, id, "prompt")
 	if err != nil {
-		a.logf("session %s: dropping malformed queued command: %v", a.path, err)
+		a.log.Warn("dropping malformed queued command", "session", a.path, "err", err)
 		a.publishQueue()
 		return
 	}
@@ -873,7 +876,7 @@ func (a *Actor) applyRuntime(r *applyReq) {
 		}
 		if err := a.pi.Send(raw); err != nil {
 			delete(a.runtimeCalls, id)
-			a.logf("session %s: apply %s failed: %v", a.path, rc.Command, err)
+			a.log.Warn("runtime parameter apply failed", "session", a.path, "command", rc.Command, "err", err)
 		}
 	}
 }
@@ -1054,6 +1057,7 @@ func (a *Actor) handlePiExit() {
 	}
 	a.state = stateCrashed
 	a.stopReason = stateCrashed
+	a.metrics.Inc(metrics.PiExits)
 	a.publishState(stateCrashed, reason, &code)
 	a.failQueued(protocol.CodeSessionCrashed, "pi exited")
 	a.failPendingCalls()
@@ -1202,8 +1206,10 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 		}
 	}
 	if !req.force && (others > 0 || a.turnState == turnRunning) {
+		a.metrics.Inc(metrics.ReloadsRefused)
 		return fail(ErrReloadBusy)
 	}
+	a.metrics.Inc(metrics.Reloads)
 	a.setState(stateRestarting)
 	a.publishState(stateRestarting, "reload", nil)
 	a.stopPi()
@@ -1255,8 +1261,10 @@ func (a *Actor) routeUI(rec *protocol.Record) bool {
 	if !dialogMethods[protocol.Field(rec.Raw, "method")] {
 		return true
 	}
+	a.metrics.Inc(metrics.UIRequests)
 	winner := a.pickUIWinner()
 	if winner == "" {
+		a.metrics.Inc(metrics.UIUnroutable)
 		return false
 	}
 	rec.Owner = winner
@@ -1303,17 +1311,6 @@ func (a *Actor) respond(c ClientCommand, success bool, data []byte) {
 
 func (a *Actor) errorResponse(c ClientCommand, code, msg string) {
 	a.respondFrame(c, false, code, msg, nil)
-}
-
-// requireCap reports whether the client holds a capability, replying with
-// `forbidden` when it does not.
-func (a *Actor) requireCap(c ClientCommand, capability string) bool {
-	if c.Client.Has(capability) {
-		return true
-	}
-	a.errorResponse(c, protocol.CodeForbidden,
-		fmt.Sprintf("%s requires the %s capability", c.Type, capability))
-	return false
 }
 
 // respondFrame publishes a pi-shaped response addressed to the requester.

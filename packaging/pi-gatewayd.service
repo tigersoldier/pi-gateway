@@ -1,0 +1,39 @@
+# pi-gateway session daemon as a systemd user unit.
+#
+# Install:
+#   install -Dm644 packaging/pi-gatewayd.service ~/.config/systemd/user/pi-gatewayd.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pi-gatewayd
+#
+# Inspect:
+#   systemctl --user status pi-gatewayd
+#   journalctl --user -u pi-gatewayd -f
+#   curl -s 127.0.0.1:7332/status
+#
+# The daemon writes its token, port, debug port, and tokens file under
+# ~/.config/pi-gateway/ (or --state-dir).
+[Unit]
+Description=pi-gateway session daemon (owns pi RPC sessions)
+Documentation=https://github.com/tigersoldier/pi-gateway
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pi-gatewayd
+# SIGHUP re-reads ~/.config/pi-gateway/tokens.json, so
+# `pi-gatewayd --provision-token ...` takes effect without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# Shutdown stops every session (pi gets SIGTERM after an abort).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+# The daemon resolves `pi` through PATH. npm-style installs often live outside
+# a user unit's PATH; uncomment and adjust, or pass --pi explicitly:
+#Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+#Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
