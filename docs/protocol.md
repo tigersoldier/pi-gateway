@@ -11,21 +11,29 @@ This document is the client-facing wire protocol for the settled design in
 - Every decision for this draft is settled; the one deliberately provisional
   behavior is noted in §6 (mid-turn attach) and will be revisited after
   implementation.
+- **Implementation status.** M1 is implemented: handshake/auth, token/port
+  discovery, lazy session creation, attach/rebind by path, `new_session`, the
+  daemon queue, replay (`liveOnly` / `resume.sinceSeq`), `gw_snapshot`, and
+  hibernation/reaping. The catalog (§3.2), `gw_new_session` (§3.3),
+  `gw_reload_session` (§3.6), `fork`/`clone` (§3.8), name resolution, and
+  backpressure coalescing are M2: until they land, a name target answers
+  `unknown_session` and the unimplemented `gw_*` controls answer
+  `not_supported`. See README → *Implementation status*.
 
 ---
 
 ## 0. Roles and topology
 
 ```text
- third-party UI ── raw pi JSONL (stdio) ──► pi-gateway connect ── gw protocol ──► pi-gateway serve ── pi RPC ──► pi
+ third-party UI ── raw pi JSONL (stdio) ──► pi-gateway (bridge) ── gw protocol ──► pi-gatewayd (daemon) ── pi RPC ──► pi
                                                   (a client)                       (owns pi, sole writer)
  integrations (e.g. Slack bot, separate repo) ── gw protocol ──────────────────────────┘
 ```
 
 | Role | Command | Owns pi? | Speaks |
 |---|---|---|---|
-| **daemon** | `pi-gateway serve` | yes | gateway protocol (`gw_hello` + `gw_*`) |
-| **bridge** | `pi-gateway connect --stdio` | no | gateway protocol upstream, **raw pi RPC** downstream |
+| **daemon** | `pi-gatewayd` | yes | gateway protocol (`gw_hello` + `gw_*`) |
+| **bridge** | `pi-gateway` | no | gateway protocol upstream, **raw pi RPC** downstream |
 
 The bridge is an ordinary client of the daemon. It never spawns pi and holds no
 session state. Several bridges, and several direct gateway clients, can be
@@ -97,7 +105,7 @@ client                                        daemon
 Session binding is **lazy**. A connection with no `session` in `gw_hello` is
 unbound until its first session-scoped command:
 
-- `switch_session` (or a non-pi `gw_attach`) binds without creating a session;
+- `switch_session` binds without creating a session;
 - any other session command (e.g. `get_state`) **creates a new session**, which
   is pilish's fresh-session flow.
 
@@ -134,11 +142,18 @@ message.
 - `piArgs` carries the pi parameters the UI was invoked with (already filtered
   by the client to the accepted set; see §4.3).
 - `resume.sinceSeq` requests replay after that sequence; `resume.leafEntryId`
-  enables durable resync after a daemon restart.
+  enables durable resync after a daemon restart. **M1 note:** `leafEntryId` and
+  `allowLossy` are accepted but not yet acted on (durable resync and lossy
+  backpressure are M2); an evicted `sinceSeq` triggers `resyncRequired` plus
+  `gw_snapshot`.
 - `liveOnly: true` attaches at the current head without replay (the bridge
   default). `resume` is ignored when `liveOnly` is set.
 - `kind` is informational and tagged on events, queue entries, presence, and
   catalog entries. It never changes policy. Authority is capability-based.
+- An absent or empty `client.capabilities` list is treated as the full set
+  (the default daemon-generated token grants it). In M1 the daemon enforces
+  `prompt`, `interject`, and `ui`; full capability/role provisioning lands in
+  M3.
 
 ### `gw_welcome` (daemon → client)
 
@@ -430,8 +445,9 @@ rejected with `bad_frame`.
     session-global, and every client is notified with `gw_state_changed`;
   - spawn-only parameters are compared to the session's recorded spawn config:
     **identical values are no-ops; a differing value fails the attach** with
-    `spawn_param_conflict` (naming the parameter). This is required because
-    pilish re-sends `--approve` on every reload.
+    `spawn_param_conflict` (naming the parameter). A parameter the request does
+    not mention is not a conflict: the session keeps its recorded value. This
+    is required because pilish re-sends `--approve` on every reload.
 
 ### 4.4 Global session mutations
 
@@ -467,7 +483,8 @@ clients receive a copy tagged with `gw_owner`.
 | Type | Payload | Purpose |
 |---|---|---|
 | `gw_welcome` | §2 | handshake result |
-| `gw_replay` / `gw_replay_done` | record / `{headSeq}` | replay window |
+| `gw_replay` | replay frames carry the original pi fields (including their original `type` and `gw_seq`) | replay window |
+| `gw_replay_done` | `{headSeq}` | ends the replay window |
 | `gw_snapshot` | §2 | full resync |
 | `gw_turn` | `{state:"running"\|"settled", turnId, author:{clientId,kind,name}}` | turn lifecycle; replaces the removed floor |
 | `gw_queue` | `{pending:[{id, mode:"followUp", author:{clientId,kind,name}, preview}]}` | daemon-owned pending prompts, tagged by client kind; immediate `steer` interjections are not listed |

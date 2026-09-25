@@ -1,5 +1,6 @@
-// Package protocol implements strict JSONL framing and the small set of
-// gateway control messages that wrap pi's RPC protocol.
+// Package protocol implements strict JSONL framing for the gateway protocol
+// and pi's RPC protocol, plus the small set of gateway control messages that
+// wrap pi's messages.
 //
 // Framing rule (inherited from pi): records are delimited by LF only. A
 // trailing CR is stripped. U+2028/U+2029 are valid inside JSON strings and
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -23,6 +25,10 @@ const Version = 1
 // payloads; keep this generous but finite.
 const MaxFrameBytes = 16 << 20
 
+// InternalIDPrefix marks command ids the daemon uses for its own pi calls.
+// pi only ever sees ids with this prefix or a client namespace prefix.
+const InternalIDPrefix = "gwint:"
+
 var (
 	ErrFrameTooLarge = errors.New("protocol: frame exceeds max size")
 	ErrNoWriter      = errors.New("protocol: codec has no writer")
@@ -30,10 +36,16 @@ var (
 
 // Record is one decoded JSONL frame plus gateway routing metadata.
 type Record struct {
-	Seq  uint64 // gateway-assigned global sequence (0 = not sequenced)
-	Raw  []byte // gateway view of the frame (may include gw_* fields)
+	Seq  uint64 // gateway-assigned per-session sequence (0 = not sequenced)
+	Raw  []byte // wire frame (may already carry gw_* fields)
 	Type string // value of "type"
 	ID   string // value of "id" ("" if absent)
+
+	// Owner is the client ID a frame is addressed to, derived from the
+	// namespaced "id" pi echoed. Responses are delivered only to their owner;
+	// other owner-tagged frames are broadcast with gw_owner set. Empty means
+	// broadcast.
+	Owner string
 }
 
 // DecodeRecord extracts the routing fields from a raw frame.
@@ -45,7 +57,13 @@ func DecodeRecord(raw []byte) (Record, error) {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return Record{}, fmt.Errorf("protocol: decode frame: %w", err)
 	}
-	return Record{Raw: raw, Type: probe.Type, ID: probe.ID}, nil
+	rec := Record{Raw: raw, Type: probe.Type, ID: probe.ID}
+	if owner, _ := SplitNamespaceID(probe.ID); owner != "" && owner != probe.ID {
+		rec.Owner = owner
+	} else if strings.HasPrefix(probe.ID, InternalIDPrefix) {
+		rec.Owner = "" // internal ids are consumed by the actor
+	}
+	return rec, nil
 }
 
 // Codec reads and writes strict JSONL. Reads use LF-only framing.
@@ -121,6 +139,37 @@ func (c *Codec) WriteJSON(v any) error {
 	return c.WriteRaw(b)
 }
 
+// IsInternalID reports whether id belongs to a daemon-internal pi call.
+func IsInternalID(id string) bool { return strings.HasPrefix(id, InternalIDPrefix) }
+
+// RewriteCommand returns a copy of raw with its "id" and "type" fields set.
+// An empty id removes the field; an empty typ leaves the type unchanged.
+func RewriteCommand(raw []byte, id, typ string) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("protocol: rewrite command: %w", err)
+	}
+	if id == "" {
+		delete(obj, "id")
+	} else {
+		obj["id"] = id
+	}
+	if typ != "" {
+		obj["type"] = typ
+	}
+	return json.Marshal(obj)
+}
+
+// Field returns a top-level string field of raw ("" if absent).
+func Field(raw []byte, name string) string {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	s, _ := obj[name].(string)
+	return s
+}
+
 // Stamp returns a copy of raw with the given gateway fields added.
 func Stamp(raw []byte, fields map[string]any) ([]byte, error) {
 	if len(fields) == 0 {
@@ -136,7 +185,8 @@ func Stamp(raw []byte, fields map[string]any) ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-// RewriteID returns a copy of raw with its "id" field replaced.
+// RewriteID returns a copy of raw with its "id" field replaced. An empty id
+// removes the field.
 func RewriteID(raw []byte, id string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
@@ -150,20 +200,58 @@ func RewriteID(raw []byte, id string) ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-// Field returns a top-level string field of raw ("" if absent).
-func Field(raw []byte, name string) string {
+// RestoreID removes a client namespace prefix from raw's id. It is a no-op
+// when the id is not namespaced for clientID.
+func RestoreID(raw []byte, clientID string) []byte {
+	prefix := clientID + ":"
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
-		return ""
+		return raw
 	}
-	s, _ := obj[name].(string)
-	return s
+	id, _ := obj["id"].(string)
+	switch {
+	case strings.HasPrefix(id, prefix):
+		obj["id"] = strings.TrimPrefix(id, prefix)
+	case id == clientID:
+		delete(obj, "id")
+	default:
+		return raw
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// StripGatewayFields returns a copy of raw with every gw_* key removed,
+// yielding a pristine pi frame. It is used by the bridge for raw pi peers.
+func StripGatewayFields(raw []byte) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return raw
+	}
+	changed := false
+	for k := range obj {
+		if strings.HasPrefix(k, "gw_") {
+			delete(obj, k)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // IsGatewayType reports whether typ is a gateway-only message. Raw/compat
 // clients never receive these.
 func IsGatewayType(typ string) bool {
-	return len(typ) > 3 && typ[0] == 'g' && typ[1] == 'w' && typ[2] == '_'
+	return strings.HasPrefix(typ, "gw_")
 }
 
 // NamespaceID builds the globally unique id forwarded to pi.
@@ -174,12 +262,38 @@ func NamespaceID(clientID, localID string) string {
 	return clientID + ":" + localID
 }
 
-// SplitNamespaceID reverses NamespaceID.
+// SplitNamespaceID reverses NamespaceID. For an id with no namespace it
+// returns ("", id); for "c_1" it returns ("c_1", "").
 func SplitNamespaceID(id string) (clientID, localID string) {
-	for i := 0; i < len(id); i++ {
-		if id[i] == ':' {
-			return id[:i], id[i+1:]
-		}
+	if i := strings.IndexByte(id, ':'); i >= 0 {
+		return id[:i], id[i+1:]
 	}
-	return id, ""
+	if id == "" {
+		return "", ""
+	}
+	return "", id
+}
+
+// DataField returns raw's "data" object as JSON, or nil.
+func DataField(raw []byte) json.RawMessage {
+	var obj struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	return obj.Data
+}
+
+// BoolField returns a top-level boolean field, or def when absent.
+func BoolField(raw []byte, name string, def bool) bool {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return def
+	}
+	v, ok := obj[name].(bool)
+	if !ok {
+		return def
+	}
+	return v
 }

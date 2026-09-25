@@ -23,10 +23,12 @@ The server is intended to run as a **background service** (e.g. a systemd user
 unit) on the machine that owns the sessions, and to accept **local connections**
 from clients. Clients are the processes third-party UIs spawn in place of `pi`.
 
-> **Status of this document.** The purpose above is settled. The concrete
-> deployment and session-lifecycle decisions that follow from it are **not yet
-> decided**; they are listed under [Open design decisions](#open-design-decisions)
-> and are being resolved with the operator one at a time.
+> **Status.** The design is settled (see [Design decisions](#design-decisions))
+> and **M1 is implemented**: the `pi-gatewayd` daemon and the `pi-gateway`
+> bridge, with token auth, port discovery, session attach/rebinding, the
+> daemon-owned queue, replay, hibernation, and orphan reaping. See
+> [Implementation status](#implementation-status) for M1 scope and what is
+> deliberately deferred.
 
 ## Background: why pi alone cannot do this
 
@@ -69,21 +71,22 @@ survives client death, and non-pi integrations.
 |------|----------|
 | [`docs/design.md`](docs/design.md) | Full architecture, invariants, arbitration, replay, failure modes |
 | [`docs/protocol.md`](docs/protocol.md) | Client-facing wire protocol (pi-compatible + thin gateway envelope) |
-| [`cmd/pi-gateway`](cmd/pi-gateway) | Go reference skeleton (stdlib only): `serve` + `connect` |
+| [`cmd/pi-gatewayd`](cmd/pi-gatewayd) | M1 daemon: owns pi sessions, serves the gateway protocol on loopback TCP |
+| [`cmd/pi-gateway`](cmd/pi-gateway) | M1 bridge: the binary UIs spawn in place of `pi` |
 
 ## TL;DR of the design
 
 ```text
  third-party UI (pilish over ssh) ─┐
- Slack bot / other integration ────┼── local conn ──► pi-gateway serve (daemon)
- another pilish tab ───────────────┘                        │
-                                                            ├─ SessionActor: one per session, sole pi writer
-                                                            ├─ Hub: ordered event log (seq) + replay ring
-                                                            ├─ Arbiter: turn ownership / handoff
-                                                            └─ UIBroker: extension_ui_request routing
-                                                            ▼
-                                              pi --mode rpc --session X
-                                              (survives client disconnects)
+ Slack bot / other integration ────┼── loopback TCP ──► pi-gatewayd (daemon)
+ another pilish tab ───────────────┘     (token auth)        │
+                                                             ├─ SessionActor: one per session, sole pi writer
+                                                             ├─ Hub: ordered event log (seq) + replay ring
+                                                             ├─ PromptQueue: daemon-owned per-client FIFO
+                                                             └─ UIBroker: extension_ui_request routing
+                                                             ▼
+                                               pi --mode rpc --session X
+                                               (survives client disconnects)
 ```
 
 - Clients speak pi's RPC protocol verbatim; a thin `gw_*` envelope adds
@@ -93,10 +96,10 @@ survives client death, and non-pi integrations.
 - A session outlives its clients: the daemon keeps pi running across ssh
   drops, and clients re-attach.
 - All commands are linearized by the actor; all events get a global `seq`.
-- Late joiners / reconnects replay from a `seq` cursor, or resync via
-  `get_entries since=<entryId>` + snapshot.
-- Concurrent prompts are arbitrated by a turn lease; `steer`/`follow_up` are
-  always safe and let clients interject without stealing the floor.
+- Late joiners / reconnects replay from a `seq` cursor, or resync via a
+  snapshot.
+- Concurrent prompts are queued by the daemon (per-client tagged FIFO, one
+  turn at a time); any client may prompt and `steer` interjects immediately.
 
 ## Design decisions
 
@@ -158,8 +161,8 @@ unless it is explicitly marked so.
   carries accumulated output. No turn replay and no snapshot synthesis for now.
 - **`pilish-reload` semantics** (operator). **Attach-only + explicit daemon
   reload.** pilish's reload becomes a re-attach (state/history refresh); it does
-  not restart pi. Restarting pi is an explicit daemon operation (e.g.
-  `pi-gateway reload <session>`, or a `gw_reload_session` control message) that
+  not restart pi. Restarting pi is an explicit daemon operation (a
+  `gw_reload_session` control message) that
   refuses while other clients are attached or a turn is running, unless forced.
 - **`switch_session` re-routing** (operator). **Server-side rebinding.** The
   server intercepts `switch_session`, resolves the target (file path or session
@@ -243,70 +246,63 @@ unless it is explicitly marked so.
 
 None. Every gap found while reviewing `docs/protocol.md` draft 2 has been
 resolved and recorded above. The **mid-turn attach** entry is deliberately
-provisional (live-only) and will be revisited after implementation.
+provisional (live-only) and is the first item to revisit now that M1 is
+implemented.
 
-## Running the reference skeleton
+## Implementation status
 
-> **The current Go skeleton predates the settled design.** It is a prototype
-> with one `pi-gateway` binary and `serve`/`connect` subcommands. The settled
-> packaging is two binaries — `pi-gatewayd` (server) and `pi-gateway` (client)
-> — plus token auth, the daemon-owned queue, and the rest of the decision log.
-> The skeleton will be reworked; treat `docs/protocol.md` draft 2 as the target.
+**M1 (core daemon and client) is implemented.**
 
-Requires Go 1.22+ and a `pi` binary on `PATH` (or `-pi <path>`).
+| Area | M1 |
+| --- | --- |
+| Binaries | `pi-gatewayd` (daemon), `pi-gateway` (bridge) |
+| Transport/auth | loopback TCP, token file (0600), `--server`/`--port`/`--token-file`, port-file discovery with fallback to `127.0.0.1:7331` |
+| Sessions | attach by path, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester |
+| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping of never-messaged sessions |
+| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed` |
+| Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
+| Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state`, `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync |
+| Extension UI | broadcast plus first-response-wins with `ui_stale` (full turn-author routing lands in M2) |
 
-### Third-party pi UIs: the `connect` bridge
+Deliberately deferred to M2+ (roadmap in `docs/design.md` §14): session
+catalog and name resolution (`gw_list_sessions`), `gw_new_session`,
+`gw_reload_session`, `fork`/`clone` adoption, backpressure coalescing and
+`gw_lag`, and the HTTP debug listener. Until then those commands answer
+`not_supported`, and `switch_session` accepts file paths only.
 
-`pi-gateway` is split into a **server** that owns pi and a **bridge** that is
-just another client of that server. The bridge presents raw pi RPC on stdio
-(or TCP) and speaks the gateway protocol upstream.
-
-```bash
-# server: owns pi, sole writer
-pi-gateway serve --listen 127.0.0.1:7331 --session /tmp/shared.jsonl -- --provider openai
-
-# third-party UI: spawn this instead of `pi --mode rpc`
-pi-gateway connect --stdio --server 127.0.0.1:7331 --session-id shared
-```
-
-The UI sees **only** pristine pi messages (no `gw_*`, no injected fields) with
-`id`s restored, so it needs no changes. Additional gateway clients can attach
-to the same server session at the same time.
-
-`connect --listen <addr>` accepts raw pi RPC over TCP and bridges each
-connection as a **separate server client**, so several raw UIs can share one
-session. `--replay` forwards replayed history; by default the bridge attaches
-live-only and the UI rebuilds state via `get_state`/`get_messages` as usual.
-
-### Gateway-protocol clients (TCP)
+### Running M1
 
 ```bash
-# terminal 1 — start the server (spawns pi itself)
-go run ./cmd/pi-gateway serve --listen 127.0.0.1:7331 --session /tmp/demo.jsonl --mode exclusive
+go build ./cmd/pi-gatewayd ./cmd/pi-gateway
 
-# terminal 2 — drive it with any JSONL client
-nc 127.0.0.1 7331
-# then paste the handshake line, followed by pi commands, one JSON per line:
-# {"type":"gw_hello","protocol":1,"sessionId":"default","client":{"name":"me","capabilities":["observe","prompt","control"]}}
-# {"type":"prompt","id":"req-1","message":"hello"}
-```
+# Daemon: owns pi sessions (run as a systemd user unit in production).
+# It writes the token and port file under ~/.config/pi-gateway/.
+./pi-gatewayd --pi /usr/local/bin/pi
 
-Run the tests (unit + two-client fan-out + bridge end-to-end against a fake pi):
+# A UI spawns this instead of `pi`; --mode rpc is accepted and consumed.
+./pi-gateway --mode rpc --approve
 
-```bash
+# The managed pi version, answered by the daemon (pilish's dependency check).
+./pi-gateway --version
+
+# Unit + daemon/bridge end-to-end tests (fake pi, no real pi needed).
 go test -race ./...
 ```
 
-### Skeleton scope
+Point `pilish-executable` (local) at the `pi-gateway` binary, or the layer's
+`pilish/remote-executables` path (remote). Do not shadow the real `pi`.
 
-Implemented: strict JSONL framing, ordered hub + replay, `gw_hello`/`gw_resume`,
-fan-out, targeted response routing with `id` namespacing, turn arbitration
-(`exclusive`/`queue`/`owner-only`/`read-only`), extension-UI first-response-wins,
-snapshot resync, per-connection backpressure/disconnect, and the two-role
-topology: **`serve`** (owns pi) and **`connect`** (a bridge client for raw pi
-stdio/TCP compatibility).
+## Repository layout
 
-Deliberately left out (see roadmap in `docs/design.md`): WebSocket transport,
-auth/RBAC beyond capability flags, SQLite session registry and adoption across
-gateway restarts, crash auto-restart, and metrics.
-
+```text
+cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
+cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
+internal/client/     bridge implementation (argv, token/port, relay)
+internal/config/     token and port file paths, defaults
+internal/daemon/     session table, attach/rebind, spawn-param checks
+internal/piargs/     accepted pi parameter parsing (shared daemon/client)
+internal/protocol/   strict JSONL codec, gw_* messages, id namespacing
+internal/session/    SessionActor, Hub, PromptQueue, PiProcess
+internal/fakepi/     fake pi used by the tests
+internal/testutil/   test helpers (build fake pi, raw protocol client)
+```

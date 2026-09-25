@@ -639,12 +639,15 @@ internal/daemon/       listener, auth, connection table, binding/rebinding
 internal/session/      SessionActor, Hub, PromptQueue, UIBroker, PiProcess
 internal/catalog/      session catalog: file scan + live index, name resolution
 internal/client/       bridge: gateway <-> raw pi, id restore, gw_* filtering
+internal/piargs/       accepted pi parameter parsing (shared daemon <-> client)
+internal/fakepi/       fake pi used by the end-to-end tests
+internal/testutil/     test helpers: build fake pi, raw protocol client
 ```
 
-The repository currently contains a **single-binary prototype**
-(`cmd/pi-gateway` with `serve`/`connect`) that predates the settled design; it
-is being reworked into the two-binary layout above. The prototype is useful as
-a source of the JSONL codec, the Hub, and the bridge relay loop.
+M1 implements this layout. The prototype that predated the settled design
+(a single binary with `serve`/`connect` subcommands and floor arbitration) has
+been removed. `internal/catalog` (name resolution and the session catalog)
+arrives with M2.
 
 ---
 
@@ -675,11 +678,13 @@ a source of the JSONL codec, the Hub, and the bridge relay loop.
 
 ## 14. Roadmap
 
-1. **M1 — core daemon and client.** Two binaries; token/port discovery; loopback
-   TCP listener with auth; one session actor (Hub, PromptQueue, PiProcess);
-   `gw_hello`/`gw_welcome`; pi command/event passthrough with id namespacing;
-   server-side `switch_session` rebinding; daemon-owned queue; bridge on stdio;
-   hibernation and orphan reaping.
+1. **M1 — core daemon and client (implemented).** Two binaries; token/port
+   discovery; loopback TCP listener with auth; session actor (Hub, PromptQueue,
+   PiProcess); `gw_hello`/`gw_welcome`; pi command/event passthrough with id
+   namespacing; server-side `switch_session` and `new_session` rebinding;
+   daemon-owned queue; spawn-param conflict checks and runtime-parameter
+   application; replay and `gw_snapshot` resync; bridge on stdio; hibernation
+   and orphan reaping.
 2. **M2 — sessions and multi-client.** Catalog and name resolution;
    `gw_new_session`; `gw_reload_session`; `fork`/`clone` policy; extension UI
    broker; presence and `gw_state_changed`; kind tagging; backpressure and
