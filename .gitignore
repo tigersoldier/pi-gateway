@@ -1,0 +1,12 @@
+# Built binaries
+/pi-gateway
+/pi-gatewayd
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.txt
+
+# Editor/OS noise
+.DS_Store
+*~
