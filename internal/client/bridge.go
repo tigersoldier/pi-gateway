@@ -50,12 +50,14 @@ Client options:
   --version              print the managed pi version (daemon-answered)
   --help                 print this help
 
-Accepted pi options: trust (--approve/--no-approve), extensions (-e,
---extension, --no-extensions), resource/tool toggles (--skill,
---prompt-template, --theme, --no-context-files, --tools, --exclude-tools,
---no-builtin-tools, --no-tools, --system-prompt, --append-system-prompt), and
---provider, --model, --thinking, --name, --session-dir, --no-session,
---api-key. Other pi options are rejected.
+Accepted pi options: trust (--approve/-a, --no-approve/-na), extensions (-e,
+--extension, --no-extensions/-ne), resource/tool toggles (--skill,
+--no-skills/-ns, --prompt-template, --no-prompt-templates/-np, --theme,
+--no-themes, --no-context-files/-nc, --tools/-t, --exclude-tools/-xt,
+--no-builtin-tools/-nbt, --no-tools/-nt, --system-prompt,
+--append-system-prompt), and --provider, --model, --models, --thinking,
+--name/-n, --session-dir, --no-session, --api-key, --offline, --verbose.
+Other pi options are rejected.
 
 Environment:
   PI_GATEWAY_CLIENT_NAME  client name advertised to the daemon (default %q)
@@ -266,6 +268,7 @@ func (b *bridge) run(ctx context.Context) int {
 			Capabilities: protocol.AllCapabilities,
 		},
 		PiArgs:   b.parsed.piArgs,
+		Cwd:      workingDir(),
 		LiveOnly: true,
 	}
 	if err := b.up.WriteJSON(&hello); err != nil {
@@ -374,6 +377,16 @@ func (b *bridge) relayDaemon(results *chan relayResult) {
 			return
 		}
 	}
+}
+
+// workingDir reports the directory the UI spawned us in. The daemon creates
+// the session there, so pi sees the project the UI is working on.
+func workingDir() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return dir
 }
 
 func envOr(key, def string) string {

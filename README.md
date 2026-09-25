@@ -273,6 +273,23 @@ unless it is explicitly marked so.
   client's own usage without contacting the daemon; `pi-gatewayd --help` prints
   the daemon's. `--version` stays daemon-answered so the reported pi version
   matches the managed binary.
+- **Session working directory** (found by the end-to-end suite). **The
+  client's directory, carried in the handshake.** `gw_hello.cwd` (and
+  `gw_new_session{cwd}`) is validated as an absolute existing directory and
+  used as pi's spawn directory, so a session belongs to the project the UI is
+  looking at instead of the directory the daemon was started in. An empty
+  `cwd` keeps meaning "the daemon's own directory" for bare protocol clients,
+  and a session whose file already exists is always respawned in the directory
+  recorded in its header — hibernation and daemon restarts ignore the
+  attaching client's directory.
+- **pi option aliases** (found by the end-to-end suite). **Accepted.**
+  pi's short forms (`-a`, `-na`, `-ne`, `-ns`, `-np`, `-nc`, `-nbt`, `-nt`,
+  `-e`, `-t`, `-xt`, `-n`) map to the same canonical parameters as their long
+  forms, and `--models`, `--no-themes`, `--offline`, `--verbose` joined the
+  accepted set, so a UI that passes `pi -a` no longer fails the handshake.
+  Aliases and long forms are recorded identically, so they can never look like
+  a spawn-parameter conflict. Options the daemon owns (session selection,
+  one-shot modes) are still rejected with `bad_frame`.
 
 ### Open
 

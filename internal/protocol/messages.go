@@ -13,15 +13,18 @@ import (
 
 // Hello is the first frame a client must send.
 type Hello struct {
-	Type       string     `json:"type"`
-	Protocol   int        `json:"protocol"`
-	Token      string     `json:"token"`
-	Client     ClientInfo `json:"client"`
-	Session    string     `json:"session,omitempty"`
-	PiArgs     []string   `json:"piArgs,omitempty"`
-	Resume     *Resume    `json:"resume,omitempty"`
-	LiveOnly   bool       `json:"liveOnly,omitempty"`
-	AllowLossy bool       `json:"allowLossy,omitempty"`
+	Type     string     `json:"type"`
+	Protocol int        `json:"protocol"`
+	Token    string     `json:"token"`
+	Client   ClientInfo `json:"client"`
+	// Cwd is the client's working directory; new sessions spawn pi there.
+	// Empty means "the daemon's own directory" (docs/protocol.md §2).
+	Cwd        string   `json:"cwd,omitempty"`
+	Session    string   `json:"session,omitempty"`
+	PiArgs     []string `json:"piArgs,omitempty"`
+	Resume     *Resume  `json:"resume,omitempty"`
+	LiveOnly   bool     `json:"liveOnly,omitempty"`
+	AllowLossy bool     `json:"allowLossy,omitempty"`
 }
 
 // ClientInfo identifies a client connection.

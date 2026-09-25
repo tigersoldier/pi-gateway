@@ -366,6 +366,31 @@ func trimEOL(b []byte) []byte {
 	return b
 }
 
+// HeaderCwd returns the working directory recorded in a session file's
+// header, or "" when the file is unreadable or has none. Used to respawn a
+// session in its own directory rather than the attaching client's
+// (docs/protocol.md §2).
+func HeaderCwd(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	line, err := readLine(bufio.NewReaderSize(f, 1<<16))
+	if (err != nil && !errors.Is(err, io.EOF)) || len(line) == 0 {
+		return ""
+	}
+	var entry entryLine
+	if json.Unmarshal(line, &entry) != nil || entry.Type != "session" {
+		return ""
+	}
+	var h header
+	if json.Unmarshal(line, &h) != nil {
+		return ""
+	}
+	return h.Cwd
+}
+
 // LeafID returns the id of the last entry in the file: pi's durable leaf.
 // It reads from the end of the file, bounded by lastLineLimit.
 func LeafID(path string) (string, error) {

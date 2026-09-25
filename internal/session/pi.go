@@ -17,8 +17,11 @@ import (
 // PiConfig describes how to spawn pi in RPC mode for one session.
 type PiConfig struct {
 	// Log receives pi's stderr lines (at debug level) and process errors.
-	Log  gwlog.Logger
-	Bin  string
+	Log gwlog.Logger
+	Bin string
+	// Dir is the working directory for the child; empty inherits the daemon's
+	// (docs/protocol.md §2: sessions are created in the client's directory).
+	Dir  string
 	Args []string
 }
 
@@ -74,6 +77,7 @@ func StartPi(cfg PiConfig) (*PiProcess, error) {
 
 	// A nil Env inherits the daemon's environment.
 	proc, err := os.StartProcess(resolved, append([]string{resolved}, cfg.Args...), &os.ProcAttr{
+		Dir:   cfg.Dir,
 		Files: []*os.File{stdinR, stdoutW, stderrW},
 	})
 	if err != nil {

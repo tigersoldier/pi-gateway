@@ -135,6 +135,7 @@ message.
     "capabilities": ["observe", "interject", "prompt", "ui", "control"],
     "tags": {"host": "laptop"}
   },
+  "cwd": "/home/u/proj",
   "session": "/home/u/.pi/agent/sessions/--home-u-proj--/2026-...jsonl",
   "piArgs": ["--approve"],
   "resume": {"sinceSeq": 1042, "leafEntryId": "a1b2c3d4"},
@@ -147,6 +148,14 @@ message.
   Omit it for the fresh-session/rebind flow (pilish does this).
 - `piArgs` carries the pi parameters the UI was invoked with (already filtered
   by the client to the accepted set; see §4.3).
+- `cwd` is the client's working directory. A **new** session's pi process is
+  spawned there, so the session belongs to the project the UI is looking at.
+  It must be an absolute existing directory, otherwise the handshake fails with
+  `bad_frame`; omitting it (or sending `""`) means "the daemon's own
+  directory", which keeps bare protocol clients working. For a session created
+  from a file that already exists, the directory recorded in the session header
+  wins: a respawn after hibernation or a daemon restart happens in the
+  session's own directory no matter which client attaches.
 - `resume.sinceSeq` requests replay after that sequence. The cursor is
   unreplayable when it was evicted from the ring **or** lies beyond the log
   head (which means it belongs to a previous log instance, e.g. before a
@@ -287,6 +296,7 @@ sessions, so an integration can list its own.
   ```json
   {"type": "gw_new_session", "id": "req-2",
    "name": "slack-auth-thread",
+   "cwd": "/home/u/proj",
    "piArgs": ["--provider", "openai"],
    "tags": {"channel": "#auth"}}
   ```
@@ -420,7 +430,7 @@ terms of the daemon queue and pi's turn:
 |---|---|---|
 | `gw_hello` | §2 | handshake, auth, optional bind |
 | `gw_list_sessions` | `{filter}` | session catalog |
-| `gw_new_session` | `{name?, piArgs?, tags?}` | explicit create + bind |
+| `gw_new_session` | `{name?, cwd?, piArgs?, tags?}` | explicit create + bind |
 | `gw_reload_session` | `{session?, force?}` | restart pi for a session |
 | `gw_ping` | `{}` | liveness |
 | `gw_bye` | `{}` | graceful disconnect |
@@ -446,6 +456,7 @@ Intercepted (not forwarded to the current pi):
 |---|---|
 | `switch_session` | resolve target, rebind connection, synthesize response (§3.4) |
 | `new_session` | create a new session, rebind **only this connection**, synthesize response (§3.7) |
+| `gw_new_session` | admin control: create with `name`/`piArgs`/`tags`/`cwd`, rebind requester (§3.3) |
 | `fork`, `clone` | sole client: forward, adopt the new file, rebind requester; shared: `shared_session` (§3.8) |
 
 `abort` and `clear_queue` are **session-wide** and require `interject`, the
@@ -454,12 +465,17 @@ client queued or had forwarded.
 
 ### 4.3 Spawn parameters (`piArgs`)
 
-Accepted set: trust (`--approve`/`--no-approve`), extensions (`-e`,
-`--no-extensions`), resource/tool toggles (`--skill`, `--prompt-template`,
-`--theme`, `--no-context-files`, `--tools`, `--exclude-tools`,
-`--no-builtin-tools`, `--no-tools`, `--system-prompt`,
-`--append-system-prompt`), and `--provider`, `--model`, `--thinking`,
-`--name`, `--session-dir`, `--no-session`, `--api-key`. Other pi options are
+Accepted set, with pi's short aliases: trust (`--approve`/`-a`,
+`--no-approve`/`-na`), extensions (`-e`/`--extension`, `--no-extensions`/
+`-ne`), resource/tool toggles (`--skill`, `--no-skills`/`-ns`,
+`--prompt-template`, `--no-prompt-templates`/`-np`, `--theme`, `--no-themes`,
+`--no-context-files`/`-nc`, `--tools`/`-t`, `--exclude-tools`/`-xt`,
+`--no-builtin-tools`/`-nbt`, `--no-tools`/`-nt`, `--system-prompt`,
+`--append-system-prompt`), and `--provider`, `--model`, `--models`,
+`--thinking`, `--name`/`-n`, `--session-dir`, `--no-session`, `--api-key`,
+`--offline`, `--verbose`. Aliases record the same canonical parameter as their
+long form, so `-a` and `--approve` never look like a conflict. Other pi
+options (including session selection and one-shot modes the daemon owns) are
 rejected with `bad_frame`.
 
 - If the session is **not live**, all accepted parameters apply at spawn.

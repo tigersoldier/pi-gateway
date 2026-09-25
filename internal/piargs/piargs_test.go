@@ -1,6 +1,7 @@
 package piargs
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -99,5 +100,61 @@ func TestRuntimeValuesLastWins(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(spec.Args, " "), "--model a --model b") {
 		t.Fatalf("spawn args should keep every occurrence: %v", spec.Args)
+	}
+}
+
+// TestShortAliasesMatchLongForms guards pi's short flags: a UI that passes
+// `-a` must record exactly what `--approve` records, or the spawn-parameter
+// comparison would treat the same session as a conflict.
+func TestShortAliasesMatchLongForms(t *testing.T) {
+	cases := []struct {
+		alias string
+		long  string
+		value string
+		key   string
+	}{
+		{"-a", "--approve", "", "approve"},
+		{"-na", "--no-approve", "", "no-approve"},
+		{"-ne", "--no-extensions", "", "no-extensions"},
+		{"-ns", "--no-skills", "", "no-skills"},
+		{"-np", "--no-prompt-templates", "", "no-prompt-templates"},
+		{"-nc", "--no-context-files", "", "no-context-files"},
+		{"-nbt", "--no-builtin-tools", "", "no-builtin-tools"},
+		{"-nt", "--no-tools", "", "no-tools"},
+		{"-e", "--extension", "/tmp/ext.ts", "extension"},
+		{"-t", "--tools", "read,bash", "tools"},
+		{"-xt", "--exclude-tools", "write", "exclude-tools"},
+		{"-n", "--name", "work", KeyName},
+		// Newly accepted long forms (no alias, but recorded canonically).
+		{"", "--models", "sonnet,haiku", "models"},
+		{"", "--no-themes", "", "no-themes"},
+		{"", "--offline", "", "offline"},
+		{"", "--verbose", "", "verbose"},
+	}
+	for _, tc := range cases {
+		withValue := func(flag string) []string {
+			if tc.value == "" {
+				return []string{flag}
+			}
+			return []string{flag, tc.value}
+		}
+		long, err := Parse(withValue(tc.long))
+		if err != nil {
+			t.Fatalf("Parse(%v): %v", withValue(tc.long), err)
+		}
+		if len(long.Values[tc.key]) == 0 {
+			t.Fatalf("%s did not record key %q: %v", tc.long, tc.key, long.Values)
+		}
+		if tc.alias == "" {
+			continue
+		}
+		alias, err := Parse(withValue(tc.alias))
+		if err != nil {
+			t.Fatalf("Parse(%v): %v", withValue(tc.alias), err)
+		}
+		if !reflect.DeepEqual(alias.Values, long.Values) {
+			t.Fatalf("%s recorded %v, want %v (same as %s)",
+				tc.alias, alias.Values, long.Values, tc.long)
+		}
 	}
 }

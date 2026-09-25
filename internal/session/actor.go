@@ -43,6 +43,7 @@ type RuntimeCommand struct {
 type Params struct {
 	PiBin       string
 	PiArgs      []string // accepted pi arguments, excluding --mode rpc/--session
+	Cwd         string   // pi's working directory; empty inherits the daemon's
 	SessionPath string   // known path; empty for implicit creation
 	IdleTimeout time.Duration
 	ShortGrace  time.Duration
@@ -287,7 +288,7 @@ func (a *Actor) spawnPi() (*PiProcess, error) {
 		args = append(args, "--session", a.path)
 	}
 	args = append(args, a.params.PiArgs...)
-	return StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Log: a.log})
+	return StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Dir: a.params.Cwd, Log: a.log})
 }
 
 // stopPi asks the process to abort and closes it, bounded by a grace period

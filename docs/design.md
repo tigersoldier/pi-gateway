@@ -299,15 +299,26 @@ Two paths, both file-backed:
 - **Implicit.** A fresh client sends `get_state` before any `switch_session`;
   the daemon creates a session and `get_state.sessionFile` reports the new
   file. This is pilish's new-chat flow and must keep working.
-- **Explicit.** `gw_new_session{name?, piArgs?, tags?}` creates a session,
-  records the creating client's identity/tags (exposed in the catalog), and
-  binds the requester to it.
+- **Explicit.** `gw_new_session{name?, cwd?, piArgs?, tags?}` creates a
+  session, records the creating client's identity/tags (exposed in the
+  catalog), and binds the requester to it.
 
 A created session spawns:
 
 ```text
 pi --mode rpc --session <file> [accepted piArgs...]
 ```
+
+The **working directory of a session is the creating client's**, carried in
+`gw_hello.cwd` (or `gw_new_session.cwd`) and used as pi's spawn directory. The
+UI is the only party that knows which project it is looking at, and a
+daemon-side directory would file every session under whatever directory the
+service happened to start in. The value must be an absolute existing
+directory; an empty `cwd` means "the daemon's own directory" for bare protocol
+clients. For a session whose file already exists, the directory recorded in
+the session header wins over the attaching client's, so a respawn after
+hibernation or a daemon restart always happens in the session's own project
+(§4.3, §4.5).
 
 Sessions created with `--no-session` are supported but **ephemeral**: pi
 reports no session file, so they have no path to attach to, they cannot be

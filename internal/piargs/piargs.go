@@ -18,18 +18,24 @@ const (
 )
 
 // valueFlags maps a flag spelling to a canonical key. Each takes a value.
+// pi's short aliases map to the same keys, so `-n x` and `--name x` are the
+// same spawn parameter.
 var valueFlags = map[string]string{
 	"--provider":             KeyProvider,
 	"--model":                KeyModel,
+	"--models":               "models",
 	"--thinking":             KeyThinking,
 	"--name":                 KeyName,
+	"-n":                     KeyName,
 	"-e":                     "extension",
 	"--extension":            "extension",
 	"--skill":                "skill",
 	"--prompt-template":      "prompt-template",
 	"--theme":                "theme",
 	"--tools":                "tools",
+	"-t":                     "tools",
 	"--exclude-tools":        "exclude-tools",
+	"-xt":                    "exclude-tools",
 	"--system-prompt":        "system-prompt",
 	"--append-system-prompt": "append-system-prompt",
 	"--session-dir":          "session-dir",
@@ -38,13 +44,26 @@ var valueFlags = map[string]string{
 
 // boolFlags maps a boolean flag spelling to a canonical key.
 var boolFlags = map[string]string{
-	"--approve":          "approve",
-	"--no-approve":       "no-approve",
-	"--no-extensions":    "no-extensions",
-	"--no-context-files": "no-context-files",
-	"--no-builtin-tools": "no-builtin-tools",
-	"--no-tools":         "no-tools",
-	"--no-session":       "no-session",
+	"--approve":             "approve",
+	"-a":                    "approve",
+	"--no-approve":          "no-approve",
+	"-na":                   "no-approve",
+	"--no-extensions":       "no-extensions",
+	"-ne":                   "no-extensions",
+	"--no-skills":           "no-skills",
+	"-ns":                   "no-skills",
+	"--no-prompt-templates": "no-prompt-templates",
+	"-np":                   "no-prompt-templates",
+	"--no-themes":           "no-themes",
+	"--no-context-files":    "no-context-files",
+	"-nc":                   "no-context-files",
+	"--no-builtin-tools":    "no-builtin-tools",
+	"-nbt":                  "no-builtin-tools",
+	"--no-tools":            "no-tools",
+	"-nt":                   "no-tools",
+	"--no-session":          "no-session",
+	"--offline":             "offline",
+	"--verbose":             "verbose",
 }
 
 // reservedFlags are pi options the gateway owns and must never forward.

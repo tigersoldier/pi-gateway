@@ -473,10 +473,45 @@ func (d *Daemon) decorate(row *Row, canon string, live map[string]liveSession) {
 	}
 }
 
+// resolveCwd validates the working directory a client asked its session to use
+// (docs/protocol.md §2). An empty value means "the daemon's own directory",
+// which keeps clients that do not send one working.
+func resolveCwd(cwd string) (string, error) {
+	if cwd == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(cwd) {
+		return "", fmt.Errorf("cwd must be an absolute path: %q", cwd)
+	}
+	info, err := os.Stat(cwd)
+	if err != nil {
+		return "", fmt.Errorf("cwd %s: %w", cwd, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("cwd %s is not a directory", cwd)
+	}
+	return filepath.Clean(cwd), nil
+}
+
+// spawnCwd picks the directory a session about to be spawned should run in: a
+// session file records its own directory, so a respawn (hibernation, daemon
+// restart) uses it instead of whichever client happened to attach. Falls back
+// to the client's directory, then to the daemon's.
+func spawnCwd(path, clientCwd string) string {
+	if path != "" {
+		if dir := catalog.HeaderCwd(path); dir != "" {
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				return dir
+			}
+		}
+	}
+	return clientCwd
+}
+
 // attach resolves a target path or name, joining a live session or spawning
 // pi for a hibernated/absent one. The returned actor is live but not yet bound
 // to the client.
-func (d *Daemon) attach(target string, spec *piargs.Spec) (*session.Actor, error) {
+func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string) (*session.Actor, error) {
 	canon, err := d.resolveTarget(target)
 	if err != nil {
 		return nil, err
@@ -489,7 +524,7 @@ func (d *Daemon) attach(target string, spec *piargs.Spec) (*session.Actor, error
 		e = nil
 	}
 	if e == nil {
-		a, err := d.newActor(canon, spec)
+		a, err := d.newActor(canon, spec, spawnCwd(canon, cwd))
 		if err != nil {
 			d.mu.Unlock()
 			return nil, err
@@ -512,8 +547,8 @@ func (d *Daemon) attach(target string, spec *piargs.Spec) (*session.Actor, error
 
 // create starts a session whose file path is not known yet; the actor reports
 // it through OnPath once pi answers get_state.
-func (d *Daemon) create(spec *piargs.Spec) (*session.Actor, error) {
-	a, err := d.newActor("", spec)
+func (d *Daemon) create(spec *piargs.Spec, cwd string) (*session.Actor, error) {
+	a, err := d.newActor("", spec, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -524,10 +559,11 @@ func (d *Daemon) create(spec *piargs.Spec) (*session.Actor, error) {
 	return a, nil
 }
 
-func (d *Daemon) newActor(path string, spec *piargs.Spec) (*session.Actor, error) {
+func (d *Daemon) newActor(path string, spec *piargs.Spec, cwd string) (*session.Actor, error) {
 	a := session.NewActor(session.Params{
 		PiBin:       d.cfg.PiBin,
 		PiArgs:      spec.Args,
+		Cwd:         cwd,
 		SessionPath: path,
 		IdleTimeout: d.cfg.IdleTimeout,
 		ShortGrace:  d.cfg.ShortGrace,

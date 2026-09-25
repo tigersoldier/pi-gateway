@@ -105,7 +105,10 @@ type conn struct {
 	caps    map[string]bool
 	granted []string
 	piSpec  *piargs.Spec
-	lossy   lossyTail
+	// cwd is the client's working directory: new sessions spawn pi there
+	// (docs/protocol.md §2). Empty means the daemon's own directory.
+	cwd   string
+	lossy lossyTail
 	// allowLossy lets the hub drop non-terminal deltas for this client and
 	// report the gap with gw_lag instead of dropping the connection.
 	allowLossy bool
@@ -403,11 +406,17 @@ func (c *conn) handleHello(raw []byte) error {
 		return err
 	}
 	c.piSpec = spec
+	cwd, err := resolveCwd(h.Cwd)
+	if err != nil {
+		c.sendError(protocol.CodeBadFrame, err.Error())
+		return err
+	}
+	c.cwd = cwd
 
 	var actor *session.Actor
 	var attachErr error
 	if h.Session != "" {
-		actor, attachErr = c.d.attach(h.Session, spec)
+		actor, attachErr = c.d.attach(h.Session, spec, cwd)
 	}
 	// Subscribe before reading the replay window: records published between the
 	// two must land in the subscriber buffer (the pump's watermark drops the
@@ -700,7 +709,7 @@ func (c *conn) handleFrame(raw []byte) {
 	if a == nil {
 		// Lazy binding: the first session-scoped command creates a session
 		// (pilish's fresh-session flow).
-		actor, ok := c.bindNew(id, typ, c.piSpec)
+		actor, ok := c.bindNew(id, typ, c.piSpec, c.cwd)
 		if !ok {
 			return
 		}
@@ -720,7 +729,7 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 		c.sendResponse(id, "switch_session", false, protocol.CodeUnknownSession, "missing sessionPath", nil)
 		return
 	}
-	actor, err := c.d.attach(path, c.piSpec)
+	actor, err := c.d.attach(path, c.piSpec, c.cwd)
 	if err != nil {
 		c.d.metrics.Inc(metrics.AttachFailures)
 		c.sendResponse(id, "switch_session", false, errorCode(err), err.Error(), nil)
@@ -735,7 +744,7 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 
 // handleNewSession creates a session and rebinds only this connection.
 func (c *conn) handleNewSession(id string) {
-	if _, ok := c.bindNew(id, "new_session", c.piSpec); !ok {
+	if _, ok := c.bindNew(id, "new_session", c.piSpec, c.cwd); !ok {
 		return
 	}
 	c.sendResponse(id, "new_session", true, "", "", []byte(`{"cancelled":false}`))
@@ -744,8 +753,8 @@ func (c *conn) handleNewSession(id string) {
 // bindNew creates a session with spec and binds this connection to it. On
 // failure it answers the triggering command with session_crashed and reports
 // false.
-func (c *conn) bindNew(id, command string, spec *piargs.Spec) (*session.Actor, bool) {
-	actor, err := c.d.create(spec)
+func (c *conn) bindNew(id, command string, spec *piargs.Spec, cwd string) (*session.Actor, bool) {
+	actor, err := c.d.create(spec, cwd)
 	if err != nil {
 		c.sendResponse(id, command, false, protocol.CodeSessionCrashed, err.Error(), nil)
 		return nil, false
@@ -798,6 +807,7 @@ func (c *conn) handleGWNewSession(raw []byte) {
 		Name   string            `json:"name"`
 		PiArgs []string          `json:"piArgs"`
 		Tags   map[string]string `json:"tags"`
+		Cwd    string            `json:"cwd"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		c.sendResponse(id, "gw_new_session", false, protocol.CodeBadFrame, err.Error(), nil)
@@ -811,7 +821,16 @@ func (c *conn) handleGWNewSession(raw []byte) {
 	if req.Name != "" {
 		spec.SetName(req.Name)
 	}
-	actor, ok := c.bindNew(id, "gw_new_session", spec)
+	cwd := c.cwd
+	if req.Cwd != "" {
+		resolved, err := resolveCwd(req.Cwd)
+		if err != nil {
+			c.sendResponse(id, "gw_new_session", false, protocol.CodeBadFrame, err.Error(), nil)
+			return
+		}
+		cwd = resolved
+	}
+	actor, ok := c.bindNew(id, "gw_new_session", spec, cwd)
 	if !ok {
 		return
 	}
