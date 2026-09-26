@@ -76,6 +76,7 @@ asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e
 | `config` | state/token/port paths, discovery, token roles, provisioning (exported) |
 | `piargs` | accepted pi parameters and spawn-parameter comparison (exported) |
 | `gwclient` | exported client library for integrations and bots (dial, hello, commands, events) |
+| `examples/chat` | runnable example CLI built only on `gwclient` (streaming, queue/steer/abort, commands/skills) |
 | `internal/client` | bridge implementation (token/port discovery, relay, non-RPC modes) |
 | `internal/daemon` | session table, attach/rebinding, spawn-parameter checks, per-connection fan-out |
 | `internal/session` | `SessionActor`, `Hub` (event log and replay ring), `PromptQueue`, `PiProcess` |

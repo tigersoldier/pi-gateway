@@ -73,6 +73,7 @@ func main() {
 		delay:          time.Duration(envInt("FAKEPI_TURN_DELAY_MS", 15)) * time.Millisecond,
 		rejectPrompt:   os.Getenv("FAKEPI_REJECT_PROMPT") != "",
 		uiRequest:      os.Getenv("FAKEPI_UI_REQUEST") != "",
+		withCommands:   os.Getenv("FAKEPI_COMMANDS") != "",
 		exitAfterFirst: os.Getenv("FAKEPI_EXIT_AFTER_FIRST_TURN") != "",
 	}
 	s.open()
@@ -107,6 +108,7 @@ type state struct {
 	delay          time.Duration
 	rejectPrompt   bool
 	uiRequest      bool
+	withCommands   bool
 	exitAfterFirst bool
 	turns          int
 	forks          int
@@ -174,6 +176,22 @@ func mustGetwd() string {
 
 // appendEntry writes one session line, chaining parentId to the current leaf
 // (except for the header, which stays root).
+func (s *state) commandList() []any {
+	if !s.withCommands {
+		return []any{}
+	}
+	// One of each source type so a client's decoder is exercised against the
+	// documented shape (docs/rpc.md, get_commands).
+	return []any{
+		map[string]any{"name": "session-name", "description": "Set or clear session name",
+			"source": "extension", "path": "/tmp/extensions/session.ts"},
+		map[string]any{"name": "fix-tests", "description": "Fix failing tests",
+			"source": "prompt", "location": "project", "path": "/tmp/prompts/fix-tests.md"},
+		map[string]any{"name": "skill:brave-search", "description": "Web search via Brave API",
+			"source": "skill", "location": "user", "path": "/tmp/skills/brave-search/SKILL.md"},
+	}
+}
+
 func (s *state) appendEntry(entry map[string]any) {
 	if s.sessionFile == "" {
 		return
@@ -216,7 +234,7 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 	case "get_messages":
 		respond("get_messages", true, map[string]any{"messages": []any{}}, "")
 	case "get_commands":
-		respond("get_commands", true, map[string]any{"commands": []any{}}, "")
+		respond("get_commands", true, map[string]any{"commands": s.commandList()}, "")
 	case "prompt":
 		s.handlePrompt(c, msg, respond)
 	case "steer", "follow_up", "abort", "abort_retry", "abort_bash":

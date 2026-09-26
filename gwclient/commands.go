@@ -51,6 +51,13 @@ func (c *Client) Steer(ctx context.Context, message string) (*Response, error) {
 	return c.Do(ctx, "steer", map[string]any{"message": message})
 }
 
+// FollowUp queues a message to run after the agent has fully settled. Unlike
+// Prompt, which starts a turn when the session is idle, it never preempts
+// current work.
+func (c *Client) FollowUp(ctx context.Context, message string) (*Response, error) {
+	return c.Do(ctx, "follow_up", map[string]any{"message": message})
+}
+
 // Abort cancels the running turn. The daemon queue is left intact, so queued
 // prompts still run afterwards.
 func (c *Client) Abort(ctx context.Context) (*Response, error) {
@@ -142,6 +149,36 @@ func (c *Client) ListSessions(ctx context.Context, filter SessionFilter) ([]Sess
 		return nil, err
 	}
 	return out.Sessions, nil
+}
+
+// Command is one entry from get_commands: an extension command, prompt
+// template, or skill the session can run (docs/rpc.md, get_commands).
+// Sending "/"+Name as a prompt invokes it; skill names already carry the
+// "skill:" prefix.
+type Command struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Source is "extension", "prompt" or "skill".
+	Source string `json:"source,omitempty"`
+	// Location is "user", "project" or "path" (absent for extensions).
+	Location string `json:"location,omitempty"`
+	Path     string `json:"path,omitempty"`
+}
+
+// GetCommands lists the commands, prompt templates and skills available in
+// the bound session.
+func (c *Client) GetCommands(ctx context.Context) ([]Command, error) {
+	resp, err := c.Do(ctx, "get_commands", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Commands []Command `json:"commands"`
+	}
+	if err := resp.Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Commands, nil
 }
 
 // ReloadSession restarts pi for a session (default: the bound one). It fails

@@ -32,7 +32,7 @@ decisions.
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
 | Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics |
-| Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome`, correlates `Do` responses by id, streams `Events()`, and wraps session/catalog/prompt/interject/dialog helpers, so a bot in another Go module can import the client instead of reimplementing it |
+| Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome`, correlates `Do` responses by id, streams `Events()`, and wraps session/catalog/prompt/interject/dialog helpers, so a bot in another Go module can import the client instead of reimplementing it; `examples/chat` is a runnable CLI built only on it |
 | Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session` requires `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
 Deferred to M4 (optional, `docs/design.md` §14): session groups across
@@ -252,6 +252,25 @@ unless it is explicitly marked so.
   ones — `gwclient` (handshake, create + prompt + catalog, response errors,
   close, UI dialog round trip) and `config.TestAddresses` — plus `go vet ./...`
   and `gofmt -l .` clean.
+- **Example CLI** (operator). **`examples/chat/`, not a third `cmd/` binary.**
+  The client library needed a worked example of the shapes an integration has
+  to handle — streaming deltas, the daemon-owned queue, steering, aborting, and
+  commands/skills. `examples/chat` is an interactive REPL built only on
+  `gwclient` and `protocol`: assistant text streams to stdout, chrome and tool
+  summaries go to stderr, `!steer`/`!queue`/`!abort`/`!commands` are local
+  commands, and `/name` passes through to pi so commands, prompt templates and
+  skills run unmodified. Blocking extension dialogs are answered from stdin,
+  which is the one part a real integration replaces with its own UI. It stays
+  in `examples/` because the packaging decision is still **two binaries**;
+  `go build ./...` and `go test ./examples/chat/` compile and cover it. Two
+  behaviours came out of actually running it: exit waits for a submitted turn
+  and the daemon queue to drain (so piped input still prints its answer, with
+  Ctrl-C breaking the wait), and `gwclient` gained `FollowUp`/`GetCommands`
+  plus a `FAKEPI_COMMANDS` knob so the command-list decode path is tested.
+  Evidence: `go test -race ./...` green (152 tests, +13: ten renderer, two
+  input-parser, one `gwclient`), `gofmt -l .`/`go vet ./...` clean, and a
+  manual fake-pi run covering create, prompt, steer, queue, `!commands`,
+  abort, and attach by path.
 
 ### Open
 
@@ -266,6 +285,7 @@ is implemented.
 cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
 cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
 gwclient/            exported client library: dial, handshake, commands, events
+examples/chat/       example interactive CLI built only on gwclient
 config/              token/port/tokens-file paths, discovery, roles, provisioning
 piargs/              accepted pi parameter parsing (shared daemon/client)
 protocol/            strict JSONL codec, gw_* messages, id namespacing, capability table
@@ -298,7 +318,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (133 tests, a few minutes)
+go test -race ./...                       # everything (152 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

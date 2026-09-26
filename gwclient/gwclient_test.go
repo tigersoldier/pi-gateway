@@ -131,6 +131,36 @@ func TestDoReturnsResponseError(t *testing.T) {
 	}
 }
 
+func TestFollowUpAndGetCommands(t *testing.T) {
+	t.Setenv("FAKEPI_COMMANDS", "1")
+	c := dial(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if _, err := c.NewSession(ctx, gwclient.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, err := c.FollowUp(ctx, "later"); err != nil {
+		t.Fatalf("FollowUp: %v", err)
+	}
+	commands, err := c.GetCommands(ctx)
+	if err != nil {
+		t.Fatalf("GetCommands: %v", err)
+	}
+	if len(commands) != 3 {
+		t.Fatalf("commands = %+v, want 3", commands)
+	}
+	if commands[0].Source != "extension" || commands[0].Description == "" {
+		t.Errorf("extension command = %+v", commands[0])
+	}
+	if commands[1].Location != "project" || commands[1].Name != "fix-tests" {
+		t.Errorf("prompt template = %+v", commands[1])
+	}
+	if skill := commands[2]; skill.Name != "skill:brave-search" || skill.Source != "skill" || skill.Location != "user" {
+		t.Errorf("skill command = %+v", skill)
+	}
+}
+
 func TestCloseClosesEvents(t *testing.T) {
 	c := dial(t, nil)
 	if err := c.Close(); err != nil {

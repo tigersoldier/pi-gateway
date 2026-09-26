@@ -234,6 +234,10 @@ for ev := range c.Events() {
 event stream, and session/catalog/prompt/interject/dialog helpers. The
 protocol remains documented for non-Go integrations: `docs/protocol.md`.
 
+A runnable interactive CLI is [`examples/chat`](examples/chat):
+`go run ./examples/chat` gives streaming rendering, `!queue`/`!steer`/`!abort`,
+and `/name` for commands, prompt templates and skills.
+
 ## CLI reference
 
 ### `pi-gatewayd` reference
