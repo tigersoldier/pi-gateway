@@ -3,6 +3,8 @@ package gwclient
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 
 	"github.com/tigersoldier/pi-gateway/protocol"
 )
@@ -11,9 +13,34 @@ import (
 // Anything not covered here remains reachable through Do/Send with the pi
 // command names from docs/protocol.md §4.
 
-// Ping sends gw_ping. The daemon answers with a gw_pong event on Events().
+// Ping sends gw_ping and waits for the daemon's gw_pong, so it doubles as a
+// liveness check. It gives up after Config.RequestTimeout, or when ctx ends,
+// whichever comes first.
 func (c *Client) Ping(ctx context.Context) error {
-	return c.Send("gw_ping", nil)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Drop a pong left over from an earlier ping, so this call cannot be
+	// satisfied by an answer to a request that preceded it.
+	select {
+	case <-c.pong:
+	default:
+	}
+	if err := c.Send("gw_ping", nil); err != nil {
+		return err
+	}
+	timer := time.NewTimer(c.cfg.RequestTimeout)
+	defer timer.Stop()
+	select {
+	case <-c.pong:
+		return nil
+	case <-c.closed:
+		return c.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("gwclient: no gw_pong after %s", c.cfg.RequestTimeout)
+	}
 }
 
 // Bye asks the daemon to close the connection. The session survives.
@@ -21,13 +48,24 @@ func (c *Client) Bye(ctx context.Context) error {
 	return c.Send("gw_bye", nil)
 }
 
-// GetState asks pi for its current state.
+// GetState asks pi for its current state. It also refreshes Session() (a
+// lazily created session becomes visible here) and the turn state reported by
+// TurnRunning.
 func (c *Client) GetState(ctx context.Context) (protocol.PiState, error) {
 	resp, err := c.Do(ctx, "get_state", nil)
 	if err != nil {
 		return protocol.PiState{}, err
 	}
-	return protocol.ParsePiState(resp.Data), nil
+	state := protocol.ParsePiState(resp.Data)
+	if state.SessionFile != "" {
+		c.setSession(&protocol.SessionRef{
+			Path: state.SessionFile,
+			Name: state.SessionName,
+			ID:   state.SessionID,
+		})
+	}
+	c.noteTurn(state.IsStreaming)
+	return state, nil
 }
 
 // GetMessages asks for the session transcript.
@@ -41,21 +79,41 @@ func (c *Client) GetMessages(ctx context.Context) (json.RawMessage, error) {
 
 // Prompt sends a user message. When the session is idle the turn starts
 // immediately; otherwise the daemon queues it and reports progress with
-// gw_turn/gw_queue events.
-func (c *Client) Prompt(ctx context.Context, message string) (*Response, error) {
-	return c.Do(ctx, "prompt", map[string]any{"message": message})
+// gw_turn/gw_queue events. Optional images (pi's ImageContent shape) ride
+// along with the message.
+func (c *Client) Prompt(ctx context.Context, message string, images ...protocol.ImageContent) (*Response, error) {
+	return c.Do(ctx, "prompt", messageFields(message, images))
 }
 
-// Steer interjects a message into the running turn.
-func (c *Client) Steer(ctx context.Context, message string) (*Response, error) {
-	return c.Do(ctx, "steer", map[string]any{"message": message})
+// Steer interjects a message into the running turn. It accepts the same
+// optional images as Prompt.
+func (c *Client) Steer(ctx context.Context, message string, images ...protocol.ImageContent) (*Response, error) {
+	return c.Do(ctx, "steer", messageFields(message, images))
 }
 
 // FollowUp queues a message to run after the agent has fully settled. Unlike
 // Prompt, which starts a turn when the session is idle, it never preempts
-// current work.
-func (c *Client) FollowUp(ctx context.Context, message string) (*Response, error) {
-	return c.Do(ctx, "follow_up", map[string]any{"message": message})
+// current work. It accepts the same optional images as Prompt.
+func (c *Client) FollowUp(ctx context.Context, message string, images ...protocol.ImageContent) (*Response, error) {
+	return c.Do(ctx, "follow_up", messageFields(message, images))
+}
+
+// messageFields builds a prompt/steer/follow_up payload. Images are copied so
+// an empty Type is filled in without mutating the caller's slice.
+func messageFields(message string, images []protocol.ImageContent) map[string]any {
+	fields := map[string]any{"message": message}
+	if len(images) == 0 {
+		return fields
+	}
+	out := make([]protocol.ImageContent, len(images))
+	copy(out, images)
+	for i := range out {
+		if out[i].Type == "" {
+			out[i].Type = "image"
+		}
+	}
+	fields["images"] = out
+	return fields
 }
 
 // Abort cancels the running turn. The daemon queue is left intact, so queued
@@ -77,15 +135,10 @@ func (c *Client) SwitchSession(ctx context.Context, session string) (*Response, 
 	if err != nil {
 		return resp, err
 	}
-	// The response is pi-shaped and carries no reference; learn the resolved
-	// path from pi. A failure here must not fail the switch.
-	if state, err := c.GetState(ctx); err == nil {
-		c.setSession(&protocol.SessionRef{
-			Path: state.SessionFile,
-			Name: state.SessionName,
-			ID:   state.SessionID,
-		})
-	}
+	// The response is pi-shaped and carries no reference; GetState learns the
+	// resolved path and refreshes Session(). A failure here must not fail the
+	// switch.
+	_, _ = c.GetState(ctx)
 	return resp, nil
 }
 
@@ -133,10 +186,17 @@ func (c *Client) NewSession(ctx context.Context, req NewSessionRequest) (*protoc
 // ListSessions returns the session catalog. It requires the observe
 // capability.
 func (c *Client) ListSessions(ctx context.Context, filter SessionFilter) ([]SessionRow, error) {
+	// The daemon cannot filter by creator, so fetch everything and filter
+	// here. The other filters stay server-side so the scan stays bounded.
+	localFilter := len(filter.Tags) > 0 || filter.CreatedBy != ""
+	serverLimit := filter.Limit
+	if localFilter {
+		serverLimit = 0
+	}
 	fields := map[string]any{"filter": map[string]any{
 		"cwd":   filter.Cwd,
 		"live":  filter.Live,
-		"limit": filter.Limit,
+		"limit": serverLimit,
 	}}
 	resp, err := c.Do(ctx, "gw_list_sessions", fields)
 	if err != nil {
@@ -148,7 +208,34 @@ func (c *Client) ListSessions(ctx context.Context, filter SessionFilter) ([]Sess
 	if err := resp.Decode(&out); err != nil {
 		return nil, err
 	}
-	return out.Sessions, nil
+	if !localFilter {
+		return out.Sessions, nil
+	}
+	rows := make([]SessionRow, 0, len(out.Sessions))
+	for _, row := range out.Sessions {
+		if !rowMatches(row, filter) {
+			continue
+		}
+		rows = append(rows, row)
+		if filter.Limit > 0 && len(rows) == filter.Limit {
+			break
+		}
+	}
+	return rows, nil
+}
+
+func rowMatches(row SessionRow, filter SessionFilter) bool {
+	if filter.CreatedBy != "" {
+		if row.CreatedBy == nil || row.CreatedBy.ClientID != filter.CreatedBy {
+			return false
+		}
+	}
+	for key, want := range filter.Tags {
+		if row.CreatedBy == nil || row.CreatedBy.Tags[key] != want {
+			return false
+		}
+	}
+	return true
 }
 
 // Command is one entry from get_commands: an extension command, prompt

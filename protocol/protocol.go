@@ -10,6 +10,7 @@ package protocol
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -287,12 +288,31 @@ func LagFrame(oldestSeq, headSeq uint64) ([]byte, error) {
 	})
 }
 
+// ImageContent is pi's image attachment shape (docs/rpc.md): base64 data
+// plus its MIME type, sent in the `images` array of prompt, steer and
+// follow_up. The gateway forwards it unchanged.
+type ImageContent struct {
+	Type     string `json:"type"`     // always "image"
+	Data     string `json:"data"`     // base64-encoded bytes
+	MIMEType string `json:"mimeType"` // for example "image/png"
+}
+
+// NewImage builds an ImageContent from raw bytes, base64-encoding them.
+func NewImage(data []byte, mimeType string) ImageContent {
+	return ImageContent{
+		Type:     "image",
+		Data:     base64.StdEncoding.EncodeToString(data),
+		MIMEType: mimeType,
+	}
+}
+
 // PiState is the subset of pi's get_state payload the gateway depends on.
 type PiState struct {
 	SessionFile   string `json:"sessionFile"`
 	SessionName   string `json:"sessionName"`
 	SessionID     string `json:"sessionId"`
 	ThinkingLevel string `json:"thinkingLevel"`
+	IsStreaming   bool   `json:"isStreaming"`
 	Model         struct {
 		ID       string `json:"id"`
 		Provider string `json:"provider"`

@@ -155,12 +155,12 @@ func run(ctx context.Context, opts options) error {
 	}
 	// Dialogs are answered from the main loop, which also reads stdin, so
 	// they are handed over instead of being rendered.
-	dialogs := make(chan gwclient.Event, 8)
+	dialogs := make(chan gwclient.UIRequest, 8)
 	go func() {
 		for ev := range client.Events() {
-			if ev.Type == "extension_ui_request" {
+			if req, ok := ev.UIRequest(); ok {
 				select {
-				case dialogs <- ev:
+				case dialogs <- req:
 				case <-ctx.Done():
 					return
 				}
@@ -260,51 +260,39 @@ func handleLine(ctx context.Context, client *gwclient.Client, render *renderer, 
 
 // handleDialog answers an extension dialog. notify/set* are fire-and-forget;
 // blocking dialogs read their answer from the input stream.
-func handleDialog(ctx context.Context, client *gwclient.Client, ev gwclient.Event, lines <-chan string) {
-	id := ev.Field("id")
-	switch method := ev.Field("method"); method {
-	case "notify":
-		kind := ev.Field("notifyType")
-		if kind == "" {
-			kind = "info"
+func handleDialog(ctx context.Context, client *gwclient.Client, req gwclient.UIRequest, lines <-chan string) {
+	if !req.Blocking {
+		if req.Method == gwclient.UIMethodNotify {
+			fmt.Fprintf(os.Stderr, "\n[%s] %s\n", req.NotifyTypeOrInfo(), req.Message)
 		}
-		fmt.Fprintf(os.Stderr, "\n[%s] %s\n", kind, ev.Field("message"))
 		return
-	case "setStatus", "setWidget", "setTitle", "set_editor_text":
-		return
-	default:
-		answer, ok := askDialog(method, ev, lines)
-		if !ok {
-			answer = map[string]any{"cancelled": true}
-		}
-		if err := client.RespondUI(ctx, id, answer); err != nil {
-			reportError("extension_ui_response", err)
-		}
+	}
+	answer, ok := askDialog(req, lines)
+	if !ok {
+		answer = req.Cancelled()
+	}
+	if err := client.RespondUI(ctx, req.ID, answer); err != nil {
+		reportError("extension_ui_response", err)
 	}
 }
 
 // askDialog reads one answer from the input stream.
-func askDialog(method string, ev gwclient.Event, lines <-chan string) (map[string]any, bool) {
-	title := ev.Field("title")
-	switch method {
-	case "confirm":
-		fmt.Fprintf(os.Stderr, "\n[confirm] %s: %s [y/N] ", title, ev.Field("message"))
+func askDialog(req gwclient.UIRequest, lines <-chan string) (map[string]any, bool) {
+	switch req.Method {
+	case gwclient.UIMethodConfirm:
+		fmt.Fprintf(os.Stderr, "\n[confirm] %s: %s [y/N] ", req.Title, req.Message)
 		line, ok := nextLine(lines)
 		if !ok {
 			return nil, false
 		}
 		switch strings.ToLower(strings.TrimSpace(line)) {
 		case "y", "yes":
-			return map[string]any{"confirmed": true}, true
+			return req.Confirmed(true), true
 		default:
-			return map[string]any{"confirmed": false}, true
+			return req.Confirmed(false), true
 		}
-	case "select":
-		var req struct {
-			Options []string `json:"options"`
-		}
-		_ = ev.Unmarshal(&req)
-		fmt.Fprintf(os.Stderr, "\n[select] %s\n", title)
+	case gwclient.UIMethodSelect:
+		fmt.Fprintf(os.Stderr, "\n[select] %s\n", req.Title)
 		for i, option := range req.Options {
 			fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, option)
 		}
@@ -317,20 +305,20 @@ func askDialog(method string, ev gwclient.Event, lines <-chan string) (map[strin
 		if n, err := strconv.Atoi(value); err == nil && n >= 1 && n <= len(req.Options) {
 			value = req.Options[n-1]
 		}
-		return map[string]any{"value": value}, true
-	case "input", "editor":
-		hint := title
+		return req.Value(value), true
+	case gwclient.UIMethodInput, gwclient.UIMethodEditor:
+		hint := req.Title
 		if hint == "" {
-			hint = ev.Field("placeholder")
+			hint = req.Placeholder
 		}
 		fmt.Fprintf(os.Stderr, "\n[input] %s (empty cancels): ", hint)
 		line, ok := nextLine(lines)
 		if !ok || strings.TrimSpace(line) == "" {
 			return nil, false
 		}
-		return map[string]any{"value": line}, true
+		return req.Value(line), true
 	default:
-		fmt.Fprintf(os.Stderr, "\n[unsupported dialog %q; cancelling]\n", method)
+		fmt.Fprintf(os.Stderr, "\n[unsupported dialog %q; cancelling]\n", req.Method)
 		return nil, false
 	}
 }

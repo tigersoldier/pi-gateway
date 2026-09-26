@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
-	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // renderer turns the gwclient event stream into terminal output. Assistant
@@ -84,8 +83,7 @@ func (r *renderer) Handle(ev gwclient.Event) {
 			fmt.Fprint(r.errOut, ev.Field("delta"))
 		}
 	case "gw_turn":
-		var turn protocol.TurnEvent
-		if ev.Unmarshal(&turn) == nil {
+		if turn, err := ev.Turn(); err == nil {
 			r.busy.Store(turn.State == "running")
 			if turn.State == "settled" {
 				r.waiting.Store(false)
@@ -93,14 +91,12 @@ func (r *renderer) Handle(ev gwclient.Event) {
 			r.statusLine("turn " + turn.State)
 		}
 	case "gw_queue":
-		var queue protocol.QueueEvent
-		if ev.Unmarshal(&queue) == nil {
+		if queue, err := ev.Queue(); err == nil {
 			r.queued.Store(int64(len(queue.Pending)))
 			r.statusLine(fmt.Sprintf("queue %d pending", len(queue.Pending)))
 		}
 	case "gw_session_state":
-		var state protocol.SessionStateEvent
-		if ev.Unmarshal(&state) == nil {
+		if state, err := ev.SessionState(); err == nil {
 			if state.State == "crashed" || state.State == "stopped" || state.State == "hibernated" {
 				r.waiting.Store(false)
 				r.queued.Store(0)
@@ -112,8 +108,8 @@ func (r *renderer) Handle(ev gwclient.Event) {
 			fmt.Fprintf(r.errOut, "\n[%s]\n", line)
 		}
 	case "gw_lag":
-		fmt.Fprintf(r.errOut, "\n[lag] dropped records %d..%d; reconnect with a resume cursor to resync\n",
-			uint64(protocol.NumField(ev.Raw, "oldestSeq")), uint64(protocol.NumField(ev.Raw, "headSeq")))
+		oldSeq, headSeq := ev.Lag()
+		fmt.Fprintf(r.errOut, "\n[lag] dropped records %d..%d; reconnect with a resume cursor to resync\n", oldSeq, headSeq)
 	case "gw_error":
 		fmt.Fprintf(r.errOut, "\n[error %s] %s\n", ev.Field("code"), ev.Field("message"))
 	case "extension_error":

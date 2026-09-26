@@ -19,6 +19,12 @@ const testToken = "gwclient-test-token"
 func dial(t *testing.T, mutate func(*gwclient.Config)) *gwclient.Client {
 	t.Helper()
 	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	return dialTo(t, addr, mutate)
+}
+
+// dialTo connects a client to an already running daemon.
+func dialTo(t *testing.T, addr string, mutate func(*gwclient.Config)) *gwclient.Client {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cfg := gwclient.Config{
@@ -243,27 +249,35 @@ func waitForAssistantText(c *gwclient.Client, timeout time.Duration) (string, er
 			if !ok {
 				return "", fmt.Errorf("events closed: %w", c.Err())
 			}
-			if ev.Type != "message_end" {
-				continue
-			}
-			var msg struct {
-				Message struct {
-					Content []struct {
-						Type string `json:"type"`
-						Text string `json:"text"`
-					} `json:"content"`
-				} `json:"message"`
-			}
-			if err := ev.Unmarshal(&msg); err != nil {
-				return "", err
-			}
-			for _, part := range msg.Message.Content {
-				if part.Type == "text" {
-					return part.Text, nil
-				}
+			if text, ok := assistantText(ev); ok {
+				return text, nil
 			}
 		case <-deadline:
 			return "", errors.New("timed out waiting for message_end")
 		}
 	}
+}
+
+// assistantText extracts the first text part of a message_end event.
+func assistantText(ev gwclient.Event) (string, bool) {
+	if ev.Type != "message_end" {
+		return "", false
+	}
+	var msg struct {
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := ev.Unmarshal(&msg); err != nil {
+		return "", false
+	}
+	for _, part := range msg.Message.Content {
+		if part.Type == "text" {
+			return part.Text, true
+		}
+	}
+	return "", false
 }

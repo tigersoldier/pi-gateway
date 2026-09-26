@@ -110,6 +110,7 @@ type state struct {
 	uiRequest      bool
 	withCommands   bool
 	exitAfterFirst bool
+	lastAssistant  string
 	turns          int
 	forks          int
 	nextEntry      int
@@ -230,7 +231,88 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 		s.mu.Lock()
 		leaf := s.leafID
 		s.mu.Unlock()
-		respond("get_entries", true, map[string]any{"entries": []any{}, "leafId": leaf}, "")
+		entries := []any{}
+		if leaf != "" {
+			entries = append(entries, map[string]any{"type": "message", "id": leaf})
+		}
+		respond("get_entries", true, map[string]any{"entries": entries, "leafId": leaf}, "")
+	case "get_tree":
+		s.mu.Lock()
+		leaf := s.leafID
+		s.mu.Unlock()
+		tree := []any{}
+		if leaf != "" {
+			tree = append(tree, map[string]any{
+				"entry":    map[string]any{"type": "message", "id": leaf},
+				"children": []any{},
+			})
+		}
+		respond("get_tree", true, map[string]any{"tree": tree, "leafId": leaf}, "")
+	case "get_session_stats":
+		s.mu.Lock()
+		count := s.messageCount
+		s.mu.Unlock()
+		respond("get_session_stats", true, map[string]any{
+			"messageCount": count,
+			"tokens":       map[string]any{"total": 7},
+		}, "")
+	case "export_html":
+		path, _ := msg["outputPath"].(string)
+		if path == "" {
+			path = "/tmp/fakepi-export.html"
+		}
+		respond("export_html", true, map[string]any{"path": path}, "")
+	case "compact":
+		data := map[string]any{"summary": "compacted"}
+		if v, ok := msg["customInstructions"].(string); ok {
+			data["customInstructions"] = v
+		}
+		respond("compact", true, data, "")
+	case "set_auto_compaction", "set_auto_retry":
+		respond(typ, true, map[string]any{"enabled": msg["enabled"]}, "")
+	case "set_steering_mode", "set_follow_up_mode":
+		respond(typ, true, map[string]any{"mode": msg["mode"]}, "")
+	case "cycle_model":
+		s.mu.Lock()
+		model := map[string]any{"id": s.model, "provider": s.provider, "name": "Fake Model"}
+		s.mu.Unlock()
+		respond("cycle_model", true, map[string]any{"model": model, "thinkingLevel": "medium", "isScoped": false}, "")
+	case "get_available_models":
+		respond("get_available_models", true, map[string]any{"models": []any{
+			map[string]any{"id": "fake-one", "name": "Fake One", "provider": "fake"},
+			map[string]any{"id": "fake-two", "name": "Fake Two", "provider": "fake"},
+		}}, "")
+	case "cycle_thinking_level":
+		s.mu.Lock()
+		s.thinking = "high"
+		level := s.thinking
+		s.mu.Unlock()
+		respond("cycle_thinking_level", true, map[string]any{"level": level}, "")
+	case "get_available_thinking_levels":
+		respond("get_available_thinking_levels", true, map[string]any{"levels": []any{"off", "low", "high"}}, "")
+	case "get_fork_messages":
+		respond("get_fork_messages", true, map[string]any{"messages": []any{
+			map[string]any{"entryId": "e1", "text": "first prompt"},
+		}}, "")
+	case "get_last_assistant_text":
+		s.mu.Lock()
+		text := s.lastAssistant
+		s.mu.Unlock()
+		var value any
+		if text != "" {
+			value = text
+		}
+		respond("get_last_assistant_text", true, map[string]any{"text": value}, "")
+	case "bash":
+		command, _ := msg["command"].(string)
+		if id != "" {
+			_ = c.WriteJSON(map[string]any{
+				"type": "bash_execution_update", "id": id, "delta": "fake:" + command + "\n",
+			})
+		}
+		respond("bash", true, map[string]any{
+			"output": "fake:" + command, "exitCode": 0, "cancelled": false, "truncated": false,
+		}, "")
 	case "get_messages":
 		respond("get_messages", true, map[string]any{"messages": []any{}}, "")
 	case "get_commands":
@@ -363,6 +445,10 @@ func (s *state) handlePrompt(c *protocol.Codec, msg map[string]any,
 
 func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay time.Duration, uiRequest bool) {
 	text, _ := msg["message"].(string)
+	echo := "echo: " + text
+	if images, ok := msg["images"].([]any); ok && len(images) > 0 {
+		echo = fmt.Sprintf("%s [images: %d]", echo, len(images))
+	}
 	emit := func(obj map[string]any) {
 		_ = c.WriteJSON(obj)
 		if delay > 0 {
@@ -396,20 +482,21 @@ func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay
 	}
 	emit(map[string]any{"type": "message_update",
 		"assistantMessageEvent": map[string]any{
-			"type": "text_end", "contentIndex": 0, "content": "echo: " + text,
+			"type": "text_end", "contentIndex": 0, "content": echo,
 		}})
 	emit(map[string]any{"type": "message_end", "message": map[string]any{
 		"role":       "assistant",
 		"stopReason": "stop",
-		"content":    []any{map[string]any{"type": "text", "text": "echo: " + text}},
+		"content":    []any{map[string]any{"type": "text", "text": echo}},
 	}})
 	emit(map[string]any{"type": "turn_end"})
 	emit(map[string]any{"type": "agent_end"})
 
 	s.mu.Lock()
 	s.streaming = false
+	s.lastAssistant = echo
 	s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
-		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "echo: " + text}},
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": echo}},
 	}})
 	s.messageCount++
 	s.turns++

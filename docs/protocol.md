@@ -259,12 +259,17 @@ already processed.
   "type": "gw_snapshot",
   "piState": { "...": "get_state result" },
   "entries": [ {"type": "message", "id": "a1b2c3d4", "...": "..."} ],
-  "leafId": "e5f6g7h8"
+  "leafId": "e5f6g7h8",
+  "headSeq": 41
 }
 ```
 
 `entries` come from pi's `get_entries` (the full durable tree, pre-compaction
-history included), not `get_messages`.
+history included), not `get_messages`. `headSeq` is the hub watermark the
+snapshot covers: the daemon's live pump drops records at or below it, so a
+client that applies the snapshot resumes from `headSeq` and neither misses
+live records nor re-reads the ring. A snapshot from a restarted daemon
+therefore replaces whatever higher sequence the client held before.
 
 ---
 
@@ -483,6 +488,10 @@ Forwarded verbatim with `id` namespaced per client and restored on responses:
 `export_html`, `get_entries`, `get_tree`, `get_fork_messages`,
 `get_last_assistant_text`, `set_session_name`, `get_commands`.
 
+`prompt`, `steer` and `follow_up` also accept pi's optional `images` array
+(`ImageContent`: base64 `data` plus `mimeType`); the gateway forwards it
+unchanged.
+
 Intercepted (not forwarded to the current pi):
 
 | Command | Daemon behavior |
@@ -592,6 +601,9 @@ implementation.
 - `resume.leafEntryId` enables durable resume across daemon restarts: a
   matching durable leaf proves the client is up to date, so no snapshot is
   needed even though `sinceSeq` cannot be replayed.
+- `gw_snapshot` carries `headSeq`, the boundary the connection's live stream
+  resumes from. Persist it as the next `resume.sinceSeq`; it also replaces a
+  higher cursor left over from a previous daemon generation.
 - **Mid-turn attach (provisional).** A client joining a running turn receives
   live events from that point. It may see a truncated `message_update` fragment
   until `message_end` delivers the complete assistant message;

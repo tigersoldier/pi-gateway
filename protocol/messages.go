@@ -150,12 +150,15 @@ type ReplayDone struct {
 	HeadSeq uint64 `json:"headSeq"`
 }
 
-// Snapshot is a full resync payload.
+// Snapshot is a full resync payload. HeadSeq is the hub watermark the
+// snapshot covers: live records continue after it, so a reconnecting client
+// can resume from HeadSeq instead of re-reading a ring that was reset.
 type Snapshot struct {
 	Type    string            `json:"type"`
 	PiState json.RawMessage   `json:"piState"`
 	Entries []json.RawMessage `json:"entries"`
 	LeafID  string            `json:"leafId,omitempty"`
+	HeadSeq uint64            `json:"headSeq,omitempty"`
 }
 
 // StateChanged announces a shared-state mutation.

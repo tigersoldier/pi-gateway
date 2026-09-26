@@ -697,7 +697,8 @@ See `docs/protocol.md` draft 2 for the exact message set.
 ```text
 cmd/pi-gatewayd/       daemon main: flags, signals, systemd unit entry point
 cmd/pi-gateway/        client main: the bridge UIs spawn in place of `pi`
-gwclient/              exported client library: dial, handshake, commands, events
+gwclient/              exported client library: dial, handshake, commands,
+                       events, reconnect/resume, typed helpers
 examples/chat/         example interactive CLI built only on gwclient
 protocol/              JSONL codec, gateway messages, compat helpers
 config/                token/port file paths, defaults, discovery

@@ -32,7 +32,7 @@ decisions.
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
 | Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics |
-| Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome`, correlates `Do` responses by id, streams `Events()`, and wraps session/catalog/prompt/interject/dialog helpers, so a bot in another Go module can import the client instead of reimplementing it; `examples/chat` is a runnable CLI built only on it |
+| Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome` (including the post-welcome attach error), correlates `Do` responses by id, streams `Events()` or delivers frames through `Config.OnEvent`, exposes a resume cursor (`Cursor`/`LastSeq`/`LeafID`, `Reconnect`), decodes gateway events and extension dialogs with typed accessors, and wraps session/catalog/prompt/interject/dialog plus the rest of pi's command surface (models, thinking, modes, compaction, retry, `bash` streaming, entries/tree/stats/export, `set_session_name`, images), so a bot in another Go module can import the client instead of reimplementing it; `examples/chat` is a runnable CLI built only on it |
 | Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session` requires `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
 Deferred to M4 (optional, `docs/design.md` §14): session groups across
@@ -271,6 +271,38 @@ unless it is explicitly marked so.
   input-parser, one `gwclient`), `gofmt -l .`/`go vet ./...` clean, and a
   manual fake-pi run covering create, prompt, steer, queue, `!commands`,
   abort, and attach by path.
+- **Client-library hardening for long-running bots** (operator: "fix all of
+  them", after the v0.1.0 capability review). The review found that `gwclient`
+  covered the chat loop but not a production bot: `Dial` reported success on an
+  unbound connection whose attach had failed (the next command then silently
+  created a second session), `Session()` went stale after implicit creation,
+  there was no reconnect/resume primitive, `Ping` did not wait for `gw_pong`,
+  the event channel disconnected a consumer that paused, and the typed surface
+  stopped at the core chat commands. All of it is fixed in the library:
+  `Dial` reads the post-welcome `gw_error` when `Config.Session` was
+  requested; `GetState` refreshes `Session()` and the turn latch;
+  `Cursor`/`LastSeq`/`LeafID` plus `Reconnect` resume with replay or snapshot;
+  `Config.OnEvent` delivers frames on the read goroutine so no drain goroutine
+  is required; `Ping` waits for `gw_pong`; `AwaitSettled`/`TurnRunning` expose
+  the turn latch; `Prompt`/`Steer`/`FollowUp` accept `protocol.ImageContent`;
+  and the remaining §4.2 commands have typed wrappers (models, thinking,
+  modes, compaction, retry, `bash` with streamed updates,
+  entries/tree/forks/stats/export/last-text/name). Typed event decoders and
+  `UIRequest`/`BlockingUIMethod` replace hand-rolled JSON for gateway events
+  and dialogs. `SessionFilter` gained `Tags`/`CreatedBy` filtering, done in the
+  client because the daemon's `createdBy`/tags are in-memory only. One daemon
+  change was needed for the cursor to survive a resync: `gw_snapshot` now
+  carries `headSeq`, the same boundary the connection's pump drops at, so a
+  client that applies a snapshot does not keep a stale pre-restart sequence and
+  replay the whole ring. Evidence: `go test -race ./...` green (166 tests,
+  +14), `gofmt -l .`/`go vet ./...` clean, and `TestAttachConflictReturnsError`
+  checked to fail with its fix reverted (`Dial` returned a nil error and an
+  unbound client). Rejected: a `Manager`/connection-pool layer (policy belongs
+  to the bot; `Reconnect` + `OnEvent` are the mechanism); passing
+  caller-supplied `PiArgs` on reconnect (the daemon's `SpawnConflict` only
+  checks requested keys, so the original hello parameters are safe); and
+  making `LiveOnly` suppress reconnect replay (Reconnect exists to close the
+  gap, so it clears it).
 
 ### Open
 
@@ -279,12 +311,30 @@ resolved and recorded above. The **mid-turn attach** entry is deliberately
 provisional (live-only) and is the first item to revisit now that the daemon
 is implemented.
 
+The v0.1.0 library review also named gaps that are **not** library fixes and
+stay open as separate decisions:
+
+- **Explicit session release.** There is no stop/hibernate/delete command, so
+  a per-conversation bot cannot release a session (pi process plus file) early;
+  idle hibernation is the only path. A `gw_stop_session` (admin, idle and
+  unattached only) is the smallest useful shape.
+- **Durable creator tags.** `createdBy`/tags live in daemon memory, so
+  `gw_list_sessions` creator filtering only describes sessions the running
+  daemon saw created; persisting them in the session file is the fix.
+- **Prompt idempotency.** A connection dropped after `prompt` leaves the
+  prompt's fate ambiguous; a naive retry can duplicate a turn.
+- **Connection caps.** The planned commands-per-second,
+  connections-per-session and sessions-per-daemon limits are still not
+  implemented (`docs/design.md` §10), so a multi-conversation bot must bound
+  its own connections.
+
 ## Repository layout
 
 ```text
 cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
 cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
-gwclient/            exported client library: dial, handshake, commands, events
+gwclient/            exported client library: dial, handshake, commands, events,
+                     reconnect/resume, typed event and UI helpers
 examples/chat/       example interactive CLI built only on gwclient
 config/              token/port/tokens-file paths, discovery, roles, provisioning
 piargs/              accepted pi parameter parsing (shared daemon/client)
@@ -318,7 +368,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (152 tests, a few minutes)
+go test -race ./...                       # everything (166 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

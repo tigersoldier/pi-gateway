@@ -504,13 +504,18 @@ func (c *conn) handleHello(raw []byte) error {
 	// resync implies observe: both the replay request and the oversize check
 	// are gated on it, so there is no "resync without a transcript" case.
 	case resync:
-		if snap, err := actor.Snapshot(); err != nil {
+		snap, err := actor.Snapshot()
+		if err != nil {
 			c.sendError(protocol.CodeResyncRequired, err.Error())
-		} else {
+		}
+		// Live records resume from the head captured after the snapshot reads;
+		// the frame carries the same boundary, so a reconnecting client
+		// resumes exactly where this connection's live stream does.
+		watermark = actor.Info().HeadSeq
+		if err == nil {
+			snap.HeadSeq = watermark
 			c.sendJSON(&snap)
 		}
-		// Live records resume from the head captured after the snapshot reads.
-		watermark = actor.Info().HeadSeq
 	case replayRequested:
 		watermark = h.Resume.SinceSeq
 		gen := c.gen.Load()

@@ -190,6 +190,15 @@ prompt, `steer`/`abort`, `switch_session`, or run `bash`; shared-state
 mutations need `control`. [`docs/protocol.md`](docs/protocol.md) §10 maps every
 command.
 
+Pick the role for what the integration does, not for what it reads:
+
+- `operator` attaches to existing sessions, prompts, steers, aborts and
+  answers dialogs, but cannot create sessions, name them, or change the model.
+- `admin` (the daemon-generated token's level) is needed for
+  `gw_new_session`, so a bot that creates its own sessions, names them
+  (`set_session_name`), or reconfigures them (`set_model`, `compact`, …) needs
+  `admin` or an explicit `--token-caps` list containing `admin`/`control`.
+
 ### Integrations
 
 The gateway protocol is also the integration API: non-pi clients (a Slack bot,
@@ -231,8 +240,30 @@ for ev := range c.Events() {
 ```
 
 `gwclient` covers discovery and the handshake, id-correlated `Do`/`Send`, the
-event stream, and session/catalog/prompt/interject/dialog helpers. The
-protocol remains documented for non-Go integrations: `docs/protocol.md`.
+event stream, and session/catalog/prompt/interject/dialog helpers. For a
+long-lived bot it also provides:
+
+- **Reconnect and resume** — `Cursor`/`LastSeq`/`LeafID` report what the client
+  has consumed; `Reconnect` dials again with that cursor and the daemon answers
+  with a replay window or a `gw_snapshot` when the cursor is unreplayable
+  (`Welcome.ResyncRequired`). Persist the cursor to survive a process restart.
+- **Callback delivery** — `Config.OnEvent` hands every frame to a function on
+  the read goroutine, so a bot does not need a drain goroutine and cannot
+  overflow the event buffer mid-turn.
+- **Typed events and dialogs** — `Event.Turn`/`Queue`/`Snapshot`/`SessionState`
+  and friends, plus `Event.UIRequest` with `BlockingUIMethod`, so extension
+  dialogs (tool approval, `confirm`/`select`/`input`/`editor`) can be routed
+  without hand-rolled JSON.
+- **Images** — `Prompt`, `Steer` and `FollowUp` accept `protocol.ImageContent`
+  (base64 + MIME type) for screenshot/attachment messages.
+- **The rest of pi's surface** — typed wrappers for models, thinking levels,
+  steering/follow-up modes, compaction, auto-retry, `bash` (with streamed
+  `BashUpdate` callbacks), entries/tree/forks/stats/export, and
+  `set_session_name`.
+
+A bot that creates its own sessions needs a token with `admin` (see
+[Restricted tokens](#restricted-tokens)); one that only attaches to sessions it
+finds in the catalog can use `operator`.
 
 A runnable interactive CLI is [`examples/chat`](examples/chat):
 `go run ./examples/chat` gives streaming rendering, `!queue`/`!steer`/`!abort`,

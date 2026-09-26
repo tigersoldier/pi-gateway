@@ -54,6 +54,14 @@ UI — dialogs are the only part of the CLI that is a stand-in.
 - **Commands and skills** — `get_commands` + `/skill:name` prompts.
 - **Sessions** — `NewSession` (with `cwd`, `name`, `piArgs`) or
   `SwitchSession` by path or name.
+- **Typed events and dialogs** — `Event.UIRequest` + `BlockingUIMethod` route
+  `confirm`/`select`/`input`/`editor` and ignore `set*`; gateway events are
+  decoded with `Event.Turn`/`Queue`/`SessionState`/`Lag`.
+
+The CLI is interactive and short-lived; a long-running bot adds
+`Config.OnEvent` (callback delivery instead of draining `Events()`) and
+`Cursor`/`Reconnect` (resume with replay or snapshot after a dropped
+connection or a daemon restart).
 
 The renderer and the input parser are covered by `render_test.go` and
 `input_test.go` with synthetic frames and lines, so the example is exercised by

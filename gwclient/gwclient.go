@@ -39,6 +39,13 @@
 // A Client is safe for concurrent use. Notifications (Send) never wait; Do
 // waits for the matching response, the context deadline, or the connection
 // ending.
+//
+// # Reconnects
+//
+// A long-lived consumer can keep the cursor it has consumed (Cursor, LastSeq,
+// LeafID) and dial again with Config.Resume set; Reconnect does exactly that
+// from the client whose connection failed. An unreplayable cursor is answered
+// with a snapshot instead of a gap (Welcome.ResyncRequired, Event.Snapshot).
 package gwclient
 
 import (
@@ -106,6 +113,14 @@ type Config struct {
 	LiveOnly   bool
 	AllowLossy bool
 
+	// OnEvent, when set, receives every non-response frame from the read
+	// goroutine instead of Events(). Frames arrive in order, one at a time;
+	// the handler must return promptly, and must not call a method that waits
+	// for a response (Do, GetState, Prompt, ...) because the response can only
+	// be read after the handler returns. Events() delivers nothing while
+	// OnEvent is set, and MaxPendingEvents does not apply.
+	OnEvent func(Event)
+
 	// RequestTimeout bounds one Do call; default DefaultRequestTimeout.
 	RequestTimeout time.Duration
 	// MaxPendingEvents bounds the undelivered event queue; default
@@ -118,6 +133,16 @@ type SessionFilter struct {
 	Cwd   string // only sessions in this directory
 	Live  bool   // only sessions with a running pi
 	Limit int    // 0 means the daemon's default
+	// Tags keeps only sessions whose creator tags contain every entry. The
+	// daemon filters cwd/live/limit itself but has no creator filter, so a tag
+	// filter fetches the full page and filters in the client. Tags are
+	// reported only for sessions created explicitly with gw_new_session
+	// (NewSession) and the daemon holds them in memory, so they describe
+	// sessions the running daemon saw created; a daemon restart loses them.
+	Tags map[string]string
+	// CreatedBy keeps only the sessions one creator created (the clientId the
+	// creator reported). It has the same lifetime caveat as Tags.
+	CreatedBy string
 }
 
 // SessionRow is one gw_list_sessions entry.
@@ -192,17 +217,25 @@ type Client struct {
 
 	events chan Event
 	closed chan struct{}
+	pong   chan struct{} // gw_pong signal, capacity 1
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	pending map[string]chan *Response
-	queue   []Event
-	session *protocol.SessionRef
-	err     error
+	mu          sync.Mutex
+	cond        *sync.Cond
+	pending     map[string]chan *Response
+	queue       []Event
+	session     *protocol.SessionRef
+	leafID      string
+	lastSeq     uint64
+	turnRunning bool
+	turnWait    chan struct{}
+	err         error
 
 	seq        atomic.Uint64
 	userClosed atomic.Bool
 	closeOnce  sync.Once
+
+	bashMu       sync.Mutex
+	bashHandlers map[string]func(BashUpdate)
 }
 
 // Dial connects to the daemon, performs gw_hello/gw_welcome, and starts
@@ -235,18 +268,31 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:     cfg,
-		conn:    conn,
-		codec:   protocol.NewCodec(conn, conn),
-		events:  make(chan Event, 64),
-		closed:  make(chan struct{}),
-		pending: make(map[string]chan *Response),
+		cfg:          cfg,
+		conn:         conn,
+		codec:        protocol.NewCodec(conn, conn),
+		events:       make(chan Event, 64),
+		closed:       make(chan struct{}),
+		pong:         make(chan struct{}, 1),
+		pending:      make(map[string]chan *Response),
+		turnWait:     make(chan struct{}),
+		bashHandlers: make(map[string]func(BashUpdate)),
 	}
 	c.cond = sync.NewCond(&c.mu)
-	if err := c.handshake(token); err != nil {
+	if err := c.handshake(ctx, token); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	// HeadSeq is the newest record that existed when this client attached;
+	// nothing before it belongs to this connection's cursor. An explicit
+	// Resume cursor wins, so a caller restarting from a stored cursor keeps
+	// it even when the daemon's ring was reset.
+	if cfg.Resume != nil {
+		c.lastSeq, c.leafID = cfg.Resume.SinceSeq, cfg.Resume.LeafEntryID
+	} else {
+		c.lastSeq = c.welcome.HeadSeq
+	}
+	c.turnRunning = c.welcome.Turn.State == "running"
 	go c.serve()
 	go c.pump()
 	return c, nil
@@ -295,7 +341,7 @@ func (cfg Config) token() (string, error) {
 	return tok, nil
 }
 
-func (c *Client) handshake(token string) error {
+func (c *Client) handshake(ctx context.Context, token string) error {
 	hello := protocol.Hello{
 		Type:     "gw_hello",
 		Protocol: protocol.Version,
@@ -331,10 +377,43 @@ func (c *Client) handshake(token string) error {
 					c.welcome.Protocol, protocol.Version)
 			}
 			c.session = c.welcome.Session
+			if c.cfg.Session != "" && c.welcome.Session == nil {
+				return c.attachError(ctx)
+			}
 			return nil
 		case "gw_error":
 			return fmt.Errorf("gwclient: handshake rejected: %s (%s)",
 				protocol.Field(raw, "message"), protocol.Field(raw, "code"))
+		}
+	}
+}
+
+// attachError reads the gw_error the daemon sends immediately after a
+// gw_welcome whose attach failed (docs/protocol.md §2). Without this, Dial
+// would report success on an unbound connection and the next command would
+// silently create a new session instead of the requested one.
+func (c *Client) attachError(ctx context.Context) error {
+	budget := c.cfg.DialTimeout
+	if budget <= 0 {
+		budget = DefaultDialTimeout
+	}
+	deadline := time.Now().Add(budget)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = c.conn.SetReadDeadline(deadline)
+	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	for {
+		raw, err := c.codec.Read()
+		if err != nil {
+			return fmt.Errorf("gwclient: attach %s: no error frame from daemon: %w", c.cfg.Session, err)
+		}
+		if protocol.Field(raw, "type") == "gw_error" {
+			return &ResponseError{
+				Command: "gw_hello",
+				Code:    protocol.Field(raw, "code"),
+				Message: protocol.Field(raw, "message"),
+			}
 		}
 	}
 }
@@ -428,8 +507,42 @@ func (c *Client) dispatch(raw []byte) {
 			return
 		}
 	}
+	seq := uint64(protocol.NumField(raw, "gw_seq"))
+	if seq != 0 {
+		c.advanceSeq(seq)
+	}
+	switch rec.Type {
+	case "gw_pong":
+		select {
+		case c.pong <- struct{}{}:
+		default:
+		}
+	case "gw_turn":
+		c.noteTurn(protocol.Field(raw, "state") == "running")
+	case "gw_snapshot":
+		var snap protocol.Snapshot
+		if json.Unmarshal(raw, &snap) == nil {
+			if snap.HeadSeq > 0 {
+				// The snapshot replaces everything through HeadSeq, even
+				// records from a previous daemon generation whose seq
+				// numbering was higher.
+				c.resetSeq(snap.HeadSeq)
+			}
+			c.noteLeaf(snap.LeafID)
+		}
+	case "gw_replay_done":
+		var done protocol.ReplayDone
+		if json.Unmarshal(raw, &done) == nil {
+			c.advanceSeq(done.HeadSeq)
+		}
+	case "bash_execution_update":
+		if h := c.bashHandler(rec.ID); h != nil {
+			h(BashUpdate{ID: rec.ID, Delta: protocol.Field(raw, "delta")})
+			return
+		}
+	}
 	c.pushEvent(Event{
-		Seq:  uint64(protocol.NumField(raw, "gw_seq")),
+		Seq:  seq,
 		Type: rec.Type,
 		Raw:  append(json.RawMessage(nil), raw...),
 	})
@@ -464,6 +577,10 @@ func decodeResponse(raw []byte, rec protocol.Record) *Response {
 }
 
 func (c *Client) pushEvent(e Event) {
+	if c.cfg.OnEvent != nil {
+		c.cfg.OnEvent(e)
+		return
+	}
 	c.mu.Lock()
 	if c.err != nil {
 		c.mu.Unlock()
@@ -534,10 +651,24 @@ func (c *Client) Send(command string, fields map[string]any) error {
 // a *ResponseError (with the Response still populated) when the daemon
 // answers success:false, and a transport/context error otherwise.
 func (c *Client) Do(ctx context.Context, command string, fields map[string]any) (*Response, error) {
+	return c.do(ctx, c.newID(), command, fields)
+}
+
+// DoID is Do with a caller-supplied id. The id is echoed on the response and
+// on any frame pi ties to the command (for example a bash command's
+// bash_execution_update events), which lets the caller correlate them by
+// subscribing to Events() before the response arrives.
+func (c *Client) DoID(ctx context.Context, id, command string, fields map[string]any) (*Response, error) {
+	if id == "" {
+		return nil, errors.New("gwclient: DoID: empty id")
+	}
+	return c.do(ctx, id, command, fields)
+}
+
+func (c *Client) do(ctx context.Context, id, command string, fields map[string]any) (*Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	id := c.newID()
 	raw, err := commandFrame(id, command, fields)
 	if err != nil {
 		return nil, err
