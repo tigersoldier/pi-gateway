@@ -124,9 +124,9 @@ it is recorded there.
 
 ### 1.2 pilish compatibility contract (researched)
 
-These facts were established by reading the installed pilish source
-(`/home/pi/work/performance-fix-2`, the `downstream` branch the Spacemacs layer
-tracks) and the layer (`~/.emacs.d/private/pilish`). They are **requirements**,
+These facts were established by reading pilish's source (a checkout of the
+`downstream` branch the Spacemacs layer tracks) and the layer
+(`~/.emacs.d/private/pilish`). They are **requirements**,
 not choices: the client must satisfy them for pilish to survive a broken ssh
 connection.
 
