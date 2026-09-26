@@ -16,10 +16,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/tigersoldier/pi-gateway/internal/config"
+	"github.com/tigersoldier/pi-gateway/config"
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
 	"github.com/tigersoldier/pi-gateway/internal/gwlog"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // Source is the read-only daemon view the endpoints serve.

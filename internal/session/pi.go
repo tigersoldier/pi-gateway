@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/gwlog"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // PiConfig describes how to spawn pi in RPC mode for one session.

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // slowRespawnPi wraps fake pi so that every start after the first sleeps,

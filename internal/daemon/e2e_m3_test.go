@@ -12,8 +12,8 @@ import (
 	"github.com/tigersoldier/pi-gateway/internal/debughttp"
 	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // startDaemonHandle starts a daemon and returns it together with its address,

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 func deltaRecord(t *testing.T, seq int, kind, index, delta string) protocol.Record {

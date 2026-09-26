@@ -10,8 +10,8 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/catalog"
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // writeCatalogSession writes a session file the catalog scanner can parse, and

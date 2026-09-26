@@ -146,6 +146,33 @@ func ReadPort(path string) (int, error) {
 	return p, nil
 }
 
+// Addresses returns the daemon addresses a client should try, in order:
+//
+//  1. an explicit server ("host:port"), when given;
+//  2. an explicit port on the loopback host;
+//  3. the port recorded in dir's port file;
+//  4. the fixed default address, as a fallback in case the file is stale
+//     (for example after an unclean daemon exit).
+//
+// The bridge and the client library share this so both discover the daemon
+// the same way (docs/protocol.md §1).
+func Addresses(server string, port int, dir string) []string {
+	if server != "" {
+		return []string{server}
+	}
+	if port > 0 {
+		return []string{net.JoinHostPort(DefaultHost, strconv.Itoa(port))}
+	}
+	var addrs []string
+	if p, err := ReadPort(PortPath(dir)); err == nil {
+		addrs = append(addrs, net.JoinHostPort(DefaultHost, strconv.Itoa(p)))
+	}
+	if len(addrs) == 0 || addrs[0] != DefaultAddr {
+		addrs = append(addrs, DefaultAddr)
+	}
+	return addrs
+}
+
 // PortOf extracts the port from "host:port" or ":port".
 func PortOf(addr string) (int, error) {
 	i := strings.LastIndex(addr, ":")

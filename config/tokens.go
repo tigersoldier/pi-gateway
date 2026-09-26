@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // TokensPath returns the optional multi-token file inside dir. The

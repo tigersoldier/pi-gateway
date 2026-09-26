@@ -49,7 +49,7 @@ asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e
   vacuously.
 - **Never break these invariants.** One `pi` process per session (sole writer of
   the session file); one capability check per command, driven by the single
-  table in `internal/protocol/roles.go`; canonical lowercase command types only;
+  table in `protocol/roles.go`; canonical lowercase command types only;
   terminal event frames are never dropped; both listeners stay loopback-only;
   token files are `0600`; never shadow the real `pi` (UIs are configured to
   point at the bridge instead).
@@ -58,7 +58,7 @@ asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e
   the repository, never require the network.
 - **Move paired files together.** `packaging/pi-gatewayd.service` is parsed by
   `cmd/pi-gatewayd/main_test.go`; a new pi parameter needs
-  `internal/piargs` (every accepted spelling), `docs/protocol.md` §4.3 and the
+  `piargs` (every accepted spelling), `docs/protocol.md` §4.3 and the
   README reference table.
 - **Commits:** imperative subject; the body says why, what was rejected, and the
   evidence (test counts, end-to-end matrix). Keep the tree clean and push to
@@ -72,13 +72,14 @@ asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e
 |---|---|
 | `cmd/pi-gatewayd` | daemon entry point: flags, signals, listeners, token wiring |
 | `cmd/pi-gateway` | bridge entry point: argv, relay, exit codes |
+| `protocol` | strict JSONL codec, message types, id namespacing, capability table (exported) |
+| `config` | state/token/port paths, discovery, token roles, provisioning (exported) |
+| `piargs` | accepted pi parameters and spawn-parameter comparison (exported) |
+| `gwclient` | exported client library for integrations and bots (dial, hello, commands, events) |
 | `internal/client` | bridge implementation (token/port discovery, relay, non-RPC modes) |
 | `internal/daemon` | session table, attach/rebinding, spawn-parameter checks, per-connection fan-out |
 | `internal/session` | `SessionActor`, `Hub` (event log and replay ring), `PromptQueue`, `PiProcess` |
-| `internal/protocol` | strict JSONL codec, message types, id namespacing, capability table |
 | `internal/catalog` | session-file scanning, name resolution, durable leaf ids |
-| `internal/piargs` | accepted pi parameters and spawn-parameter comparison |
-| `internal/config` | state/token/port paths, token roles, provisioning |
 | `internal/debughttp` | read-only `/status` `/catalog` `/metrics` |
 | `internal/gwlog`, `internal/metrics` | structured logging, Prometheus-text metrics |
 | `internal/fakepi`, `internal/testutil`, `internal/gwtest` | test fake pi, protocol client, daemon harness |

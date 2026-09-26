@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // terminalTypes are records that can flow through the hub and that a client

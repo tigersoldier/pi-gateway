@@ -10,8 +10,8 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // listSessionsFiltered sends gw_list_sessions with a filter and returns its rows.

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // DefaultTimeout is used when a test does not specify one.

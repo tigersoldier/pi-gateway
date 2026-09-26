@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 func writeTokens(t *testing.T, body string) string {

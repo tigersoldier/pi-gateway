@@ -12,9 +12,9 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/catalog"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/piargs"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/session"
+	"github.com/tigersoldier/pi-gateway/piargs"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 var errUnauthorized = errors.New("daemon: unauthorized")

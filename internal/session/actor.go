@@ -10,7 +10,7 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/gwlog"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // Client is the actor's view of an attached connection. It is implemented by

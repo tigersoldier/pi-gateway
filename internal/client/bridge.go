@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tigersoldier/pi-gateway/internal/config"
-	"github.com/tigersoldier/pi-gateway/internal/piargs"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/config"
+	"github.com/tigersoldier/pi-gateway/piargs"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 const (
@@ -212,20 +212,7 @@ func parseArgs(args []string) (*parsed, error) {
 // address comes first, with the fixed default as a fallback in case the file
 // is stale (for example after an unclean daemon exit).
 func candidateAddrs(p *parsed) []string {
-	if p.server != "" {
-		return []string{p.server}
-	}
-	if p.port > 0 {
-		return []string{net.JoinHostPort(config.DefaultHost, strconv.Itoa(p.port))}
-	}
-	var addrs []string
-	if port, err := config.ReadPort(config.PortPath(config.Dir())); err == nil {
-		addrs = append(addrs, net.JoinHostPort(config.DefaultHost, strconv.Itoa(port)))
-	}
-	if len(addrs) == 0 || addrs[0] != config.DefaultAddr {
-		addrs = append(addrs, config.DefaultAddr)
-	}
-	return addrs
+	return config.Addresses(p.server, p.port, config.Dir())
 }
 
 func resolveToken(p *parsed) (string, error) {

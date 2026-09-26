@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/catalog"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 func main() {

@@ -8,8 +8,8 @@ import (
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
 	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // startDaemonWithToken starts a daemon that authenticates with token.

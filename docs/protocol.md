@@ -41,6 +41,12 @@ The bridge is an ordinary client of the daemon. It never spawns pi and holds no
 session state. Several bridges, and several direct gateway clients, can be
 attached to the same session at once.
 
+A Go integration does not have to speak the protocol by hand: the
+`github.com/tigersoldier/pi-gateway/gwclient` package provides discovery, the
+handshake, id-correlated commands and the event stream (see
+`docs/development.md` → *Decision log*). The wire contract below stays the
+reference for every other language.
+
 ### Bridge guarantees to a pi UI
 
 - No handshake frame is required on the UI side; the bridge performs
@@ -752,6 +758,12 @@ will be revisited after implementation.
 6. **Never use readline-style splitters**; split on LF only.
 7. **Treat `extension_ui_request` as possibly not yours** unless you are the
    turn author or the daemon addressed it to you (§7).
+8. **Prefer the Go client library** when writing in Go:
+   `github.com/tigersoldier/pi-gateway/gwclient` owns discovery, the handshake,
+   response correlation and the event stream, so an integration only handles
+   its own policy (formatting, routing, persistence). The wire contract in this
+   document remains authoritative for other languages and for the library's
+   own behaviour.
 
 ---
 

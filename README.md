@@ -203,6 +203,37 @@ gw_new_session   -> {"path","name","sessionId"} (the requester is rebound)
 gw_reload_session-> restart pi for a session (control capability)
 ```
 
+A Go integration can import the client library instead of implementing the
+connection loop itself. It is deliberately outside `internal/`, so another
+module can depend on it:
+
+```go
+import "github.com/tigersoldier/pi-gateway/gwclient"
+
+c, err := gwclient.Dial(ctx, gwclient.Config{Name: "slack", Kind: "bot"})
+if err != nil {
+	return err
+}
+defer c.Close()
+
+sess, err := c.NewSession(ctx, gwclient.NewSessionRequest{Cwd: "/work/repo"})
+if err != nil {
+	return err
+}
+if _, err := c.Prompt(ctx, "summarise the open issues"); err != nil {
+	return err
+}
+for ev := range c.Events() {
+	if ev.Type == "message_end" {
+		// render the assistant message into the chat
+	}
+}
+```
+
+`gwclient` covers discovery and the handshake, id-correlated `Do`/`Send`, the
+event stream, and session/catalog/prompt/interject/dialog helpers. The
+protocol remains documented for non-Go integrations: `docs/protocol.md`.
+
 ## CLI reference
 
 ### `pi-gatewayd` reference

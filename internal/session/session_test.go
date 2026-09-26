@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 func TestMain(m *testing.M) {

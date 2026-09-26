@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 func TestLossyTailTracksDroppedRange(t *testing.T) {

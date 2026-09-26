@@ -84,6 +84,34 @@ func TestPortOf(t *testing.T) {
 	}
 }
 
+func TestAddresses(t *testing.T) {
+	dir := t.TempDir()
+	if got := Addresses("10.0.0.5:9999", 7331, dir); len(got) != 1 || got[0] != "10.0.0.5:9999" {
+		t.Fatalf("explicit server = %v", got)
+	}
+	if got := Addresses("", 7442, dir); len(got) != 1 || got[0] != "127.0.0.1:7442" {
+		t.Fatalf("explicit port = %v", got)
+	}
+	// No port file: only the fixed fallback, so a stale directory still works.
+	if got := Addresses("", 0, dir); len(got) != 1 || got[0] != DefaultAddr {
+		t.Fatalf("no port file = %v", got)
+	}
+	// A recorded port comes first, the fallback second.
+	if err := WritePort(PortPath(dir), 7442); err != nil {
+		t.Fatal(err)
+	}
+	if got := Addresses("", 0, dir); len(got) != 2 || got[0] != "127.0.0.1:7442" || got[1] != DefaultAddr {
+		t.Fatalf("port file = %v", got)
+	}
+	// A port file equal to the default must not duplicate the fallback.
+	if err := WritePort(PortPath(dir), DefaultPort); err != nil {
+		t.Fatal(err)
+	}
+	if got := Addresses("", 0, dir); len(got) != 1 || got[0] != DefaultAddr {
+		t.Fatalf("port file equal to the default = %v", got)
+	}
+}
+
 func TestRequireLoopback(t *testing.T) {
 	allowed := []string{"127.0.0.1:7331", "127.0.0.1:0", "[::1]:7331", "localhost:7331"}
 	for _, addr := range allowed {

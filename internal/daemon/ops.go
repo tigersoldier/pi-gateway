@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/session"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // ---------------------------------------------------------------------------

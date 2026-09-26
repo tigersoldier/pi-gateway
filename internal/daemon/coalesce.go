@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // Delta coalescing keeps a slow client from being flooded by per-token

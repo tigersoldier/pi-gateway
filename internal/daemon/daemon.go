@@ -18,13 +18,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/config"
 	"github.com/tigersoldier/pi-gateway/internal/catalog"
-	"github.com/tigersoldier/pi-gateway/internal/config"
 	"github.com/tigersoldier/pi-gateway/internal/gwlog"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
-	"github.com/tigersoldier/pi-gateway/internal/piargs"
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
 	"github.com/tigersoldier/pi-gateway/internal/session"
+	"github.com/tigersoldier/pi-gateway/piargs"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // Config configures the daemon.

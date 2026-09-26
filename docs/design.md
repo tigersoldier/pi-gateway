@@ -697,8 +697,10 @@ See `docs/protocol.md` draft 2 for the exact message set.
 ```text
 cmd/pi-gatewayd/       daemon main: flags, signals, systemd unit entry point
 cmd/pi-gateway/        client main: the bridge UIs spawn in place of `pi`
-internal/protocol/     JSONL codec, gateway messages, compat helpers
-internal/config/       token/port file paths, defaults
+gwclient/              exported client library: dial, handshake, commands, events
+protocol/              JSONL codec, gateway messages, compat helpers
+config/                token/port file paths, defaults, discovery
+piargs/                accepted pi parameter parsing (shared daemon <-> client)
 internal/daemon/       listener, auth, connection table, binding/rebinding
 internal/session/      SessionActor, Hub, PromptQueue, UIBroker, PiProcess
 internal/catalog/      session catalog: file scan + live index, name resolution
@@ -706,11 +708,16 @@ internal/client/       bridge: gateway <-> raw pi, id restore, gw_* filtering
 internal/debughttp/    read-only /status, /catalog, /metrics HTTP endpoints
 internal/gwlog/        structured logging (text or JSON via log/slog)
 internal/metrics/      Prometheus-text counters, gauges, metric names
-internal/piargs/       accepted pi parameter parsing (shared daemon <-> client)
 internal/fakepi/       fake pi used by the end-to-end tests
 internal/gwtest/       shared daemon harness for end-to-end tests
 internal/testutil/     test helpers: build fake pi, raw protocol client
 ```
+
+`protocol/`, `config/`, `piargs/` and `gwclient/` are deliberately **outside
+`internal/`**: a separate integration repository (for example the Slack bot)
+implements its client against them, and Go forbids importing `internal/...`
+across modules. `gwclient` is the supported programmatic client; the bridge in
+`internal/client` remains the stdio adapter for pi UIs.
 
 M1, M2, and M3 implement this layout, plus `packaging/pi-gatewayd.service` for
 the systemd user unit. The prototype that predated the settled

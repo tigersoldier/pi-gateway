@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tigersoldier/pi-gateway/internal/config"
+	"github.com/tigersoldier/pi-gateway/config"
 	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
 )

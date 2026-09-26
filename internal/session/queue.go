@@ -3,7 +3,7 @@ package session
 import (
 	"strings"
 
-	"github.com/tigersoldier/pi-gateway/internal/protocol"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // QueuedItem is one daemon-queued prompt or follow-up.

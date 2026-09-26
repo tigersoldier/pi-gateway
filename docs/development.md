@@ -32,6 +32,7 @@ decisions.
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
 | Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics |
+| Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome`, correlates `Do` responses by id, streams `Events()`, and wraps session/catalog/prompt/interject/dialog helpers, so a bot in another Go module can import the client instead of reimplementing it |
 | Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session` requires `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
 Deferred to M4 (optional, `docs/design.md` §14): session groups across
@@ -231,6 +232,26 @@ unless it is explicitly marked so.
   Aliases and long forms are recorded identically, so they can never look like
   a spawn-parameter conflict. Options the daemon owns (session selection,
   one-shot modes) are still rejected with `bad_frame`.
+- **Exported client library** (operator). **Promote `protocol`, `config` and
+  `piargs` out of `internal/`, then add `gwclient`.** The gateway protocol could
+  only be spoken from inside this module, so a bot in another repository could
+  not import it; Go's `internal/` rule is the blocker, and the bridge's stdio
+  relay is not a reusable API. The wire codec, message types, capability table,
+  discovery paths and pi-parameter parsing moved to the module-root packages
+  `protocol/`, `config/` and `piargs/`; `config.Addresses` is now shared by the
+  bridge and the library so both discover the daemon the same way. The new
+  `gwclient` package is the supported programmatic client: `Dial` (explicit
+  address or discovery, token from file or value), the handshake,
+  id-correlated `Do`/`Send`, an `Events()` stream with an explicit overflow
+  error instead of silent loss, and typed `NewSession`/`ListSessions`/
+  `GetState`/`Prompt`/`Steer`/`Abort`/`ClearQueue`/`SwitchSession`/
+  `ReloadSession`/`RespondUI` helpers. Behaviour is unchanged: the daemon still
+  owns the single capability table in `protocol/roles.go`, and the bridge's
+  observable output is identical (its own tests and the fake-pi end-to-end lane
+  still pass). Evidence: `go test -race ./...` green (139 tests) with six new
+  ones — `gwclient` (handshake, create + prompt + catalog, response errors,
+  close, UI dialog round trip) and `config.TestAddresses` — plus `go vet ./...`
+  and `gofmt -l .` clean.
 
 ### Open
 
@@ -244,15 +265,16 @@ is implemented.
 ```text
 cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
 cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
+gwclient/            exported client library: dial, handshake, commands, events
+config/              token/port/tokens-file paths, discovery, roles, provisioning
+piargs/              accepted pi parameter parsing (shared daemon/client)
+protocol/            strict JSONL codec, gw_* messages, id namespacing, capability table
 internal/catalog/   session file scanning, name resolution, durable leaf ids
 internal/client/     bridge implementation (argv, token/port, relay)
-internal/config/     token/port/tokens-file paths, roles, provisioning
 internal/daemon/     session table, attach/rebind, spawn-param checks
 internal/debughttp/  read-only /status /catalog /metrics over loopback HTTP
 internal/gwlog/      structured logging (log/slog: text for journald, or JSON)
 internal/metrics/    Prometheus-text counters and gauges
-internal/piargs/     accepted pi parameter parsing (shared daemon/client)
-internal/protocol/   strict JSONL codec, gw_* messages, id namespacing
 internal/session/    SessionActor, Hub, PromptQueue, PiProcess
 internal/fakepi/     fake pi used by the tests
 internal/gwtest/     shared daemon harness for end-to-end tests
@@ -279,7 +301,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 go test -race ./...                       # everything (133 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
-go test -count=2 ./internal/protocol/     # catch state leaking between runs
+go test -count=2 ./protocol/          # catch state leaking between runs
 ```
 
 - **No real `pi` is needed.** `internal/fakepi` is a deterministic stand-in
@@ -330,7 +352,7 @@ cases and the coverage of each suite.
   observable, not a proxy).
 - **Keep the invariants.** One pi process per session (sole writer on the
   session file); one capability check per command, driven by the single table
-  in `internal/protocol/roles.go`; canonical lowercase command types only;
+  in `protocol/roles.go`; canonical lowercase command types only;
   terminal events never dropped; both listeners loopback-only; token files
   `0600`; never shadow the real `pi`.
 - **Test helpers are shared, not copied.** `internal/testutil` (raw protocol
