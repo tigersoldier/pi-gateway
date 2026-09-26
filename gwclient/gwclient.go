@@ -95,8 +95,11 @@ type Config struct {
 	// Attach. Session may be a session file path or a session name; empty
 	// leaves the connection unbound until its first session command.
 	Session string
-	Cwd     string
-	PiArgs  []string
+	// Cwd is the directory a session this connection creates is spawned in
+	// (gw_hello.cwd). Empty means the daemon's own directory; NewSession takes
+	// its own Cwd and does not use this one.
+	Cwd    string
+	PiArgs []string
 	// Resume asks for replay and enables durable resume; LiveOnly attaches at
 	// the head and ignores Resume.
 	Resume     *protocol.Resume
