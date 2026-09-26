@@ -1,10 +1,10 @@
-# pi-multi-client — a session daemon and `pi` replacement
+# pi-gateway — a session daemon and `pi` replacement
 
 ## Purpose
 
-Serve as a **drop-in replacement for the `pi` executable** for third-party pi
-UIs, backed by a **background session service** that outlives any single client
-connection.
+`pi-gateway` serves as a **drop-in replacement for the `pi` executable** for
+third-party pi UIs, backed by a **background session service** that outlives any
+single client connection.
 
 Three goals drive the design:
 

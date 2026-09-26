@@ -1,7 +1,7 @@
 # Development: `pi-gateway`
 
-How the project is built, tested and extended, what state it is in, and why it
-is designed the way it is. User-facing setup, the CLI reference and the
+How `pi-gateway` is built, tested and extended, what state it is in, and why
+it is designed the way it is. User-facing setup, the CLI reference and the
 integration examples live in the [`README.md`](../README.md).
 
 **Read before changing behaviour:** [`docs/design.md`](design.md) (architecture,
