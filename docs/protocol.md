@@ -1,7 +1,8 @@
 # `pi-gateway` client protocol v1 (draft 2)
 
 This document is the client-facing wire protocol for the settled design in
-`docs/design.md` and the decision log in `README.md`. It supersedes draft 1.
+`docs/design.md` and the decision log in `docs/development.md`. It supersedes
+draft 1.
 
 - Framing: **strict JSONL, LF (`\n`) only**. Strip a trailing `\r`. Do not
   split on U+2028/U+2029. One JSON object per line, in both directions.
@@ -19,7 +20,7 @@ This document is the client-facing wire protocol for the settled design in
   daemon queue, replay (`liveOnly` / `resume.sinceSeq`) and durable resume
   (`resume.leafEntryId`), `gw_snapshot`, coalescing with `allowLossy`/`gw_lag`,
   hibernation/reaping, and the read-only HTTP debug endpoints (§13). See
-  README → *Implementation status*.
+  `docs/development.md` → *Implementation status*.
 
 ---
 
@@ -732,7 +733,7 @@ event stream, no replay, and no `gw_snapshot`; its `gw_welcome` reports
 ## 11. Open semantics
 
 None. Every gap found while reviewing this draft has been resolved with the
-operator and recorded in `README.md` → Design decisions. The only deliberately
+operator and recorded in `docs/development.md` → *Decision log*. The only deliberately
 provisional behavior is **mid-turn attach** (§6), which stays live-only and
 will be revisited after implementation.
 

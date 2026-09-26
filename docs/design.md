@@ -3,7 +3,7 @@
 Status: implemented (M1–M3; mid-turn attach provisional) · Target: Go 1.22+ ·
 Depends on: `pi --mode rpc`
 
-> **Reading order.** `README.md` → *Design decisions* is the canonical decision
+> **Reading order.** `docs/development.md` → *Decision log* is the canonical decision
 > log, and `docs/protocol.md` draft 2 is the authoritative protocol. This whole
 > document reflects the settled design; the single provisional item (mid-turn
 > attach) is marked where it appears.
@@ -70,7 +70,8 @@ Settled deployment facts:
   tokens live in `~/.config/pi-gateway/tokens.json` (§10).
 - The **HTTP debug listener** is a second loopback port (`127.0.0.1:7332` by
   default) serving read-only `/status`, `/catalog`, and `/metrics`. It is
-  deliberately **unauthenticated** (recorded in README → Design decisions), so
+  deliberately **unauthenticated** (recorded in the
+  [decision log](development.md#decision-log)), so
   it exposes operational and catalog metadata — paths, names, titles — to any
   local process, and must never gain a mutating endpoint.
 - **Port discovery is hybrid**: the daemon writes the bound port to
@@ -115,8 +116,8 @@ Settled deployment facts:
   daemon answers from the real pi binary it manages; the client prints the
   output and exits. Every other non-RPC mode (including TUI) errors.
 
-The canonical, up-to-date decision log lives in `README.md` under **Design
-decisions**. As of this writing every decision is resolved except the
+The canonical, up-to-date decision log lives in `docs/development.md` under
+**Decision log**. As of this writing every decision is resolved except the
 **mid-turn attach** behavior, which is deliberately provisional (live-only) and
 will be revisited after implementation. Do not assume a behavior in code until
 it is recorded there.
@@ -180,7 +181,8 @@ Consequences to design for:
 - A client's binding to a session actor is not fixed at connect: it can be
   re-routed by `switch_session`. **Settled:** re-routing is **server-side
   rebinding** — the server resolves the target and rebinds the connection, and
-  the bridge stays a dumb relay (see the README decision log).
+  the bridge stays a dumb relay (see the [decision
+  log](development.md#decision-log)).
 - `pilish-reload` is used to pick up extension/skill edits by restarting pi.
   **Settled:** under the daemon a reload is attach-only (re-attach, no
   restart); restarting pi is an explicit daemon operation that refuses while

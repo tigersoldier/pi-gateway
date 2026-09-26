@@ -2,7 +2,7 @@
 //
 // pi stores sessions under <agent dir>/sessions/<encoded-cwd>/<id>.jsonl
 // (docs/session-format.md). The catalog scans those files on demand: there is
-// no persisted index (README, decision 6), so a name that is missing or
+// no persisted index (docs/development.md, decision 6), so a name that is
 // ambiguous falls back to path semantics and fails with unknown_session or
 // ambiguous_session.
 package catalog
