@@ -331,7 +331,8 @@ unless it is explicitly marked so.
   a controllable slow settle (`FAKEPI_ABORT_SLOW_MS`), abort-ignore, and a
   shutdown flush (`FAKEPI_FLUSH_ON_EXIT`) for the resurrection guard.
   Evidence: `go test -race ./...` green (183 tests, +17), `gofmt -l .` and
-  `go vet ./...` clean, the fake e2e lane green, and each new regression test
+  `go vet ./...` clean, the fake e2e lane green and the real-model lane green
+  (suite A 15/15, suite B 9/9, 0 unexpected), and each new regression test
   checked to fail with its fix reverted. Rejected: refusing a delete while
   clients are attached (notification was the requirement, and a stale tab
   would make `/delete` impossible); letting `force` mean "ignore other
