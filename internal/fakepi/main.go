@@ -75,12 +75,17 @@ func main() {
 		uiRequest:      os.Getenv("FAKEPI_UI_REQUEST") != "",
 		withCommands:   os.Getenv("FAKEPI_COMMANDS") != "",
 		exitAfterFirst: os.Getenv("FAKEPI_EXIT_AFTER_FIRST_TURN") != "",
+		abortMarker:    os.Getenv("FAKEPI_ABORT_MARKER"),
+		slowSettle:     time.Duration(envInt("FAKEPI_ABORT_SLOW_MS", 0)) * time.Millisecond,
+		ignoreAbort:    os.Getenv("FAKEPI_ABORT_IGNORE") != "",
+		flushOnExit:    os.Getenv("FAKEPI_FLUSH_ON_EXIT") != "",
 	}
 	s.open()
 	codec := protocol.NewCodec(os.Stdin, os.Stdout)
 	for {
 		raw, err := codec.Read()
 		if err != nil {
+			s.flushOnExitFile()
 			return
 		}
 		var msg map[string]any
@@ -114,6 +119,16 @@ type state struct {
 	turns          int
 	forks          int
 	nextEntry      int
+
+	// abortCh is closed by `abort` to unwind the running turn; the gateway's
+	// forced stop uses it. abortMarker makes the abort observable to a test,
+	// slowSettle delays the settle it causes, and ignoreAbort models a model
+	// that does not react at all.
+	abortCh     chan struct{}
+	abortMarker string
+	slowSettle  time.Duration
+	ignoreAbort bool
+	flushOnExit bool
 }
 
 // open adopts an existing session file or creates one with a header.
@@ -319,7 +334,10 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 		respond("get_commands", true, map[string]any{"commands": s.commandList()}, "")
 	case "prompt":
 		s.handlePrompt(c, msg, respond)
-	case "steer", "follow_up", "abort", "abort_retry", "abort_bash":
+	case "abort":
+		s.handleAbort()
+		respond("abort", true, map[string]any{}, "")
+	case "steer", "follow_up", "abort_retry", "abort_bash":
 		respond(typ, true, map[string]any{}, "")
 	case "clear_queue":
 		respond("clear_queue", true, map[string]any{"steering": []any{}, "followUp": []any{}}, "")
@@ -417,6 +435,41 @@ func (s *state) newFile() error {
 	return nil
 }
 
+// flushOnExitFile appends one entry while the process is shutting down. A
+// test uses it to prove that gw_delete_session removes the file only after pi
+// has been reaped: a file deleted before pi's shutdown flush would reappear.
+func (s *state) flushOnExitFile() {
+	if !s.flushOnExit {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
+		"role": "assistant", "content": "flushed during shutdown",
+	}})
+}
+
+// handleAbort unwinds the running turn: the turn goroutine stops streaming
+// and settles. A test can watch abortMarker for the abort and use slowSettle
+// to make the settle take longer than the gateway's forced-stop grace.
+func (s *state) handleAbort() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ignoreAbort {
+		return
+	}
+	if s.abortMarker != "" {
+		_ = os.WriteFile(s.abortMarker, []byte("aborted\n"), 0o644)
+	}
+	if s.abortCh != nil {
+		select {
+		case <-s.abortCh:
+		default:
+			close(s.abortCh)
+		}
+	}
+}
+
 func (s *state) handlePrompt(c *protocol.Codec, msg map[string]any,
 	respond func(string, bool, any, string)) {
 	s.mu.Lock()
@@ -437,27 +490,25 @@ func (s *state) handlePrompt(c *protocol.Codec, msg map[string]any,
 	s.messageCount++
 	events, delay := s.events, s.delay
 	uiRequest := s.uiRequest
+	s.abortCh = make(chan struct{})
+	abortCh := s.abortCh
 	s.mu.Unlock()
 
 	respond("prompt", true, map[string]any{}, "")
-	go s.runTurn(c, msg, events, delay, uiRequest)
+	go s.runTurn(c, msg, events, delay, uiRequest, abortCh)
 }
 
-func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay time.Duration, uiRequest bool) {
+func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay time.Duration, uiRequest bool, abortCh <-chan struct{}) {
 	text, _ := msg["message"].(string)
 	echo := "echo: " + text
 	if images, ok := msg["images"].([]any); ok && len(images) > 0 {
 		echo = fmt.Sprintf("%s [images: %d]", echo, len(images))
 	}
-	emit := func(obj map[string]any) {
-		_ = c.WriteJSON(obj)
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-	}
-	emit(map[string]any{"type": "agent_start"})
+	// A turn is a fixed sequence of frames; an abort stops it at the next
+	// frame, so the gateway sees a settling turn rather than a dead stream.
+	frames := []map[string]any{{"type": "agent_start"}}
 	if uiRequest {
-		emit(map[string]any{
+		frames = append(frames, map[string]any{
 			"type":    "extension_ui_request",
 			"id":      "ui-1",
 			"method":  "confirm",
@@ -466,12 +517,14 @@ func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay
 			"timeout": 60000,
 		})
 	}
-	emit(map[string]any{"type": "turn_start"})
-	emit(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}})
-	emit(map[string]any{"type": "message_update",
-		"assistantMessageEvent": map[string]any{"type": "text_start", "contentIndex": 0}})
+	frames = append(frames,
+		map[string]any{"type": "turn_start"},
+		map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}},
+		map[string]any{"type": "message_update",
+			"assistantMessageEvent": map[string]any{"type": "text_start", "contentIndex": 0}},
+	)
 	for i := 0; i < events; i++ {
-		emit(map[string]any{
+		frames = append(frames, map[string]any{
 			"type":  "message_update",
 			"usage": map[string]any{"output": i + 1, "totalTokens": i + 1},
 			"assistantMessageEvent": map[string]any{
@@ -480,29 +533,57 @@ func (s *state) runTurn(c *protocol.Codec, msg map[string]any, events int, delay
 			},
 		})
 	}
-	emit(map[string]any{"type": "message_update",
-		"assistantMessageEvent": map[string]any{
-			"type": "text_end", "contentIndex": 0, "content": echo,
-		}})
-	emit(map[string]any{"type": "message_end", "message": map[string]any{
-		"role":       "assistant",
-		"stopReason": "stop",
-		"content":    []any{map[string]any{"type": "text", "text": echo}},
-	}})
-	emit(map[string]any{"type": "turn_end"})
-	emit(map[string]any{"type": "agent_end"})
+	frames = append(frames,
+		map[string]any{"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_end", "contentIndex": 0, "content": echo,
+			}},
+		map[string]any{"type": "message_end", "message": map[string]any{
+			"role":       "assistant",
+			"stopReason": "stop",
+			"content":    []any{map[string]any{"type": "text", "text": echo}},
+		}},
+		map[string]any{"type": "turn_end"},
+		map[string]any{"type": "agent_end"},
+	)
+
+	aborted := false
+	for _, frame := range frames {
+		select {
+		case <-abortCh:
+			aborted = true
+		default:
+		}
+		if aborted {
+			break
+		}
+		_ = c.WriteJSON(frame)
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	if aborted && s.slowSettle > 0 {
+		// Model the time a real agent takes to wind down after an abort; the
+		// gateway's forced stop stops pi when this outlasts its grace.
+		time.Sleep(s.slowSettle)
+	}
 
 	s.mu.Lock()
 	s.streaming = false
-	s.lastAssistant = echo
-	s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
-		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": echo}},
-	}})
-	s.messageCount++
+	s.abortCh = nil
+	if !aborted {
+		s.lastAssistant = echo
+		s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
+			"role": "assistant", "content": []any{map[string]any{"type": "text", "text": echo}},
+		}})
+		s.messageCount++
+	}
 	s.turns++
-	exitAfter := s.exitAfterFirst && s.turns >= 1
+	exitAfter := s.exitAfterFirst && s.turns >= 1 && !aborted
 	s.mu.Unlock()
-	emit(map[string]any{"type": "agent_settled"})
+	// The settle frame is written even after an abort: it is what makes the
+	// turn end cleanly for the gateway.
+	_ = c.WriteJSON(map[string]any{"type": "agent_settled"})
 	if exitAfter {
 		// Let the settle event drain before simulating a pi crash.
 		time.Sleep(50 * time.Millisecond)

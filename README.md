@@ -195,7 +195,8 @@ Pick the role for what the integration does, not for what it reads:
 - `operator` attaches to existing sessions, prompts, steers, aborts and
   answers dialogs, but cannot create sessions, name them, or change the model.
 - `admin` (the daemon-generated token's level) is needed for
-  `gw_new_session`, so a bot that creates its own sessions, names them
+  `gw_new_session`, `gw_stop_session` and `gw_delete_session`, so a bot that
+  creates, releases or destroys its own sessions, names them
   (`set_session_name`), or reconfigures them (`set_model`, `compact`, …) needs
   `admin` or an explicit `--token-caps` list containing `admin`/`control`.
 
@@ -260,6 +261,13 @@ long-lived bot it also provides:
   steering/follow-up modes, compaction, auto-retry, `bash` (with streamed
   `BashUpdate` callbacks), entries/tree/forks/stats/export, and
   `set_session_name`.
+- **Releasing and destroying sessions** — `StopSession` stops pi and keeps the
+  file (a later attach respawns it), `DeleteSession` stops pi and removes it
+  (irreversible). Both refuse a running turn unless `force` is set; a delete
+  also notifies every attached client with
+  `gw_session_state{state:"deleted"}` and unbinds them without closing their
+  connections, and `gwclient` clears `Session()` so the next command cannot
+  silently land in a new session.
 
 A bot that creates its own sessions needs a token with `admin` (see
 [Restricted tokens](#restricted-tokens)); one that only attaches to sessions it

@@ -62,7 +62,7 @@ func TestDeclareDocumentsEveryCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	for _, name := range []string{SessionsStarted, TurnsStarted, SubscriberDrops, FramesOut} {
+	for _, name := range []string{SessionsStarted, SessionsDeleted, TurnsStarted, SubscriberDrops, FramesOut} {
 		if !strings.Contains(out, "# HELP "+name+" ") {
 			t.Errorf("no HELP line for %s", name)
 		}

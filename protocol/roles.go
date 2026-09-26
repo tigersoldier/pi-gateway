@@ -69,8 +69,9 @@ func CommandCapability(command string) string {
 		"compact", "set_auto_compaction", "set_auto_retry",
 		"set_session_name", "set_editor_text":
 		return CapControl
-	// Provisioning.
-	case "gw_new_session":
+	// Provisioning: creating a session and destroying one are the operator's
+	// authority, not something any attached client may do (docs/design.md §10).
+	case "gw_new_session", "gw_stop_session", "gw_delete_session":
 		return CapAdmin
 	}
 	// Deliberately open to any authenticated client: only the connection

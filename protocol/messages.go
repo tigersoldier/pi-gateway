@@ -131,6 +131,21 @@ type SessionStateEvent struct {
 	ExitCode *int   `json:"exitCode,omitempty"`
 }
 
+// Session states carried by gw_session_state (docs/protocol.md §5.2). The
+// terminal SessionStateDeleted is the only one that changes client behavior:
+// the session file is gone and the session is unusable.
+const (
+	SessionStateDeleted = "deleted"
+)
+
+// Stop reasons reported on the terminal gw_session_state of
+// gw_stop_session/gw_delete_session: requested (nothing was overridden) or
+// forced (a running turn or attached clients were overridden).
+const (
+	StopReasonRequested = "requested"
+	StopReasonForced    = "forced"
+)
+
 // ErrorEvent is a gw_error protocol error.
 type ErrorEvent struct {
 	Type    string `json:"type"`
@@ -199,6 +214,8 @@ const (
 	CodeSpawnParamConflict = "spawn_param_conflict"
 	CodeSharedSession      = "shared_session"
 	CodeReloadBusy         = "reload_busy"
+	CodeSessionBusy        = "session_busy"
+	CodeSessionAttached    = "session_attached"
 	CodeQueueFull          = "queue_full"
 	CodeSlowConsumer       = "slow_consumer"
 	CodeUIStale            = "ui_stale"

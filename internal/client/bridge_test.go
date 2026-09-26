@@ -15,6 +15,7 @@ import (
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
 	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 const bridgeToken = "bridge-test-token-0123456789"
@@ -180,6 +181,47 @@ func TestBridgeRelaysPristinePiRPC(t *testing.T) {
 	u.closeStdin()
 	if code := u.waitExit(testutil.DefaultTimeout); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+func TestBridgeRefusesCommandsAfterDeletedSession(t *testing.T) {
+	addr, tokenFile, _ := startDaemon(t)
+	u := startBridge(t, addr, tokenFile, "--mode", "rpc")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ui.jsonl")
+
+	u.send(map[string]any{"type": "switch_session", "id": "s1", "sessionPath": path})
+	if resp := u.waitFor(func(f map[string]any) bool {
+		return f["type"] == "response" && f["id"] == "s1"
+	}, testutil.DefaultTimeout); resp["success"] != true {
+		t.Fatalf("switch_session through the bridge failed: %v", resp)
+	}
+
+	// A second client deletes the session out from under the UI, then the
+	// bridge has the terminal event in hand before the next UI command.
+	bot := testutil.Dial(t, addr, bridgeToken, func(h *protocol.Hello) { h.Session = path })
+	bot.WaitType("gw_welcome", testutil.DefaultTimeout)
+	bot.Send(map[string]any{"type": "gw_delete_session", "id": "d1"})
+	if resp := bot.WaitResponse("d1", testutil.DefaultTimeout); resp["success"] != true {
+		t.Fatalf("delete failed: %v", resp)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	u.send(map[string]any{"type": "get_state", "id": "req-2"})
+	resp := u.waitFor(func(f map[string]any) bool {
+		return f["type"] == "response" && f["id"] == "req-2"
+	}, testutil.DefaultTimeout)
+	if resp["success"] != false || !strings.Contains(testutil.Str(resp, "error"), "deleted") {
+		t.Fatalf("command after delete = %v, want a pi-shaped error", resp)
+	}
+	if code := u.waitExit(testutil.DefaultTimeout); code != 3 {
+		t.Fatalf("bridge exit = %d, want 3", code)
+	}
+	// The refused command did not create a replacement session.
+	bot.Send(map[string]any{"type": "gw_list_sessions", "id": "l1"})
+	listResp := bot.WaitResponse("l1", testutil.DefaultTimeout)
+	if rows := testutil.Arr(testutil.Obj(listResp, "data"), "sessions"); len(rows) != 0 {
+		t.Fatalf("a command after the delete created a session: %v", rows)
 	}
 }
 

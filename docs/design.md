@@ -291,6 +291,11 @@ or `new_session`: the connection's hub subscription and command target change,
 and the client's following commands are routed to the new actor in order. The
 bridge remains a dumb relay.
 
+A connection whose session was deleted is the one exception to lazy creation:
+the daemon unbinds it and refuses session-scoped commands until the client
+attaches or creates a session explicitly, so a deleted session cannot
+silently become a new one (§4.8).
+
 ---
 
 ## 4. Session lifecycle
@@ -398,6 +403,41 @@ client asking for it.
 
 `SIGTERM` on the daemon: stop accepting connections, `abort` each session,
 close pi stdin, wait with a timeout, then `SIGKILL`.
+
+### 4.8 Stop and delete
+
+`gw_stop_session` releases a session's pi process while keeping the file;
+`gw_delete_session` does the same and removes the file. Both are `admin`,
+session-scoped, answered on the requester's own connection, and specified on
+the wire in `docs/protocol.md` §3.10.
+
+- The request goes through the actor mailbox, so it linearizes with prompts,
+  turn start, attach and detach: a client is never bound to a deleted session.
+  A concurrent attach either completes first (and then receives the terminal
+  event and is unbound) or resolves after the deletion (`unknown_session`).
+- Refusals: `session_busy` while a turn runs without `force`;
+  `session_attached` for a stop with other clients attached without `force`.
+  Deleting never blocks on attached clients — one stale UI must not make a
+  session undeletable — so they are notified and unbound instead.
+- A forced stop sends pi `abort` and waits for `agent_settled` up to
+  `defaultStopGrace` (5s), then stops pi regardless. The daemon queue is
+  discarded and republished empty before pi stops, so no queued prompt can
+  restart a turn.
+- Deletion happens in the daemon **after** `Actor.Finished()` — pi is reaped
+  and has flushed its file — and removes exactly the canonical file, plus its
+  encoded-cwd directory when that is empty. The path is then tombstoned for
+  the daemon's lifetime: a repeat attach or delete answers `unknown_session`.
+  The tombstone also closes the window between the actor stopping and the file
+  disappearing, and deletion only accepts a session file pi registered or the
+  catalog scanned, so it cannot remove arbitrary files.
+- The actor publishes `gw_session_state{state:"deleted", reason:"requested"
+  |"forced"}` before closing the hub, so every subscriber sees it exactly
+  once. Bound connections are unbound, not closed, and a connection unbound by
+  a deletion refuses later session-scoped commands until the client attaches
+  or creates a session explicitly; the bridge turns that into a pi-shaped
+  error and closes the UI stream.
+- A stop keeps the file, so the next attach respawns pi (§4.3); its terminal
+  event is `gw_session_state{state:"stopped", reason:"requested"|"forced"}`.
 
 ---
 
@@ -639,7 +679,7 @@ pi emits `extension_ui_request` and blocks until a matching
 | `prompt` | `prompt`, `follow_up`, `new_session`, `fork`/`clone`, `bash`, `switch_session` |
 | `ui` | answer extension UI dialogs, `notify` |
 | `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
-| `admin` | `gw_new_session` (provision sessions/config) |
+| `admin` | `gw_new_session`, `gw_stop_session`, `gw_delete_session` (provision and destroy sessions) |
 | *(none)* | `gw_ping`, `gw_bye` |
 
 Non-lowercase command types are rejected (`bad_frame`) instead of forwarded, so
@@ -651,7 +691,10 @@ addressed to it (its own responses and dialogs), no replay, and no snapshot.
 `bash` is gated by `prompt` (a prompt-capable client can already run shell
 work through the agent), the shared-state mutations by `control`, and the
 cancellation primitives `abort`/`clear_queue` by `interject`, because clearing
-can withdraw work another client queued.
+can withdraw work another client queued. Destroying a session is `admin`,
+like creating one; `gw_delete_session` additionally refuses any path that is
+not a registered session or a session file under a catalog root, so it is not
+an arbitrary-file delete.
 
 - **Kind is informational only** (`pilish`, `integration`, `bot`, `observer`);
   it never changes policy. Integration-specific capability handling and

@@ -7,6 +7,7 @@ const (
 	SessionsStarted = "pi_gateway_sessions_started_total"
 	SessionsEnded   = "pi_gateway_sessions_ended_total"
 	SessionsReaped  = "pi_gateway_sessions_reaped_total"
+	SessionsDeleted = "pi_gateway_sessions_deleted_total"
 	Attaches        = "pi_gateway_attaches_total"
 	AttachFailures  = "pi_gateway_attach_failures_total"
 	Unauthorized    = "pi_gateway_unauthorized_total"
@@ -52,6 +53,7 @@ var helpText = map[string]string{
 	SessionsStarted: "sessions for which a pi process was started",
 	SessionsEnded:   "sessions whose pi process exited or was stopped",
 	SessionsReaped:  "sessions retired by the idle reaper",
+	SessionsDeleted: "sessions deleted by gw_delete_session (file and registration)",
 	Attaches:        "successful client attachments to a session",
 	AttachFailures:  "client attachments refused or timed out",
 	Unauthorized:    "connections rejected for a missing or wrong token",
@@ -90,7 +92,7 @@ var helpText = map[string]string{
 // counterNames lists the counters Declare registers, so the exposition is
 // complete (and the HELP lines present) before the first increment.
 var counterNames = []string{
-	SessionsStarted, SessionsEnded, SessionsReaped,
+	SessionsStarted, SessionsEnded, SessionsReaped, SessionsDeleted,
 	Attaches, AttachFailures, Unauthorized,
 	TurnsStarted, TurnsSettled, PromptsQueued, PromptsRejected,
 	Reloads, ReloadsRefused, PiExits,

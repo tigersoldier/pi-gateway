@@ -279,6 +279,36 @@ func (c *Client) ReloadSession(ctx context.Context, session string, force bool) 
 	return c.Do(ctx, "gw_reload_session", fields)
 }
 
+// StopSession stops a session's pi process and keeps the session file
+// (gw_stop_session). An empty session addresses this client's bound session;
+// a name or path resolves like switch_session, including a hibernated
+// session. force is required to stop a running turn and to stop a session
+// other clients are attached to. A successful response reports piStopped and
+// detachedClients.
+func (c *Client) StopSession(ctx context.Context, session string, force bool) (*Response, error) {
+	return c.stopDelete(ctx, "gw_stop_session", session, force)
+}
+
+// DeleteSession stops a session's pi process and removes its session file
+// (gw_delete_session); it is irreversible. Attached clients are notified with
+// gw_session_state{state:"deleted"} and unbound rather than disconnected, and
+// this client's Session() becomes nil once that event arrives. An empty
+// session addresses this client's bound session; a name or path resolves like
+// switch_session. force is required to delete a session with a running turn.
+// The session stops being usable; a repeat delete or attach answers
+// unknown_session.
+func (c *Client) DeleteSession(ctx context.Context, session string, force bool) (*Response, error) {
+	return c.stopDelete(ctx, "gw_delete_session", session, force)
+}
+
+func (c *Client) stopDelete(ctx context.Context, command, session string, force bool) (*Response, error) {
+	fields := map[string]any{"force": force}
+	if session != "" {
+		fields["session"] = session
+	}
+	return c.Do(ctx, command, fields)
+}
+
 // RespondUI answers an extension_ui_request. requestID is the dialog id from
 // the request; response carries pi's answer shape (for example {"value": ...}
 // or {"cancelled": true}). It requires the ui capability.

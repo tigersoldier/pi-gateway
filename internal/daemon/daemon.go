@@ -35,6 +35,9 @@ type Config struct {
 	PiBin       string
 	IdleTimeout time.Duration
 	ShortGrace  time.Duration
+	// StopGrace bounds how long a forced stop waits for the running turn to
+	// settle after `abort`; 0 uses the session package default (5s).
+	StopGrace time.Duration
 	// CatalogRoots are extra session directories to scan, on top of the ones
 	// pi itself uses (catalog.DefaultRoots).
 	CatalogRoots []string
@@ -86,6 +89,11 @@ type Daemon struct {
 	sessions map[string]*entry // canonical path -> entry
 	pending  map[*session.Actor]*entry
 	conns    map[*conn]struct{}
+	// tombstones are canonical paths deleted by gw_delete_session. They close
+	// the window between the actor stopping and the file being removed, and
+	// keep a repeat attach/delete from resurrecting a deleted session
+	// (docs/protocol.md §3.10). They live for the daemon's lifetime.
+	tombstones map[string]bool
 
 	nextClient atomic.Uint64
 	piVersion  string
@@ -119,15 +127,16 @@ func New(cfg Config) *Daemon {
 		cfg.DeltaFlush = defaultDeltaFlush
 	}
 	d := &Daemon{
-		cfg:      cfg,
-		log:      log,
-		metrics:  m,
-		scanner:  &catalog.Scanner{Roots: catalog.DefaultRoots(cfg.CatalogRoots...)},
-		sessions: make(map[string]*entry),
-		pending:  make(map[*session.Actor]*entry),
-		conns:    make(map[*conn]struct{}),
-		done:     make(chan struct{}),
-		started:  time.Now(),
+		cfg:        cfg,
+		log:        log,
+		metrics:    m,
+		scanner:    &catalog.Scanner{Roots: catalog.DefaultRoots(cfg.CatalogRoots...)},
+		sessions:   make(map[string]*entry),
+		pending:    make(map[*session.Actor]*entry),
+		conns:      make(map[*conn]struct{}),
+		tombstones: make(map[string]bool),
+		done:       make(chan struct{}),
+		started:    time.Now(),
 	}
 	m.Declare()
 	if err := d.SetTokens(cfg.Tokens); err != nil {
@@ -258,7 +267,7 @@ func (d *Daemon) resolveTarget(target string) (string, error) {
 		return "", &attachError{protocol.CodeUnknownSession, "no session path given"}
 	}
 	if looksLikePath(target) {
-		return canonicalPath(target), nil
+		return d.resolveCanonical(canonicalPath(target))
 	}
 	files, err := d.scanner.FindName(target)
 	truncated := errors.Is(err, catalog.ErrTooManyCandidates)
@@ -284,7 +293,97 @@ func (d *Daemon) resolveTarget(target string) (string, error) {
 		return "", &attachError{protocol.CodeUnknownSession,
 			fmt.Sprintf("no session named %q", target)}
 	}
+	return d.resolveCanonical(canon)
+}
+
+// resolveCanonical refuses a canonical path that gw_delete_session removed, so
+// neither a repeat delete nor an attach can bring the session back
+// (docs/protocol.md §3.10).
+func (d *Daemon) resolveCanonical(canon string) (string, error) {
+	if d.isTombstoned(canon) {
+		return "", &attachError{protocol.CodeUnknownSession, "session was deleted"}
+	}
 	return canon, nil
+}
+
+// markTombstoned remembers that a canonical path was deleted. The file is
+// removed only after the actor finishes, so between the two an attach could
+// still resolve the path from the file scan and respawn pi on a file that is
+// about to disappear; the tombstone closes that window, and it keeps a repeat
+// attach or delete of the same path from resurrecting the session for as long
+// as the daemon runs (docs/protocol.md §3.10).
+func (d *Daemon) markTombstoned(canon string) {
+	if canon == "" {
+		return
+	}
+	d.mu.Lock()
+	d.tombstones[canon] = true
+	d.mu.Unlock()
+}
+
+// clearTombstoned undoes a tombstone whose delete did not complete, so the
+// session file stays reachable.
+func (d *Daemon) clearTombstoned(canon string) {
+	if canon == "" {
+		return
+	}
+	d.mu.Lock()
+	delete(d.tombstones, canon)
+	d.mu.Unlock()
+}
+
+// isTombstoned reports whether gw_delete_session removed a canonical path.
+func (d *Daemon) isTombstoned(canon string) bool {
+	if canon == "" {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tombstones[canon]
+}
+
+// isSessionFileInfo parses a session file the daemon considers its own: it
+// must live under a catalog root and carry pi's session header. Anything else
+// is not a session, so it can neither be a stop/delete target nor a catalog
+// row.
+func (d *Daemon) isSessionFileInfo(canon string) (catalog.Info, bool) {
+	if canon == "" || d.isTombstoned(canon) {
+		return catalog.Info{}, false
+	}
+	info, err := catalog.Parse(canon)
+	if err != nil {
+		return catalog.Info{}, false
+	}
+	if !d.underRoot(canon) {
+		return catalog.Info{}, false
+	}
+	info.Path = canon
+	return info, true
+}
+
+// isSessionFile reports whether canon is a session file under a session root.
+func (d *Daemon) isSessionFile(canon string) bool {
+	_, ok := d.isSessionFileInfo(canon)
+	return ok
+}
+
+// underRoot reports whether a canonical path lives inside one of the session
+// directories the daemon scans. Roots are canonicalized the same way, so a
+// symlinked session directory is still recognized.
+func (d *Daemon) underRoot(canon string) bool {
+	if d.scanner == nil {
+		return false
+	}
+	for _, root := range d.scanner.Roots {
+		rel, err := filepath.Rel(canonicalPath(root), canon)
+		if err != nil {
+			continue
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // isLivePath reports whether one of the live sessions owns path.
@@ -566,6 +665,7 @@ func (d *Daemon) newActor(path string, spec *piargs.Spec, cwd string) (*session.
 		SessionPath: path,
 		IdleTimeout: d.cfg.IdleTimeout,
 		ShortGrace:  d.cfg.ShortGrace,
+		StopGrace:   d.cfg.StopGrace,
 		Log:         d.log.With("session", path),
 		Metrics:     d.metrics,
 	})

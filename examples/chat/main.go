@@ -248,6 +248,10 @@ func handleLine(ctx context.Context, client *gwclient.Client, render *renderer, 
 		printCommands(ctx, client)
 	case inputSession:
 		printSession(os.Stderr, client)
+	case inputStop:
+		stopOrDelete(ctx, client, "stop", arg == "force")
+	case inputDelete:
+		stopOrDelete(ctx, client, "delete", arg == "force")
 	case inputHelp:
 		fmt.Fprint(os.Stderr, helpText)
 	case inputQuit:
@@ -258,7 +262,38 @@ func handleLine(ctx context.Context, client *gwclient.Client, render *renderer, 
 	return false
 }
 
-// handleDialog answers an extension dialog. notify/set* are fire-and-forget;
+// stopOrDelete runs gw_stop_session/gw_delete_session and prints the outcome.
+// force is `!stop force` / `!delete force`; without it the daemon refuses a
+// running turn (session_busy) or, for stop, other attached clients
+// (session_attached).
+func stopOrDelete(ctx context.Context, client *gwclient.Client, command string, force bool) {
+	var (
+		resp *gwclient.Response
+		err  error
+	)
+	if command == "delete" {
+		resp, err = client.DeleteSession(ctx, "", force)
+	} else {
+		resp, err = client.StopSession(ctx, "", force)
+	}
+	if err != nil {
+		reportError(command, err)
+		return
+	}
+	var data struct {
+		Path            string `json:"path"`
+		PiStopped       bool   `json:"piStopped"`
+		DetachedClients int    `json:"detachedClients"`
+		FileDeleted     bool   `json:"fileDeleted"`
+	}
+	_ = resp.Decode(&data)
+	outcome := fmt.Sprintf("pi stopped: %v", data.PiStopped)
+	if command == "delete" {
+		outcome = fmt.Sprintf("pi stopped: %v, file deleted: %v", data.PiStopped, data.FileDeleted)
+	}
+	fmt.Fprintf(os.Stderr, "[%s ok: %s, detached clients: %d]\n", command, outcome, data.DetachedClients)
+}
+
 // blocking dialogs read their answer from the input stream.
 func handleDialog(ctx context.Context, client *gwclient.Client, req gwclient.UIRequest, lines <-chan string) {
 	if !req.Blocking {

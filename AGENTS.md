@@ -78,7 +78,7 @@ asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e
 | `gwclient` | exported client library for integrations and bots (dial, hello, typed commands/events, cursor and reconnect, UI-request classification) |
 | `examples/chat` | runnable example CLI built only on `gwclient` (streaming, queue/steer/abort, commands/skills) |
 | `internal/client` | bridge implementation (token/port discovery, relay, non-RPC modes) |
-| `internal/daemon` | session table, attach/rebinding, spawn-parameter checks, per-connection fan-out |
+| `internal/daemon` | session table, attach/rebinding, spawn-parameter checks, per-connection fan-out, stop/delete lifecycle (tombstoned paths) |
 | `internal/session` | `SessionActor`, `Hub` (event log and replay ring), `PromptQueue`, `PiProcess` |
 | `internal/catalog` | session-file scanning, name resolution, durable leaf ids |
 | `internal/debughttp` | read-only `/status` `/catalog` `/metrics` |
@@ -103,3 +103,9 @@ asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e
   and un-revivable on re-attach.
 - The bridge refuses pi options it does not own, and only `--version`/`--help`
   are answered outside RPC mode.
+- `gw_delete_session` tombstones the canonical path for the daemon's lifetime:
+  a repeat delete and any attach naming that path answer `unknown_session`, and
+  a connection it unbinds refuses session-scoped commands until the client
+  attaches or creates a session explicitly (the bridge turns that into a
+  pi-shaped error and closes the UI stream). The file is removed only after the
+  actor finishes, because pi flushes its session file while shutting down.

@@ -369,6 +369,10 @@ Attach is pi's `switch_session`, intercepted by the daemon:
 - Rebinding does not affect other clients attached to the old or new session.
 - `switch_session` accepts `session` as an alias for `sessionPath`, matching
   `gw_reload_session`.
+- A session deleted by `gw_delete_session` is tombstoned: attaching to its path
+  answers `unknown_session` for as long as the daemon runs, and a connection
+  that was bound to it must attach or create a session explicitly before any
+  session-scoped command works again (§3.10).
 
 ### 3.5 Hibernation
 
@@ -458,6 +462,94 @@ terms of the daemon queue and pi's turn:
 - A `steer` already forwarded to pi cannot be withdrawn except by the
   session-wide `clear_queue`.
 
+### 3.10 Stopping and deleting a session
+
+Two `admin` control commands release a session's pi process and, for delete,
+destroy its file. Both are session-scoped and answered on the requester's own
+connection, like `gw_reload_session`:
+
+```json
+{"type": "gw_stop_session",   "id": "req-8", "session": "auth-refactor", "force": false}
+{"type": "gw_delete_session", "id": "req-9", "session": "/path/x.jsonl",  "force": false}
+```
+
+`session` is optional and empty means the requester's bound session; a name or
+path resolves exactly like `switch_session`, so a hibernated session resolves
+by name from the file scan. Success carries the outcome:
+
+```json
+{"type": "response", "id": "req-9", "command": "gw_delete_session", "success": true,
+ "data": {"path": "...", "name": "auth-refactor", "sessionId": "uuid",
+          "piStopped": true, "fileDeleted": true, "detachedClients": 2}}
+```
+
+- `piStopped` is false only when the target had no live pi.
+- `fileDeleted` is false when there was no file to delete (a session created
+  but never flushed); the command still succeeds. The field is absent on a
+  stop.
+- `detachedClients` counts the *other* clients detached by the command (the
+  requester does not count itself).
+
+| Condition | Result |
+|---|---|
+| capability missing | `forbidden`, checked before dispatch |
+| malformed frame | `bad_frame` |
+| target resolves to nothing (no registration and no file) | `unknown_session` |
+| name matches more than one session | `ambiguous_session` |
+| a turn is running and `force` is false | `session_busy` |
+| `gw_stop_session`, other clients attached, `force` false | `session_attached` |
+| `gw_delete_session` | attached clients never block (see below) |
+| the actor cannot be stopped | `session_crashed` |
+
+Stop semantics:
+
+- The command is delivered to the session actor's mailbox, so it linearizes
+  with prompts, turn start, attach and detach: a client is never bound to a
+  deleted session. A concurrent attach either completes first (and then
+  receives the terminal event and is unbound) or resolves after the deletion
+  (`unknown_session`); there is no third state.
+- Idle: pi is stopped immediately and the file is kept, so a later attach
+  respawns pi and reloads it (§3.4).
+- Running turn without `force`: refused with `session_busy`; nothing is
+  stopped and the file is untouched.
+- Running turn with `force`: pi is sent `abort`, and if the turn does not
+  settle within the stop grace (default 5s) pi is stopped anyway. A bot's
+  `/delete` is therefore never held hostage by a runaway turn.
+- The daemon-owned queue and forwarded steers are discarded and
+  `gw_queue{pending:[]}` is published **before** pi stops, so no queued prompt
+  can restart a turn in a session that is going away.
+
+Delete semantics:
+
+- Everything a stop does, plus: the session file is removed **after** the
+  actor has fully finished and pi has been reaped, because a live pi flushes
+  its session file while shutting down. Only that one file is removed, plus
+  its `--<encoded-cwd>--` directory when it is empty afterwards; nothing is
+  recursed into. There is no undo, trash, or confirmation handshake;
+  confirmation is the caller's policy.
+- The canonical path is tombstoned for the daemon's lifetime: a repeat
+  `gw_delete_session`, and any attach naming that path, answers
+  `unknown_session`. A deleted session is never resurrected.
+- A path that is neither a registered session nor a session file the catalog
+  scanned (under a session root) is refused with `unknown_session`, so the
+  command cannot be used to delete an arbitrary file.
+
+Notification:
+
+- `gw_session_state{state:"deleted", reason:"requested"|"forced"}` is
+  published on the session hub before it is closed, so every subscriber of
+  that session receives it exactly once.
+- Every connection bound to the session — including the requester — is
+  **unbound, not disconnected**: the connection stays open and can
+  `switch_session`, `new_session` or `gw_new_session` again without redialing.
+  The terminal event and the requester's response are both delivered; either
+  may arrive first, and the response is authoritative for the outcome.
+- A connection unbound by a deletion does not lazily create a session
+  afterwards: a session-scoped command is answered `unknown_session` until
+  the client attaches or creates one explicitly. This is what keeps a deleted
+  session from silently becoming a new one; the bridge relies on it and closes
+  the UI stream with a pi-shaped error (§12).
+
 ---
 
 ## 4. Commands
@@ -470,6 +562,8 @@ terms of the daemon queue and pi's turn:
 | `gw_list_sessions` | `{filter}` | session catalog |
 | `gw_new_session` | `{name?, cwd?, piArgs?, tags?}` | explicit create + bind |
 | `gw_reload_session` | `{session?, force?}` | restart pi for a session |
+| `gw_stop_session` | `{session?, force?}` | stop pi, keep the session file (§3.10) |
+| `gw_delete_session` | `{session?, force?}` | stop pi, delete the session file (§3.10) |
 | `gw_ping` | `{}` | liveness |
 | `gw_bye` | `{}` | graceful disconnect |
 
@@ -575,7 +669,7 @@ client's command output.
 | `gw_queue` | `{pending:[{id, mode:"followUp", author:{clientId,kind,name}, preview}]}` | daemon-owned pending prompts, tagged by client kind; immediate `steer` interjections are not listed |
 | `gw_presence` | `{event:"join"\|"leave"\|"update", client}` | roster |
 | `gw_state_changed` | `{command, data, by}` | shared-state mutation |
-| `gw_session_state` | `{state:"ready"\|"hibernated"\|"restarting"\|"crashed"\|"stopped", reason?, exitCode?}` | session process lifecycle |
+| `gw_session_state` | `{state:"ready"\|"hibernated"\|"restarting"\|"crashed"\|"stopped"\|"deleted", reason?, exitCode?}` | session process lifecycle; `deleted` is terminal and unbinds every attached client (§3.10), `stopped` with reason `requested`/`forced` is a completed `gw_stop_session` |
 | `gw_lag` | `{oldestSeq, headSeq}` | client fell behind; resync |
 | `gw_error` | `{code, message, id?}` (`id` set when the error answers a specific request) | protocol-level error |
 | `gw_pong` | `{}` | liveness |
@@ -641,6 +735,8 @@ frame carries that same id.
 | `spawn_param_conflict` | spawn-only parameter differs from the live session config |
 | `shared_session` | `fork`/`clone` requested while other clients are attached |
 | `reload_busy` | reload refused: other clients attached or a turn running |
+| `session_busy` | stop/delete refused: a turn is running and `force` was not set |
+| `session_attached` | `gw_stop_session` refused: other clients are attached and `force` was not set |
 | `queue_full` | command rejected: the session actor is busy or shutting down (its inbound queue is full) |
 | `slow_consumer` | client disconnected for not reading |
 | `ui_stale` | extension UI response arrived after resolution |
@@ -735,7 +831,7 @@ starts pi, or changes shared state.
 | `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
 | `ui` | `extension_ui_response`, `notify` |
 | `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
-| `admin` | `gw_new_session` |
+| `admin` | `gw_new_session`, `gw_stop_session`, `gw_delete_session` |
 | *(none)* | `gw_ping`, `gw_bye` |
 
 `bash` requires `prompt` because a prompt-capable client can already cause
@@ -776,6 +872,14 @@ will be revisited after implementation.
    its own policy (formatting, routing, persistence). The wire contract in this
    document remains authoritative for other languages and for the library's
    own behaviour.
+9. **Handle `gw_session_state{state:"deleted"}`.** The bound session is gone:
+   clear it, discard local turn state, and do not send another session-scoped
+   command on that connection until you attach or create a session explicitly.
+   The daemon enforces this (`unknown_session`), but a client that keeps a
+   stale binding will misreport what it is talking to. `gwclient` clears
+   `Session()` for you; the bridge refuses the next session-scoped UI command
+   with a pi-shaped error and closes the UI stream instead of forwarding a
+   command that would land in a fresh session.
 
 ---
 

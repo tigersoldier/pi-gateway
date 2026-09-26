@@ -12,6 +12,8 @@ const (
 	inputAbort
 	inputCommands
 	inputSession
+	inputStop
+	inputDelete
 	inputHelp
 	inputQuit
 	inputUnknown
@@ -39,6 +41,10 @@ func parseInput(line string) (inputKind, string) {
 		return inputCommands, arg
 	case "session":
 		return inputSession, arg
+	case "stop":
+		return inputStop, arg
+	case "delete":
+		return inputDelete, arg
 	case "help", "?":
 		return inputHelp, arg
 	case "quit", "exit":
@@ -56,6 +62,8 @@ input          send a prompt (the daemon queues it while a turn runs)
 !steer <text>  interject into the running turn
 !abort         abort the running turn
 !session       show the attached session
+!stop [force]   stop pi for this session, keeping the session file
+!delete [force]  stop pi and delete the session file (irreversible)
 !help          this help
 !quit          exit (Ctrl-D too; Ctrl-C aborts a turn, again to quit)
 `

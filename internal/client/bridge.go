@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/config"
@@ -88,7 +89,8 @@ type parsed struct {
 
 // Run executes the bridge and returns the process exit code.
 //
-// Exit codes: 0 success, 2 usage/pi-option error, 3 daemon/connection error.
+// Exit codes: 0 success, 2 usage/pi-option error, 3 daemon/connection error
+// (including the bound session having been deleted by another client).
 func Run(ctx context.Context, opts Options) int {
 	parsedArgs, err := parseArgs(opts.Args)
 	if err != nil {
@@ -227,6 +229,12 @@ func resolveToken(p *parsed) (string, error) {
 	return tok, nil
 }
 
+// errSessionDeleted ends the bridge when a UI command arrives after another
+// client deleted the session: the daemon has unbound this connection, and
+// forwarding the command would resolve the session-scoped command by
+// implicitly creating a fresh session.
+var errSessionDeleted = errors.New("session was deleted by another client")
+
 type bridge struct {
 	conn   net.Conn
 	up     *protocol.Codec // raw connection codec
@@ -237,6 +245,11 @@ type bridge struct {
 
 	parsed *parsed
 	token  string
+
+	// deleted is set when the daemon reports the bound session deleted. The
+	// next session-scoped UI command is refused instead of forwarded, because
+	// the daemon would create a new session in the old one's place.
+	deleted atomic.Bool
 }
 
 type relayResult struct {
@@ -279,6 +292,10 @@ func (b *bridge) run(ctx context.Context) int {
 	case r := <-results:
 		if r.err == nil {
 			return 0
+		}
+		if errors.Is(r.err, errSessionDeleted) {
+			fmt.Fprintf(b.stderr, "%s: %v\n", binaryName, r.err)
+			return 3
 		}
 		if r.side == "daemon" {
 			fmt.Fprintf(b.stderr, "%s: daemon connection lost: %v\n", binaryName, r.err)
@@ -336,6 +353,16 @@ func (b *bridge) relayUI(results *chan relayResult) {
 			}
 			return
 		}
+		if b.deleted.Load() && !protocol.IsGatewayType(protocol.Field(raw, "type")) {
+			// The bound session was deleted: answer the UI in pi's shape and end
+			// the bridge, instead of forwarding a session-scoped command the
+			// daemon would answer by creating a new session.
+			typ := protocol.Field(raw, "type")
+			_ = b.ui.WriteRaw(protocol.Response(protocol.Field(raw, "id"), typ,
+				false, "", errSessionDeleted.Error(), nil))
+			*results <- relayResult{side: "ui", err: errSessionDeleted}
+			return
+		}
 		if err := b.up.WriteRaw(raw); err != nil {
 			*results <- relayResult{side: "daemon", err: err}
 			return
@@ -352,6 +379,13 @@ func (b *bridge) relayDaemon(results *chan relayResult) {
 			return
 		}
 		typ := protocol.Field(raw, "type")
+		if typ == "gw_session_state" && protocol.Field(raw, "state") == protocol.SessionStateDeleted {
+			// Another client deleted the session. The event is gateway traffic,
+			// so the UI never sees it; the flag makes the next session-scoped
+			// command fail in pi's shape instead of silently landing in a new
+			// session on the now-unbound connection.
+			b.deleted.Store(true)
+		}
 		if protocol.IsGatewayType(typ) {
 			continue
 		}

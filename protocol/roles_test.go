@@ -67,6 +67,8 @@ func TestCommandCapability(t *testing.T) {
 		"compact":               CapControl,
 		"gw_reload_session":     CapControl,
 		"gw_new_session":        CapAdmin,
+		"gw_stop_session":       CapAdmin,
+		"gw_delete_session":     CapAdmin,
 		"gw_ping":               "",
 		"gw_bye":                "",
 	}

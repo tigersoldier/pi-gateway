@@ -519,6 +519,16 @@ func (c *Client) dispatch(raw []byte) {
 		}
 	case "gw_turn":
 		c.noteTurn(protocol.Field(raw, "state") == "running")
+	case "gw_session_state":
+		var st protocol.SessionStateEvent
+		if json.Unmarshal(raw, &st) == nil && sessionDetached(st) {
+			// The daemon unbound this connection: the session was deleted, or
+			// it was stopped on request. Drop the binding and the local turn
+			// state, so Session() reports nil and a later command cannot
+			// silently reuse a session this client is no longer attached to.
+			c.setSession(nil)
+			c.noteTurn(false)
+		}
 	case "gw_snapshot":
 		var snap protocol.Snapshot
 		if json.Unmarshal(raw, &snap) == nil {
@@ -574,6 +584,19 @@ func decodeResponse(raw []byte, rec protocol.Record) *Response {
 		Error:   obj.Error,
 		Data:    obj.Data,
 	}
+}
+
+// sessionDetached reports whether a gw_session_state record means the daemon
+// has unbound this connection: the session was deleted, or it was stopped on
+// request (which keeps the file but does not keep the binding). A crash and a
+// hibernation leave the binding alone, so a crashed session can still be
+// reloaded in place.
+func sessionDetached(st protocol.SessionStateEvent) bool {
+	if st.State == protocol.SessionStateDeleted {
+		return true
+	}
+	return st.State == "stopped" &&
+		(st.Reason == protocol.StopReasonRequested || st.Reason == protocol.StopReasonForced)
 }
 
 func (c *Client) pushEvent(e Event) {

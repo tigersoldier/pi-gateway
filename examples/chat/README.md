@@ -28,6 +28,8 @@ a transcript can be piped; prompts, tool summaries and status lines go to
 | `!queue <text>` | queue a follow-up for after the agent settles | `FollowUp` |
 | `!steer <text>` | interject into the running turn | `Steer` |
 | `!abort` | abort the running turn (the queue survives) | `Abort` |
+| `!stop [force]` | stop pi, keeping the session file | `StopSession` |
+| `!delete [force]` | stop pi and delete the session file (irreversible) | `DeleteSession` |
 | `!session` | print the attached session file/name/id | `Session` |
 | `!help`, `!quit` | local help and exit | — |
 
@@ -54,6 +56,9 @@ UI — dialogs are the only part of the CLI that is a stand-in.
 - **Commands and skills** — `get_commands` + `/skill:name` prompts.
 - **Sessions** — `NewSession` (with `cwd`, `name`, `piArgs`) or
   `SwitchSession` by path or name.
+- **Stop and delete** — `!stop`/`!delete` call `StopSession`/`DeleteSession`;
+  the terminal `gw_session_state{state:"deleted"}` clears the binding, so the
+  renderer prints it and `Session()` goes back to nil.
 - **Typed events and dialogs** — `Event.UIRequest` + `BlockingUIMethod` route
   `confirm`/`select`/`input`/`editor` and ignore `set*`; gateway events are
   decoded with `Event.Turn`/`Queue`/`SessionState`/`Lag`.

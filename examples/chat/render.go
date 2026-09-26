@@ -97,7 +97,7 @@ func (r *renderer) Handle(ev gwclient.Event) {
 		}
 	case "gw_session_state":
 		if state, err := ev.SessionState(); err == nil {
-			if state.State == "crashed" || state.State == "stopped" || state.State == "hibernated" {
+			if state.State == "crashed" || state.State == "stopped" || state.State == "hibernated" || state.State == "deleted" {
 				r.waiting.Store(false)
 				r.queued.Store(0)
 			}

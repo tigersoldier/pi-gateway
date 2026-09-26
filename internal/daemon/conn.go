@@ -117,6 +117,10 @@ type conn struct {
 	allowLossy bool
 
 	helloDone bool
+	// deletedUnbound marks a connection the daemon unbound because its session
+	// was deleted (gw_delete_session). A later session-scoped command must not
+	// lazily create a fresh session in its place; binding again is explicit.
+	deletedUnbound atomic.Bool
 
 	mu      sync.Mutex
 	session *session.Actor
@@ -427,7 +431,7 @@ func (c *conn) handleHello(raw []byte) error {
 	// ones the replay window already covered).
 	if actor != nil && attachErr == nil {
 		if err := c.bind(actor, false); err != nil {
-			c.sendError(protocol.CodeSessionCrashed, err.Error())
+			c.sendError(bindErrorCode(err), err.Error())
 			return nil
 		}
 	}
@@ -561,8 +565,14 @@ func (c *conn) bind(a *session.Actor, startLive bool) error {
 	c.gen.Add(1) // invalidate frames queued for the previous binding
 	if !c.d.registerClient(a, c) {
 		sub.Close()
+		if c.d.isTombstoned(canonicalPath(a.Path())) {
+			return errSessionDeleted
+		}
 		return errors.New("session is shutting down")
 	}
+	// Binding deliberately (switch_session, new_session, gw_new_session) clears
+	// the deleted-unbound state: the client asked for a session again.
+	c.deletedUnbound.Store(false)
 	c.mu.Lock()
 	c.session, c.sub = a, sub
 	c.mu.Unlock()
@@ -635,6 +645,17 @@ func (c *conn) pump(s *session.Subscriber, gen, watermark uint64) {
 					return
 				}
 			}
+			if detachTerminal(rec) {
+				if protocol.Field(rec.Raw, "state") == protocol.SessionStateDeleted {
+					c.deletedUnbound.Store(true)
+				}
+				// The session is gone (deleted, or stopped on request), but this
+				// connection survives it: unbind instead of closing, so a bot can
+				// attach or create another session without redialing
+				// (docs/protocol.md §3.10).
+				c.unbind()
+				return
+			}
 		case <-ticker.C:
 			if !co.pending() {
 				continue
@@ -698,6 +719,12 @@ func (c *conn) handleFrame(raw []byte) {
 	case "gw_reload_session":
 		c.handleReload(raw)
 		return
+	case "gw_stop_session":
+		c.handleStop(raw, false)
+		return
+	case "gw_delete_session":
+		c.handleStop(raw, true)
+		return
 	}
 	if protocol.IsGatewayType(typ) {
 		c.sendError(protocol.CodeNotSupported, fmt.Sprintf("%s is not supported by this daemon revision", typ))
@@ -722,6 +749,15 @@ func (c *conn) handleFrame(raw []byte) {
 
 	a := c.bound()
 	if a == nil {
+		if c.deletedUnbound.Load() {
+			// The session this connection was bound to was deleted. Creating a
+			// replacement is explicit (switch_session/new_session/gw_new_session);
+			// a session-scoped command must not silently turn a deleted session
+			// into a fresh one (docs/protocol.md §3.10).
+			c.sendResponse(id, typ, false, protocol.CodeUnknownSession,
+				"session was deleted; attach or create a session explicitly", nil)
+			return
+		}
 		// Lazy binding: the first session-scoped command creates a session
 		// (pilish's fresh-session flow).
 		actor, ok := c.bindNew(id, typ, c.piSpec, c.cwd)
@@ -752,7 +788,7 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 		return
 	}
 	if err := c.bind(actor, true); err != nil {
-		c.sendResponse(id, "switch_session", false, protocol.CodeSessionCrashed, err.Error(), nil)
+		c.sendResponse(id, "switch_session", false, bindErrorCode(err), err.Error(), nil)
 		return
 	}
 	c.sendResponse(id, "switch_session", true, "", "", []byte(`{"cancelled":false}`))
@@ -776,7 +812,7 @@ func (c *conn) bindNew(id, command string, spec *piargs.Spec, cwd string) (*sess
 		return nil, false
 	}
 	if err := c.bind(actor, true); err != nil {
-		c.sendResponse(id, command, false, protocol.CodeSessionCrashed, err.Error(), nil)
+		c.sendResponse(id, command, false, bindErrorCode(err), err.Error(), nil)
 		return nil, false
 	}
 	return actor, true

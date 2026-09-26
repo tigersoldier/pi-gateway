@@ -23,17 +23,17 @@ decisions.
 | --- | --- |
 | Binaries | `pi-gatewayd` (daemon), `pi-gateway` (bridge) |
 | Transport/auth | loopback TCP, token file (0600), `--server`/`--port`/`--token-file`, port-file discovery with fallback to `127.0.0.1:7331` |
-| Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags |
+| Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags, and `gw_stop_session`/`gw_delete_session` to release pi or destroy the session (`session_busy`/`session_attached` refusals, `force`, tombstoned paths) |
 | Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags |
-| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise) |
+| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
 | Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
-| Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state`, `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
+| Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state` (including the terminal `deleted`), `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
-| Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics |
+| Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics including `pi_gateway_sessions_deleted_total` |
 | Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome` (including the post-welcome attach error), correlates `Do` responses by id, streams `Events()` or delivers frames through `Config.OnEvent`, exposes a resume cursor (`Cursor`/`LastSeq`/`LeafID`, `Reconnect`), decodes gateway events and extension dialogs with typed accessors, and wraps session/catalog/prompt/interject/dialog plus the rest of pi's command surface (models, thinking, modes, compaction, retry, `bash` streaming, entries/tree/stats/export, `set_session_name`, images), so a bot in another Go module can import the client instead of reimplementing it; `examples/chat` is a runnable CLI built only on it |
-| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session` requires `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
+| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session`/`gw_stop_session`/`gw_delete_session` require `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
 Deferred to M4 (optional, `docs/design.md` §14): session groups across
 daemons, WebSocket transport for non-local clients, and other transport
@@ -303,6 +303,43 @@ unless it is explicitly marked so.
   checks requested keys, so the original hello parameters are safe); and
   making `LiveOnly` suppress reconnect replay (Reconnect exists to close the
   gap, so it clears it).
+- **Session stop and delete** (operator requirement: `gw_stop_session` and
+  `gw_delete_session`, one mechanism with two file dispositions). `gwclient`
+  gave a per-conversation bot hibernation-on-idle but no way to release a pi
+  process early (its own concurrency cap) or to destroy a session a user
+  deleted in chat, so the open *explicit session release* item is resolved.
+  Both commands are `admin`, session-scoped, and answered on the requester's
+  own connection. The request goes through the actor mailbox, so it linearizes
+  with prompts, turns and attaches: a concurrent attach is either bound-first
+  (then notified and unbound) or `unknown_session`, never a third state. A
+  running turn refuses with the new `session_busy` unless `force`, which aborts
+  and settles pi or stops it at the grace (`defaultStopGrace` 5s, overridable
+  through `Config.StopGrace` for tests). A stop with other clients attached
+  refuses with the new `session_attached` unless forced; a delete never blocks
+  on attached clients — one stale UI must not make a session undeletable — so
+  they are notified with `gw_session_state{state:"deleted"}` and unbound. The
+  daemon removes the file after `Actor.Finished()` (pi reaped, flush done):
+  exactly one file, plus its `--<encoded-cwd>--` directory when empty, and the
+  path is tombstoned for the daemon's lifetime so neither a repeat delete nor
+  an attach can resurrect it. A path that is not a registered session or a
+  scanned session file is refused, so the command cannot delete arbitrary
+  files. Connections unbound by a deletion refuse session-scoped commands
+  until the client attaches or creates explicitly; the bridge turns that into
+  a pi-shaped error and closes the UI stream. `gwclient` gained
+  `StopSession`/`DeleteSession` and clears the binding and turn latch on the
+  terminal events; `fakepi` gained observable aborts (`FAKEPI_ABORT_MARKER`),
+  a controllable slow settle (`FAKEPI_ABORT_SLOW_MS`), abort-ignore, and a
+  shutdown flush (`FAKEPI_FLUSH_ON_EXIT`) for the resurrection guard.
+  Evidence: `go test -race ./...` green (183 tests, +17), `gofmt -l .` and
+  `go vet ./...` clean, the fake e2e lane green, and each new regression test
+  checked to fail with its fix reverted. Rejected: refusing a delete while
+  clients are attached (notification was the requirement, and a stale tab
+  would make `/delete` impossible); letting `force` mean "ignore other
+  clients" for stop (a forced stop detaches them, but an unforced stop is a
+  resource action); closing affected connections instead of unbinding them
+  (throwing away a bot's connection mid-reply is worse than an unbound one);
+  and deleting the file from inside `shutdown()` (pi flushes during its own
+  shutdown, so the file must go after the reap).
 
 ### Open
 
@@ -314,10 +351,6 @@ is implemented.
 The v0.1.0 library review also named gaps that are **not** library fixes and
 stay open as separate decisions:
 
-- **Explicit session release.** There is no stop/hibernate/delete command, so
-  a per-conversation bot cannot release a session (pi process plus file) early;
-  idle hibernation is the only path. A `gw_stop_session` (admin, idle and
-  unattached only) is the smallest useful shape.
 - **Durable creator tags.** `createdBy`/tags live in daemon memory, so
   `gw_list_sessions` creator filtering only describes sessions the running
   daemon saw created; persisting them in the session file is the fix.
@@ -368,7 +401,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (166 tests, a few minutes)
+go test -race ./...                       # everything (183 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

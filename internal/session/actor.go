@@ -47,6 +47,9 @@ type Params struct {
 	SessionPath string   // known path; empty for implicit creation
 	IdleTimeout time.Duration
 	ShortGrace  time.Duration
+	// StopGrace bounds a forced stop's wait for the running turn to settle;
+	// 0 uses defaultStopGrace.
+	StopGrace   time.Duration
 	HubCapacity int
 	SessionID   string // gw_session value before a path is known
 	Log         gwlog.Logger
@@ -81,6 +84,12 @@ var (
 	// ErrReloadBusy is returned when gw_reload_session is refused because a
 	// turn is running or another client is attached.
 	ErrReloadBusy = errors.New("session: reload refused while busy")
+	// ErrSessionBusy is returned when a stop/delete is refused because a turn
+	// is running and force was not set.
+	ErrSessionBusy = errors.New("session: a turn is running")
+	// ErrSessionAttached is returned when gw_stop_session is refused because
+	// other clients are attached and force was not set.
+	ErrSessionAttached = errors.New("session: other clients are attached")
 )
 
 const (
@@ -91,11 +100,17 @@ const (
 	stateHibernated = "hibernated"
 	stateStopped    = "stopped"
 	stateCrashed    = "crashed"
+	// stateDeleted is the terminal state of gw_delete_session: the session
+	// file is gone and the session is unusable (docs/protocol.md §5.2).
+	stateDeleted = protocol.SessionStateDeleted
 
 	turnIdle    = "idle"
 	turnRunning = "running"
 
 	defaultCloseGrace = 2 * time.Second
+	// defaultStopGrace bounds how long a forced stop waits for a running turn
+	// to settle after `abort` before pi is stopped anyway.
+	defaultStopGrace = 5 * time.Second
 )
 
 // globalMutations are client commands that change shared session state; their
@@ -150,6 +165,41 @@ type restartReq struct {
 	done      chan error
 }
 
+// StopRequest asks the actor to stop pi and terminate the session (the daemon
+// operation behind gw_stop_session and gw_delete_session).
+type StopRequest struct {
+	// Force lets a running turn be aborted and attached clients be detached.
+	Force bool
+	// Requester is the client that asked; it does not count as an attached
+	// client, mirroring gw_reload_session.
+	Requester string
+	// Delete selects the terminal `deleted` state: the daemon removes the
+	// session file after the actor has finished.
+	Delete bool
+}
+
+// StopResult reports what a stop or delete actually did.
+type StopResult struct {
+	Path            string
+	Name            string
+	SessionID       string
+	PiStopped       bool
+	DetachedClients int
+}
+
+// stopReq is one stop request traveling through the actor mailbox.
+type stopReq struct {
+	force     bool
+	requester string
+	deleted   bool
+	done      chan stopOutcome
+}
+
+type stopOutcome struct {
+	result StopResult
+	err    error
+}
+
 type actorMsg struct {
 	cmd       *ClientCommand
 	attach    Client
@@ -158,6 +208,7 @@ type actorMsg struct {
 	call      *callReq
 	apply     *applyReq
 	restart   *restartReq
+	stop      *stopReq
 	info      chan Info
 }
 
@@ -203,6 +254,15 @@ type Actor struct {
 	pendingUI         map[string]*uiPending
 	lastActive        map[string]time.Time
 	restarting        bool
+
+	// terminalState is what shutdown publishes (stateStopped, or stateDeleted
+	// for gw_delete_session). pendingStop is the forced stop waiting for the
+	// aborted turn to settle, bounded by stopGrace.
+	terminalState string
+	pendingStop   *stopReq
+	stopResult    StopResult
+	stopGrace     *time.Timer
+	stopGraceC    <-chan time.Time
 
 	timer      *time.Timer
 	timerArmed bool
@@ -463,6 +523,36 @@ func (a *Actor) Restart(force bool, requesterID string, by *protocol.ClientRef, 
 	}
 }
 
+// StopSession stops pi and terminates the session (the daemon operation behind
+// gw_stop_session and gw_delete_session). It returns once the actor has begun
+// its terminal shutdown; the daemon waits for Finished before touching the
+// session file. It is refused with ErrSessionBusy while a turn is running and
+// with ErrSessionAttached while other clients are attached, unless Force is
+// set.
+func (a *Actor) StopSession(req StopRequest, timeout time.Duration) (StopResult, error) {
+	r := &stopReq{force: req.Force, requester: req.Requester, deleted: req.Delete, done: make(chan stopOutcome, 1)}
+	if !a.send(actorMsg{stop: r}) {
+		return StopResult{}, ErrStopped
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case out := <-r.done:
+		return out.result, out.err
+	case <-t.C:
+		return StopResult{}, ErrCallTimeout
+	case <-a.finished:
+		// Stopping finishes the actor, so both channels can be ready at once:
+		// prefer the outcome the actor queued before it exited.
+		select {
+		case out := <-r.done:
+			return out.result, out.err
+		default:
+			return StopResult{}, ErrStopped
+		}
+	}
+}
+
 // Info returns a snapshot for welcome messages.
 func (a *Actor) Info() Info {
 	reply := make(chan Info, 1)
@@ -520,6 +610,10 @@ func (a *Actor) loop() {
 		case <-a.timer.C:
 			a.timerArmed = false
 			a.handleIdle()
+		case <-a.stopGraceC:
+			if a.pendingStop != nil {
+				a.finishStop(a.pendingStop, a.stopResult)
+			}
 		case <-a.stopCh:
 			a.dead = true
 		}
@@ -528,6 +622,10 @@ func (a *Actor) loop() {
 }
 
 func (a *Actor) shutdown() {
+	terminal := a.terminalState
+	if terminal == "" {
+		terminal = stateStopped
+	}
 	if a.stopReason == "" {
 		a.stopReason = stateStopped
 	}
@@ -537,8 +635,8 @@ func (a *Actor) shutdown() {
 	a.failPendingCalls()
 	a.failInternalCallbacks()
 	// Publish before closing the subscribers, or nobody sees the final state.
-	a.setState(stateStopped)
-	a.publishState(stateStopped, a.stopReason, nil)
+	a.setState(terminal)
+	a.publishState(terminal, a.stopReason, nil)
 	a.hub.CloseAll()
 	if a.OnStopped != nil {
 		a.OnStopped(a, a.stopReason)
@@ -562,6 +660,8 @@ func (a *Actor) handleMsg(m actorMsg, events <-chan protocol.Record, done <-chan
 		a.applyRuntime(m.apply)
 	case m.restart != nil:
 		return a.handleRestart(m.restart, events, done)
+	case m.stop != nil:
+		a.handleStop(m.stop)
 	case m.info != nil:
 		m.info <- a.info()
 	}
@@ -824,6 +924,11 @@ func (a *Actor) startTurn(author *protocol.ClientRef) {
 }
 
 func (a *Actor) onSettled() {
+	if a.pendingStop != nil {
+		// A forced stop was waiting for this turn to unwind.
+		a.finishStop(a.pendingStop, a.stopResult)
+		return
+	}
 	if a.turnState == turnRunning {
 		a.metrics.Inc(metrics.TurnsSettled)
 		a.turnState = turnIdle
@@ -1059,6 +1164,14 @@ func (a *Actor) handlePiExit() {
 	if a.dead {
 		return
 	}
+	if a.pendingStop != nil {
+		// pi exited (or was already gone) while a forced stop was waiting for
+		// the aborted turn: the stop is complete, and the terminal state is
+		// the stop's, not a crash.
+		a.metrics.Inc(metrics.PiExits)
+		a.finishStop(a.pendingStop, a.stopResult)
+		return
+	}
 	a.setState(stateCrashed)
 	a.stopReason = stateCrashed
 	a.metrics.Inc(metrics.PiExits)
@@ -1187,6 +1300,103 @@ func (a *Actor) startInternal(command string, cb func(protocol.Record)) {
 		delete(a.internalCallbacks, id)
 		cb(protocol.Record{})
 	}
+}
+
+// handleStop validates a stop request and either refuses it or begins the
+// terminal sequence: the daemon queue is discarded, attached clients are
+// detached (their connections stay open, they are only unbound), and a
+// running turn is aborted and given a bounded grace to settle before pi is
+// stopped anyway.
+func (a *Actor) handleStop(req *stopReq) {
+	if a.dead || a.pendingStop != nil {
+		req.done <- stopOutcome{err: ErrStopped}
+		return
+	}
+	switch a.state {
+	case stateReady, stateCrashed, stateRestarting:
+	default:
+		req.done <- stopOutcome{err: ErrStopped}
+		return
+	}
+	others := 0
+	for id := range a.clients {
+		if id != req.requester {
+			others++
+		}
+	}
+	if a.turnState == turnRunning && !req.force {
+		req.done <- stopOutcome{err: ErrSessionBusy}
+		return
+	}
+	// Deleting a session never blocks on attached clients: they are notified
+	// and unbound (docs/protocol.md §3.10). Stopping pi under an active user
+	// is a resource action, so it refuses unless forced.
+	if !req.deleted && !req.force && others > 0 {
+		req.done <- stopOutcome{err: ErrSessionAttached}
+		return
+	}
+	res := StopResult{
+		Path:            a.path,
+		Name:            a.sessionName,
+		SessionID:       a.sessionID,
+		PiStopped:       a.pi != nil,
+		DetachedClients: others,
+	}
+	a.terminalState = stateStopped
+	if req.deleted {
+		a.terminalState = stateDeleted
+	}
+	a.stopReason = protocol.StopReasonRequested
+	if req.force {
+		a.stopReason = protocol.StopReasonForced
+	}
+	// Discard the daemon queue and the prompts already forwarded from it, and
+	// republish the empty queue before anything else: no queued prompt may
+	// start a turn in a session that is going away.
+	a.discardQueue()
+	for id := range a.clients {
+		a.detachClient(id)
+	}
+	if a.turnState == turnRunning && a.pi != nil {
+		// Forced stop of a running turn: ask pi to abort, then wait for it to
+		// settle, bounded by the grace.
+		a.pendingStop = req
+		a.stopResult = res
+		a.startInternal("abort", func(protocol.Record) {})
+		a.stopGrace = time.NewTimer(a.stopGraceDuration())
+		a.stopGraceC = a.stopGrace.C
+		return
+	}
+	a.finishStop(req, res)
+}
+
+// finishStop delivers the stop outcome and marks the actor for shutdown; the
+// loop exits after the current handler returns, publishing the terminal state.
+func (a *Actor) finishStop(req *stopReq, res StopResult) {
+	if a.stopGrace != nil {
+		a.stopGrace.Stop()
+		a.stopGrace, a.stopGraceC = nil, nil
+	}
+	a.pendingStop = nil
+	req.done <- stopOutcome{result: res}
+	a.dead = true
+}
+
+func (a *Actor) stopGraceDuration() time.Duration {
+	if a.params.StopGrace > 0 {
+		return a.params.StopGrace
+	}
+	return defaultStopGrace
+}
+
+// discardQueue drops the daemon-owned queue and the prompts already forwarded
+// from it, and republishes the empty queue.
+func (a *Actor) discardQueue() {
+	a.queue.Clear()
+	for id := range a.queueRuns {
+		delete(a.queueRuns, id)
+	}
+	a.publishQueue()
 }
 
 // handleRestart stops and respawns pi for the same session file. It runs on
