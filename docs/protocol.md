@@ -595,7 +595,9 @@ implementation.
 ## 7. Extension UI
 
 `extension_ui_request` is forwarded to clients; `extension_ui_response` is
-validated and forwarded to pi.
+validated and forwarded to pi. As with pi, the answer echoes the **dialog's
+`id`** (the daemon does not require a separate `requestId`), and the response
+frame carries that same id.
 
 - Fire-and-forget methods (`notify`, `setStatus`, `setWidget`, `setTitle`,
   `set_editor_text`) are broadcast.

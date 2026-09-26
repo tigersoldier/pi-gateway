@@ -1059,7 +1059,7 @@ func (a *Actor) handlePiExit() {
 	if a.dead {
 		return
 	}
-	a.state = stateCrashed
+	a.setState(stateCrashed)
 	a.stopReason = stateCrashed
 	a.metrics.Inc(metrics.PiExits)
 	a.publishState(stateCrashed, reason, &code)

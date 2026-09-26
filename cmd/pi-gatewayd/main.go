@@ -151,25 +151,7 @@ Debug listener (read-only, unauthenticated, loopback): /status /catalog /metrics
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-hup:
-				updated, err := config.LoadTokens(grantsPath)
-				if err != nil {
-					log.Error("token reload failed", "err", err, "tokensFile", grantsPath)
-					continue
-				}
-				if err := d.SetTokens(updated); err != nil {
-					log.Error("token reload rejected", "err", err)
-					continue
-				}
-				log.Info("tokens reloaded", "tokens", strings.Join(d.TokenNames(), ","))
-			}
-		}
-	}()
+	go watchTokens(ctx, hup, grantsPath, d, log)
 
 	if err := d.Serve(ctx); err != nil {
 		fatal(err)
@@ -276,4 +258,32 @@ func (s *stringList) Set(value string) error {
 	}
 	s.Values = append(s.Values, value)
 	return nil
+}
+
+// watchTokens applies the token table on every SIGHUP-style signal until ctx
+// ends. Extracted so the reload path is testable without sending real signals.
+func watchTokens(ctx context.Context, hup <-chan os.Signal, path string, d *daemon.Daemon, log gwlog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			reloadTokens(path, d, log)
+		}
+	}
+}
+
+// reloadTokens re-reads the restricted-token file and swaps the daemon's table.
+// A bad file or a rejected table leaves the running table untouched.
+func reloadTokens(path string, d *daemon.Daemon, log gwlog.Logger) {
+	updated, err := config.LoadTokens(path)
+	if err != nil {
+		log.Error("token reload failed", "err", err, "tokensFile", path)
+		return
+	}
+	if err := d.SetTokens(updated); err != nil {
+		log.Error("token reload rejected", "err", err)
+		return
+	}
+	log.Info("tokens reloaded", "tokens", strings.Join(d.TokenNames(), ","))
 }

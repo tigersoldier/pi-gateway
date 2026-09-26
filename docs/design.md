@@ -754,6 +754,22 @@ arbitration) has been removed.
   reading; assert `gw_session_state`, disconnect/resync, and that pi latency is
   unaffected for healthy clients. A replay window too large for the connection's
   out queue must resync from a snapshot instead of closing the client.
+- **Control surfaces**: `gw_ping`/`gw_pong` and `gw_bye` (the connection goes,
+  the session stays); `switch_session`/`new_session` answer pi-shaped
+  `data.cancelled`; `gw_list_sessions` honours `filter.live` and `filter.cwd`;
+  `steer` is forwarded while `follow_up` is queued and listed by `gw_queue`;
+  `abort` leaves the daemon queue intact, so a queued follow-up still runs;
+  dialogs reach the turn author and never a client without `ui`.
+- **Slow consumer / lossy delivery**: a client that stops reading while a long
+  turn streams is dropped (its connection and subscription disappear while the
+  session and its other clients survive); an `allowLossy` client that falls
+  behind and catches up is told with `gw_lag` before the next record and keeps
+  its connection. Terminal records are never dropped, so a client still behind
+  when a turn ends is closed instead.
+- **Operations wiring**: SIGHUP reloads a provisioned token without a restart
+  and a broken `tokens.json` leaves the live table intact; the shipped systemd
+  unit keeps `Type=simple`, `Restart=on-failure`, `ExecReload` SIGHUP and
+  `KillSignal=SIGTERM`.
 - **Single-writer invariant**: attaching while a reload is mid-restart joins the
   reloading actor; assert one pi process and one catalog row for the session
   file, and that runtime parameters applied on attach are attributed to the
