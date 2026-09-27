@@ -27,7 +27,7 @@ func RoleCapabilities(role string) ([]string, bool) {
 	case RoleAdmin:
 		return append([]string(nil), AllCapabilities...), true
 	case RoleOperator:
-		return []string{CapObserve, CapInterject, CapPrompt, CapUI}, true
+		return []string{CapObserve, CapInterject, CapPrompt, CapContext, CapUI}, true
 	case RoleObserver:
 		return []string{CapObserve}, true
 	}
@@ -55,6 +55,10 @@ func CommandCapability(command string) string {
 	// anyway; `switch_session` may start pi for a hibernated session.
 	case "prompt", "follow_up", "new_session", "fork", "clone", "bash", "switch_session":
 		return CapPrompt
+	// Writing into the session's context without being seen as the person
+	// typing (non-turn injection).
+	case "inject":
+		return CapContext
 	// Interjecting into (or cancelling) a running turn.
 	case "steer", "abort", "abort_bash", "abort_retry", "clear_queue":
 		return CapInterject

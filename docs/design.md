@@ -109,12 +109,13 @@ Settled deployment facts:
 - **Packaging is configuration, not shadowing.** UIs point their pi-executable
   setting at the client (`pilish-executable`, `pilish/remote-executables`). The
   client forwards pi parameters to the daemon; the daemon accepts common pi
-  parameters for the pi it manages. If a session is live, runtime-applicable
-  parameters are applied via RPC, and a spawn-only parameter that differs from
-  the session's recorded spawn config fails the attach (identical values are
-  no-ops). Non-RPC invocations are limited to `--version`/`--help`, which the
-  daemon answers from the real pi binary it manages; the client prints the
-  output and exits. Every other non-RPC mode (including TUI) errors.
+  parameters for the pi it manages. A session's spawn-only parameters are
+  **durable**: recorded by the daemon and re-applied on every respawn, with a
+  differing value for a recorded key failing the attach and a key the session
+  never recorded being ignored (identical values are no-ops). Non-RPC
+  invocations are limited to `--version`/`--help`, which the daemon answers
+  from the real pi binary it manages; the client prints the output and exits.
+  Every other non-RPC mode (including TUI) errors.
 
 The canonical, up-to-date decision log lives in `docs/development.md` under
 **Decision log**. As of this writing every decision is resolved except the
@@ -538,18 +539,46 @@ rewritten.
 Accepted from the client: the set listed in `docs/protocol.md` §4.3,
 including pi's short aliases (`-a`, `-nt`, `-t`, `-n`, …) and `--models`,
 `--offline`, `--verbose`. Aliases record the same canonical parameter as their
-long form. Other pi options — session selection and one-shot modes the gateway
+long form. `--approve` and `--no-approve` are one setting with opposite
+values. Other pi options — session selection and one-shot modes the gateway
 owns — are rejected.
 
-- Not-live session: all accepted parameters apply at spawn.
+**Spawn configuration is durable.** The spawn-only parameters (and spawn
+`cwd`) a session was created with are persisted by the daemon in a sidecar
+keyed by the canonical session path, never in pi's session file and never only
+in memory. This closes the defect where a hibernated or daemon-restarted
+session silently lost its `--append-system-prompt`, and the risk that the
+first client to attach after a restart decides how pi is spawned.
+
+- Not-live session: the recorded spawn-only values win; the requester's
+  arguments fill canonical keys the record never set; its runtime parameters
+  apply at spawn.
 - Live session: runtime-applicable parameters (`--model`, `--provider`,
   `--thinking`, `--name`) are applied via RPC and change shared session state
   (confirmed session-global; all clients get `gw_state_changed`).
-- Spawn-only parameters are compared with the session's recorded spawn config:
-  identical values are no-ops, a differing value fails the attach with
-  `spawn_param_conflict`. (Required because pilish re-sends `--approve`.)
+- Spawn-only parameters are compared with the recorded configuration:
+  identical values are no-ops; a differing value for a key the record owns
+  fails the attach with `spawn_param_conflict`. A key the record never set is
+  ignored rather than refused, so a client is never forced to choose between
+  installing its parameters and attaching (R5). (Required because pilish
+  re-sends `--approve`.)
+- `gw_delete_session` removes the record, `fork`/`clone` copies it, and
+  `gw_reload_session{piArgs}` replaces it deliberately.
 
-### 6.4 Global mutations
+### 6.4 Context injection
+
+`inject` appends a custom (non-user) message to a live session's context
+without starting a turn. It is a daemon-transformed command: the nested
+`message` is hoisted onto pi's `send_message` primitive, `triggerTurn` is
+forced false, and the response is translated back with the `inject` command
+name and `{queued:true}`. The daemon owns the optional `dedupeKey` (a retry
+after a reconnect must not duplicate the instruction), and pi owns the
+session file and the context — the gateway never writes either behind pi's
+back. Where `prompt`/`steer`/`follow_up` are user messages that can start or
+join work, an injection is context the model sees but no participant typed.
+It is capability `context`, separate from `prompt`.
+
+### 6.5 Global mutations
 
 Shared-state commands (`set_model`, `cycle_model`, `set_thinking_level`,
 `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`,
@@ -558,7 +587,7 @@ Shared-state commands (`set_model`, `cycle_model`, `set_thinking_level`,
 Per-connection changes (`switch_session`, `new_session`, sole-client
 `fork`/`clone`) rebind only the requester and do not notify others.
 
-### 6.5 Response semantics
+### 6.6 Response semantics
 
 `success: true` on `prompt` means **accepted or queued**, not complete. Clients
 wait for `agent_settled` (or `gw_turn{state:"settled"}`). Responses are

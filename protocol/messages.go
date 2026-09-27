@@ -83,6 +83,7 @@ type Welcome struct {
 	ClientID       string          `json:"clientId"`
 	Kind           string          `json:"kind,omitempty"`
 	Granted        []string        `json:"granted"`
+	Features       []string        `json:"features"`
 	PiVersion      string          `json:"piVersion,omitempty"`
 	Concurrency    string          `json:"concurrency"`
 	Session        *SessionRef     `json:"session"`
@@ -92,6 +93,20 @@ type Welcome struct {
 	PiState        json.RawMessage `json:"piState"`
 	Turn           TurnState       `json:"turn"`
 	Clients        []ClientSummary `json:"clients"`
+}
+
+// Gateway features advertised in gw_welcome.features. A client uses them to
+// detect a gateway revision's command surface without probing. `inject` names
+// the gateway's context command; the managed pi may still answer
+// `not_supported` when it lacks the underlying RPC primitive.
+const (
+	FeatureInject      = "inject"
+	FeatureSpawnConfig = "spawn_config"
+)
+
+// GatewayFeatures lists the features every daemon revision advertises.
+func GatewayFeatures() []string {
+	return []string{FeatureInject, FeatureSpawnConfig}
 }
 
 // TurnEvent is a gw_turn lifecycle notification.
@@ -190,6 +205,7 @@ const (
 	CapObserve   = "observe"
 	CapInterject = "interject"
 	CapPrompt    = "prompt"
+	CapContext   = "context"
 	CapUI        = "ui"
 	CapControl   = "control"
 	CapAdmin     = "admin"
@@ -197,7 +213,7 @@ const (
 
 // AllCapabilities is the full capability set granted by the default token; it
 // is also what the bridge requests on a UI's behalf.
-var AllCapabilities = []string{CapObserve, CapInterject, CapPrompt, CapUI, CapControl, CapAdmin}
+var AllCapabilities = []string{CapObserve, CapInterject, CapPrompt, CapContext, CapUI, CapControl, CapAdmin}
 
 // NewError builds a gw_error frame.
 func NewError(code, msg string) ErrorEvent {

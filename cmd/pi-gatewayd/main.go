@@ -119,6 +119,7 @@ Debug listener (read-only, unauthenticated, loopback): /status /catalog /metrics
 		IdleTimeout:  *idleTimeout,
 		ShortGrace:   *shortGrace,
 		CatalogRoots: sessionDirs.Values,
+		StateDir:     dir,
 		DeltaFlush:   *deltaFlush,
 		Log:          log,
 		Metrics:      metrics.New(),

@@ -274,3 +274,36 @@ func TestBashStreamsUpdates(t *testing.T) {
 		t.Fatalf("bash update = %+v (result id %s)", updates[0], res.ID)
 	}
 }
+
+// TestInjectRoundTrip covers the typed Inject helper and the daemon's
+// `inject`→`send_message` translation: the response is the client-facing
+// command with a queued payload.
+func TestInjectRoundTrip(t *testing.T) {
+	c := dial(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	display := false
+	resp, err := c.Inject(ctx, gwclient.InjectRequest{
+		CustomType: "gwclient/test",
+		Content:    "the retry logic is off limits",
+		Display:    &display,
+		DeliverAs:  "nextTurn",
+		DedupeKey:  "gwclient:1",
+	})
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	if resp.Command != "inject" {
+		t.Fatalf("response command = %q, want inject", resp.Command)
+	}
+	var out struct {
+		Queued bool `json:"queued"`
+	}
+	if err := resp.Decode(&out); err != nil || !out.Queued {
+		t.Fatalf("inject data = %s (%v), want queued:true", resp.Data, err)
+	}
+	if !c.HasFeature(protocol.FeatureInject) {
+		t.Fatalf("daemon does not advertise %s: %v", protocol.FeatureInject, c.Features())
+	}
+}

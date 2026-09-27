@@ -148,6 +148,9 @@ func (c *conn) handleStop(raw []byte, deleteFile bool) {
 		}
 		fileDeleted = removed
 		c.d.metrics.Inc(metrics.SessionsDeleted)
+		// The session is gone: drop its durable spawn configuration so a later
+		// session created at the same path does not inherit it.
+		c.d.spawn.Delete(canon)
 		c.d.log.Info("session deleted",
 			"session", res.Path, "name", res.Name, "client", c.id, "kind", c.Kind(),
 			"force", req.Force, "detachedClients", res.DetachedClients, "fileDeleted", removed)

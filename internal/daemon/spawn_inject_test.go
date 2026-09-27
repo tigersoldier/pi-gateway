@@ -1,0 +1,349 @@
+package daemon_test
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tigersoldier/pi-gateway/internal/daemon"
+	"github.com/tigersoldier/pi-gateway/internal/gwtest"
+	"github.com/tigersoldier/pi-gateway/internal/testutil"
+	"github.com/tigersoldier/pi-gateway/protocol"
+)
+
+// startDaemonWithState runs a daemon whose durable spawn state and catalog
+// live at the caller-provided directories, so a test can stop it and start a
+// second daemon over the same state (the daemon-restart case). startDaemonOpts
+// cannot do this because gwtest gives every daemon a fresh StateDir.
+func startDaemonWithState(t *testing.T, stateDir, sessionsDir string, mutate func(*daemon.Config)) (addr string, stop func()) {
+	t.Helper()
+	piBin, err := testutil.FakePi()
+	if err != nil {
+		t.Skipf("cannot build fake pi: %v", err)
+	}
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", sessionsDir)
+	cfg := daemon.Config{
+		Addr:     "127.0.0.1:0",
+		Token:    testToken,
+		PiBin:    piBin,
+		StateDir: stateDir,
+		Log:      gwtest.Logger(t),
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	d := daemon.New(cfg)
+	if err := d.Listen(); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = d.Serve(ctx)
+	}()
+	stop = func() {
+		cancel()
+		<-done
+		d.Shutdown()
+	}
+	t.Cleanup(stop)
+	return d.Addr().String(), stop
+}
+
+// waitForArgs polls the fake pi argv marker written by the first pi process
+// whose command line mentions want, and returns the full argv.
+func waitForArgsFile(t *testing.T, path string) string {
+	t.Helper()
+	deadline := time.Now().Add(testutil.DefaultTimeout)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+			return string(b)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no fake pi argv at %s", path)
+	return ""
+}
+
+// TestSpawnConfigSurvivesDaemonRestart is the P2 regression: a session created
+// with --append-system-prompt must be respawned with that parameter by a fresh
+// daemon that only knows the session file, even when the attaching client
+// passes no parameters (the G3 defect).
+func TestSpawnConfigSurvivesDaemonRestart(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	path := filepath.Join(sessionsDir, "spawn-restart.jsonl")
+
+	addr, stop := startDaemonWithState(t, stateDir, sessionsDir, nil)
+	a := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "one"}
+	})
+	if w := a.WaitType("gw_welcome", testutil.DefaultTimeout); w["session"] == nil {
+		t.Fatalf("attach failed: %v", w)
+	}
+	argv := waitForArgsFile(t, argsFile)
+	if !strings.Contains(argv, "one") {
+		t.Fatalf("first spawn argv does not carry the prompt: %q", argv)
+	}
+	a.Close()
+	stop()
+
+	// A new daemon, same durable state, no parameters from the client.
+	_ = os.Remove(argsFile)
+	addr2, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+	b := dial(t, addr2, func(h *protocol.Hello) { h.Session = path })
+	w := b.WaitType("gw_welcome", testutil.DefaultTimeout)
+	if w["session"] == nil {
+		t.Fatalf("re-attach failed: %v", w)
+	}
+	argv = waitForArgsFile(t, argsFile)
+	if !strings.Contains(argv, "one") {
+		t.Fatalf("respawn lost the recorded spawn parameter: %q", argv)
+	}
+}
+
+// TestColdAttachMergesUnrecordedSpawnKeys pins the merge rule: a recorded key
+// wins, and a key the record never set is filled in from the requester when
+// the session is cold.
+func TestColdAttachMergesUnrecordedSpawnKeys(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	path := filepath.Join(sessionsDir, "spawn-merge.jsonl")
+
+	addr, stop := startDaemonWithState(t, stateDir, sessionsDir, nil)
+	a := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "one"}
+	})
+	a.WaitType("gw_welcome", testutil.DefaultTimeout)
+	waitForArgsFile(t, argsFile)
+	a.Close()
+	stop()
+
+	// The requester asks for a different value for the recorded key (recorded
+	// wins) and a key that was never recorded (filled in).
+	_ = os.Remove(argsFile)
+	addr2, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+	b := dial(t, addr2, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "two", "-e", "/x.ts"}
+	})
+	if w := b.WaitType("gw_welcome", testutil.DefaultTimeout); w["session"] == nil {
+		t.Fatalf("attach failed: %v", w)
+	}
+	argv := waitForArgsFile(t, argsFile)
+	if strings.Contains(argv, "two") {
+		t.Fatalf("requester overrode a recorded spawn value: %q", argv)
+	}
+	if !strings.Contains(argv, "one") || !strings.Contains(argv, "/x.ts") {
+		t.Fatalf("merged argv = %q, want recorded prompt and new extension", argv)
+	}
+}
+
+// TestLiveAttachIgnoresUnrecordedSpawnKey is R5: a client that passes a spawn
+// parameter the live session never recorded must still attach.
+func TestLiveAttachIgnoresUnrecordedSpawnKey(t *testing.T) {
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	path := filepath.Join(t.TempDir(), "spawn-live.jsonl")
+
+	a := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--approve"}
+	})
+	a.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	b := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"-e", "/x.ts"}
+	})
+	w := b.WaitType("gw_welcome", testutil.DefaultTimeout)
+	if w["session"] == nil {
+		t.Fatalf("unrecorded spawn key must not refuse attachment: %v", w)
+	}
+}
+
+// TestCatalogExposesSpawnConfig is P3: a client can see the recorded spawn
+// configuration before attaching.
+func TestCatalogExposesSpawnConfig(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	path := filepath.Join(sessionsDir, "spawn-catalog.jsonl")
+	addr, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+
+	a := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "hello"}
+	})
+	a.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	a.Send(map[string]any{"type": "gw_list_sessions", "id": "l1"})
+	resp := a.WaitResponse("l1", testutil.DefaultTimeout)
+	sessions := testutil.Arr(testutil.Obj(resp, "data"), "sessions")
+	found := false
+	for _, raw := range sessions {
+		row, _ := raw.(map[string]any)
+		if testutil.Str(row, "path") != path {
+			continue
+		}
+		found = true
+		spawn := testutil.Obj(row, "spawn")
+		if got := testutil.StrSlice(spawn, "append-system-prompt"); len(got) != 1 || got[0] != "hello" {
+			t.Fatalf("row spawn = %v, want append-system-prompt hello", spawn)
+		}
+	}
+	if !found {
+		t.Fatalf("session %s not in catalog: %v", path, sessions)
+	}
+}
+
+// TestWelcomeAdvertisesFeatures is P3: feature detection without probing.
+func TestWelcomeAdvertisesFeatures(t *testing.T) {
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	c := dial(t, addr, nil)
+	w := c.WaitType("gw_welcome", testutil.DefaultTimeout)
+	features := testutil.StrSlice(w, "features")
+	for _, want := range []string{protocol.FeatureInject, protocol.FeatureSpawnConfig} {
+		if !contains(features, want) {
+			t.Fatalf("features = %v, want %q", features, want)
+		}
+	}
+}
+
+// TestInjectNonTurnAndDedupe is P1: injection appends to the context without a
+// turn, and a retried dedupe key is answered without a duplicate.
+func TestInjectNonTurnAndDedupe(t *testing.T) {
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	path := filepath.Join(t.TempDir(), "inject.jsonl")
+	c := dial(t, addr, func(h *protocol.Hello) { h.Session = path })
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	c.Send(map[string]any{
+		"type": "inject", "id": "i1", "deliverAs": "nextTurn", "dedupeKey": "slack:1",
+		"message": map[string]any{
+			"role": "custom", "customType": "pi-chat/context", "display": false,
+			"content": "the retry logic is off limits",
+		},
+	})
+	resp := c.WaitResponse("i1", testutil.DefaultTimeout)
+	if resp["success"] != true || testutil.Str(resp, "command") != "inject" {
+		t.Fatalf("inject response = %v", resp)
+	}
+	if testutil.Obj(resp, "data")["queued"] != true {
+		t.Fatalf("inject data = %v, want queued:true", resp["data"])
+	}
+
+	// The message is in the session file as a custom (non-user) entry.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read session file: %v", err)
+	}
+	if !strings.Contains(string(b), "pi-chat/context") || !strings.Contains(string(b), "retry logic is off limits") {
+		t.Fatalf("injection not persisted:\n%s", b)
+	}
+
+	// A retried dedupe key is a de-duplicated success, not a second entry.
+	c.Send(map[string]any{
+		"type": "inject", "id": "i2", "deliverAs": "nextTurn", "dedupeKey": "slack:1",
+		"message": map[string]any{"role": "custom", "customType": "pi-chat/context", "content": "the retry logic is off limits"},
+	})
+	resp2 := c.WaitResponse("i2", testutil.DefaultTimeout)
+	if resp2["success"] != true || testutil.Obj(resp2, "data")["deduplicated"] != true {
+		t.Fatalf("dedupe response = %v", resp2)
+	}
+	b2, _ := os.ReadFile(path)
+	if strings.Count(string(b2), "pi-chat/context") != 1 {
+		t.Fatalf("dedupe key did not collapse the retry:\n%s", b2)
+	}
+
+	// No turn was started by either injection.
+	for _, f := range c.Drain(150 * time.Millisecond) {
+		switch f["type"] {
+		case "agent_start", "turn_start", "gw_turn":
+			t.Fatalf("inject started a turn: %v", f)
+		}
+	}
+}
+
+// TestInjectReportsNotSupported is P1's dependency answer: a pi without the
+// underlying primitive produces not_supported, not a generic failure.
+func TestInjectReportsNotSupported(t *testing.T) {
+	addr, _ := startDaemonOpts(t, func(c *daemon.Config) {
+		c.IdleTimeout, c.ShortGrace = 30*time.Second, 5*time.Second
+	})
+	t.Setenv("FAKEPI_NO_SEND_MESSAGE", "1")
+	path := filepath.Join(t.TempDir(), "inject-unsupported.jsonl")
+	c := dial(t, addr, func(h *protocol.Hello) { h.Session = path })
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	c.Send(map[string]any{
+		"type": "inject", "id": "i1",
+		"message": map[string]any{"role": "custom", "customType": "x", "content": "hi"},
+	})
+	resp := c.WaitResponse("i1", testutil.DefaultTimeout)
+	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeNotSupported {
+		t.Fatalf("unsupported inject = %v, want not_supported", resp)
+	}
+}
+
+// TestReloadReplacesSpawnConfig is P4: gw_reload_session{piArgs} restarts pi
+// with the new configuration and makes it the durable record.
+func TestReloadReplacesSpawnConfig(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	path := filepath.Join(sessionsDir, "spawn-reload.jsonl")
+	addr, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+
+	c := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "one"}
+	})
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+	waitForArgsFile(t, argsFile)
+
+	_ = os.Remove(argsFile)
+	c.Send(map[string]any{
+		"type": "gw_reload_session", "id": "r1",
+		"piArgs": []string{"--append-system-prompt", "two"},
+	})
+	resp := c.WaitResponse("r1", testutil.DefaultTimeout)
+	if resp["success"] != true {
+		t.Fatalf("reload failed: %v", resp)
+	}
+	argv := waitForArgsFile(t, argsFile)
+	if !strings.Contains(argv, "two") {
+		t.Fatalf("reload did not spawn with the replacement args: %q", argv)
+	}
+
+	c.Send(map[string]any{"type": "gw_list_sessions", "id": "l1"})
+	listResp := c.WaitResponse("l1", testutil.DefaultTimeout)
+	for _, raw := range testutil.Arr(testutil.Obj(listResp, "data"), "sessions") {
+		row, _ := raw.(map[string]any)
+		if testutil.Str(row, "path") != path {
+			continue
+		}
+		got := testutil.StrSlice(testutil.Obj(row, "spawn"), "append-system-prompt")
+		if len(got) != 1 || got[0] != "two" {
+			t.Fatalf("recorded spawn after reload = %v, want two", got)
+		}
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}

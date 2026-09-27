@@ -24,7 +24,7 @@ func TestAttachConflictReturnsError(t *testing.T) {
 	creator := dialTo(t, addr, nil)
 	sess, err := creator.NewSession(ctx, gwclient.NewSessionRequest{
 		Cwd:    t.TempDir(),
-		PiArgs: []string{"--approve"},
+		PiArgs: []string{"-e", "/a.ts"},
 	})
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -32,7 +32,7 @@ func TestAttachConflictReturnsError(t *testing.T) {
 
 	bad, err := gwclient.Dial(ctx, gwclient.Config{
 		Addr: addr, Token: testToken, LiveOnly: true,
-		Session: sess.Path, PiArgs: []string{"--no-approve"},
+		Session: sess.Path, PiArgs: []string{"--extension", "/b.ts"},
 	})
 	var rerr *gwclient.ResponseError
 	if !errors.As(err, &rerr) {

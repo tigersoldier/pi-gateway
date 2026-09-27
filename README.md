@@ -192,13 +192,18 @@ command.
 
 Pick the role for what the integration does, not for what it reads:
 
-- `operator` attaches to existing sessions, prompts, steers, aborts and
-  answers dialogs, but cannot create sessions, name them, or change the model.
+- `operator` attaches to existing sessions, prompts, steers, aborts, injects
+  context (`inject`), and answers dialogs, but cannot create sessions, name
+  them, or change the model.
 - `admin` (the daemon-generated token's level) is needed for
   `gw_new_session`, `gw_stop_session` and `gw_delete_session`, so a bot that
   creates, releases or destroys its own sessions, names them
   (`set_session_name`), or reconfigures them (`set_model`, `compact`, …) needs
   `admin` or an explicit `--token-caps` list containing `admin`/`control`.
+- `context` (granted by `operator` and `admin`) allows `inject`, which writes
+  a non-turn message into the session context — a standing instruction for a
+  chat integration. `gw_welcome.features` tells a client the daemon revision
+  speaks it; `not_supported` means the managed pi cannot deliver it yet.
 
 ### Integrations
 
@@ -208,9 +213,12 @@ bridge. [`docs/protocol.md`](docs/protocol.md) is the reference; the shapes an
 integration needs first:
 
 ```text
-gw_list_sessions -> {"sessions":[{path,name,title,cwd,live,clients,...}]}
+gw_list_sessions -> {"sessions":[{path,name,title,cwd,live,spawn,clients,...}]}
 gw_new_session   -> {"path","name","sessionId"} (the requester is rebound)
-gw_reload_session-> restart pi for a session (control capability)
+gw_reload_session-> restart pi for a session (control capability;
+                    piArgs replaces its recorded spawn configuration)
+inject           -> {"queued":true} append a non-turn message to the context
+                    (context capability; not_supported when pi lacks it)
 ```
 
 A Go integration can import the client library instead of implementing the

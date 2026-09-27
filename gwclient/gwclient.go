@@ -158,6 +158,10 @@ type SessionRow struct {
 	LastActivity string                   `json:"lastActivity,omitempty"`
 	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
 	Clients      []protocol.ClientSummary `json:"clients,omitempty"`
+	// Spawn is the session's recorded spawn-only configuration in canonical
+	// key→values form, so an integration can tell a lost instruction from an
+	// absent one before attaching (docs/protocol.md §3.2, §4.3).
+	Spawn map[string][]string `json:"spawn,omitempty"`
 }
 
 // Event is one frame the daemon sent that was not a response to an
@@ -433,6 +437,21 @@ func (c *Client) ClientID() string { return c.welcome.ClientID }
 // Granted is the capability set the daemon granted (the intersection of the
 // requested set and the token's role).
 func (c *Client) Granted() []string { return append([]string(nil), c.welcome.Granted...) }
+
+// Features is the gateway feature set reported in gw_welcome (docs/protocol.md
+// §2). It names the command surface the daemon revision supports; an empty
+// list means an older daemon.
+func (c *Client) Features() []string { return append([]string(nil), c.welcome.Features...) }
+
+// HasFeature reports whether the daemon advertises a feature.
+func (c *Client) HasFeature(name string) bool {
+	for _, f := range c.welcome.Features {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
 
 // Can reports whether the daemon granted a capability on this connection.
 func (c *Client) Can(capability string) bool {

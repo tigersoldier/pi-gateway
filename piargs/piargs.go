@@ -82,6 +82,59 @@ type Spec struct {
 	// Values maps canonical keys to all values seen (boolean flags record
 	// "true"/"false").
 	Values map[string][]string
+	// groups is the parsed argument list grouped by canonical key, used to
+	// rebuild a canonical spawn configuration (docs/protocol.md §4.3).
+	groups []argGroup
+}
+
+// argGroup is one accepted flag together with the tokens that carry it
+// (either [flag, value] or [flag=value], or a single boolean flag). value is
+// the canonical value the flag stands for: for `--no-approve` it is "false"
+// under the logical key "approve", so the trust setting has one key and
+// `--approve`/`--no-approve` are the same parameter.
+type argGroup struct {
+	key     string
+	tokens  []string
+	value   string
+	runtime bool
+}
+
+// runtimeKeys are the parameters pi can change at runtime; they are applied to
+// a live session through RPC instead of being part of its spawn configuration
+// (docs/protocol.md §4.3).
+func isRuntimeKey(key string) bool {
+	switch key {
+	case KeyModel, KeyProvider, KeyThinking, KeyName:
+		return true
+	}
+	return false
+}
+
+// canonicalFlags maps a canonical key back to its long flag spelling, so a
+// recorded spawn configuration never mixes an alias with its long form.
+var canonicalFlags = func() map[string]string {
+	out := make(map[string]string, len(valueFlags)+len(boolFlags))
+	for flag, key := range valueFlags {
+		if !strings.HasPrefix(flag, "--") {
+			continue
+		}
+		out[key] = flag
+	}
+	for flag, key := range boolFlags {
+		if !strings.HasPrefix(flag, "--") {
+			continue
+		}
+		out[key] = flag
+	}
+	return out
+}()
+
+// negatedBool maps a boolean key to the flag that expresses the opposite
+// state, so a stored "false" can be spelled positively (and a "false" for a
+// negative flag can be dropped when no positive counterpart exists).
+var negatedBool = map[string]string{
+	"approve":    "no-approve",
+	"no-approve": "approve",
 }
 
 // Parse validates args and returns the accepted spec. Every argument must be
@@ -106,12 +159,24 @@ func Parse(args []string) (*Spec, error) {
 				}
 				val = inline
 			}
-			s.Values[key] = append(s.Values[key], val)
-			if !hasInline {
-				s.Args = append(s.Args, flag)
-			} else {
-				s.Args = append(s.Args, flag+"="+val)
+			// `--no-approve` is the same setting as `--approve` with the
+			// opposite value, so a recorded trust setting cannot be silently
+			// contradicted by the other spelling (docs/protocol.md §4.3).
+			if key == "no-approve" {
+				key = "approve"
+				if val == "true" {
+					val = "false"
+				} else {
+					val = "true"
+				}
 			}
+			s.Values[key] = append(s.Values[key], val)
+			tokens := []string{flag}
+			if hasInline {
+				tokens = []string{flag + "=" + val}
+			}
+			s.Args = append(s.Args, tokens...)
+			s.groups = append(s.groups, argGroup{key: key, tokens: tokens, value: val, runtime: isRuntimeKey(key)})
 			continue
 		}
 		key, ok := valueFlags[flag]
@@ -128,6 +193,7 @@ func Parse(args []string) (*Spec, error) {
 		}
 		s.Values[key] = append(s.Values[key], val)
 		s.Args = append(s.Args, flag, val)
+		s.groups = append(s.groups, argGroup{key: key, tokens: []string{flag, val}, value: val, runtime: isRuntimeKey(key)})
 	}
 	return s, nil
 }
@@ -170,6 +236,76 @@ func (s *Spec) RuntimeValues() map[string]string {
 	return out
 }
 
+// SpawnArgs returns the accepted arguments for spawn-only keys, in their
+// original spelling and order.
+func (s *Spec) SpawnArgs() []string {
+	var out []string
+	for _, g := range s.groups {
+		if !g.runtime {
+			out = append(out, g.tokens...)
+		}
+	}
+	return out
+}
+
+// CanonicalSpawnArgs returns the spawn-only arguments in canonical long-flag
+// form, so a persisted configuration can never hold both `-a` and `--approve`.
+// A boolean whose stored value is "false" is written as its opposite flag when
+// one exists, and omitted otherwise (omitting reproduces the default).
+func (s *Spec) CanonicalSpawnArgs() []string {
+	var out []string
+	for _, g := range s.groups {
+		if g.runtime {
+			continue
+		}
+		flag, ok := canonicalFlags[g.key]
+		if !ok {
+			out = append(out, g.tokens...)
+			continue
+		}
+		if len(g.tokens) == 1 {
+			// Boolean flag: emit only the true state, or the opposite flag for a
+			// stored false when one exists (omitting reproduces the default).
+			if g.value == "true" {
+				out = append(out, flag)
+				continue
+			}
+			if opposite, ok := negatedBool[g.key]; ok {
+				if oflag, ok := canonicalFlags[opposite]; ok {
+					out = append(out, oflag)
+				}
+			}
+			continue
+		}
+		out = append(out, flag, g.tokens[1])
+	}
+	return out
+}
+
+// MergeSpawn builds the effective argument list for spawning (or respawning) a
+// session that has a recorded spawn configuration. Recorded spawn-only values
+// win; the requester's spawn-only arguments are appended only for keys the
+// record does not mention; every runtime argument the requester passed is kept
+// so it can be applied via RPC on a live session or at spawn on a cold one
+// (docs/protocol.md §4.3). recordedSpawnArgs must be canonical spawn-only args
+// (CanonicalSpawnArgs), as written by the daemon's spawn sidecar.
+func MergeSpawn(recordedSpawnArgs []string, requested *Spec) []string {
+	recorded, err := Parse(recordedSpawnArgs)
+	if err != nil {
+		// A corrupt record must not stop a session from starting; fall back to
+		// what the requester asked for.
+		return append([]string(nil), requested.Args...)
+	}
+	out := append([]string(nil), recordedSpawnArgs...)
+	for _, g := range requested.groups {
+		if _, has := recorded.Values[g.key]; !g.runtime && has {
+			continue // recorded wins
+		}
+		out = append(out, g.tokens...)
+	}
+	return out
+}
+
 // SpawnValues returns every canonical value except the runtime-applicable
 // ones. These must match a live session's recorded configuration exactly.
 func (s *Spec) SpawnValues() map[string][]string {
@@ -186,30 +322,37 @@ func (s *Spec) SpawnValues() map[string][]string {
 
 // SpawnConflict reports the first spawn-only key whose requested value differs
 // from the recorded session configuration. Values are compared as sets because
-// flag order is not meaningful, and parameters the request does not mention
-// are not conflicts: an omitted parameter means "no preference".
+// flag order is not meaningful. A parameter the request does not mention is not
+// a conflict, and neither is a parameter the record never set: the session
+// keeps what it has, and a client that asks for a spawn value the session was
+// not created with is not refused attachment (docs/protocol.md §4.3).
 func SpawnConflict(recorded, requested map[string][]string) (string, bool) {
 	for key, want := range requested {
-		if !sameValues(recorded[key], want) {
+		rec, ok := recorded[key]
+		if !ok {
+			continue
+		}
+		if !sameValues(rec, want) {
 			return key, true
 		}
 	}
 	return "", false
 }
 
+// sameValues compares values as sets: flag order is not meaningful, and
+// repeating an identical flag (`--approve --approve`) is a no-op, so it must
+// not look like a conflict.
 func sameValues(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	counts := make(map[string]int, len(a))
+	set := make(map[string]bool, len(a))
 	for _, v := range a {
-		counts[v]++
+		set[v] = true
 	}
+	seen := make(map[string]bool, len(b))
 	for _, v := range b {
-		counts[v]--
-		if counts[v] < 0 {
+		if !set[v] {
 			return false
 		}
+		seen[v] = true
 	}
-	return true
+	return len(seen) == len(set)
 }

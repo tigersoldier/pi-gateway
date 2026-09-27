@@ -72,13 +72,27 @@ func TestSpawnConflict(t *testing.T) {
 		t.Fatalf("order-only difference reported as conflict on %q", key)
 	}
 
-	different := &Spec{Values: map[string][]string{"no-approve": {"true"}}}
+	different := &Spec{Values: map[string][]string{"extension": {"/c.ts"}}}
 	key, conflict := SpawnConflict(recorded.Values, different.SpawnValues())
 	if !conflict {
 		t.Fatal("expected conflict")
 	}
-	if key != "no-approve" && key != "approve" {
+	if key != "extension" {
 		t.Fatalf("unexpected conflict key %q", key)
+	}
+
+	// A spawn key the session never set is not a conflict: the record has no
+	// preference, and the session keeps what it has (docs/protocol.md §4.3).
+	extra := &Spec{Values: map[string][]string{"offline": {"true"}}}
+	if key, conflict := SpawnConflict(recorded.Values, extra.SpawnValues()); conflict {
+		t.Fatalf("unrecorded parameter must not conflict (got %q)", key)
+	}
+
+	// Repeating an identical flag is a no-op, not a conflict: pilish adds its
+	// own --approve on top of one the UI already passed.
+	doubled := &Spec{Values: map[string][]string{"approve": {"true", "true"}}}
+	if key, conflict := SpawnConflict(recorded.Values, doubled.SpawnValues()); conflict {
+		t.Fatalf("duplicate identical flag must not conflict (got %q)", key)
 	}
 
 	// Omitting a recorded parameter is not a conflict: the client expresses no
@@ -114,7 +128,7 @@ func TestShortAliasesMatchLongForms(t *testing.T) {
 		key   string
 	}{
 		{"-a", "--approve", "", "approve"},
-		{"-na", "--no-approve", "", "no-approve"},
+		{"-na", "--no-approve", "", "approve"}, // recorded as the approve setting, value false
 		{"-ne", "--no-extensions", "", "no-extensions"},
 		{"-ns", "--no-skills", "", "no-skills"},
 		{"-np", "--no-prompt-templates", "", "no-prompt-templates"},
@@ -156,5 +170,69 @@ func TestShortAliasesMatchLongForms(t *testing.T) {
 			t.Fatalf("%s recorded %v, want %v (same as %s)",
 				tc.alias, alias.Values, long.Values, tc.long)
 		}
+	}
+}
+
+func TestCanonicalSpawnArgs(t *testing.T) {
+	spec, err := Parse([]string{
+		"-a", "-na", "--extension", "/a.ts", "-e", "/b.ts",
+		"--append-system-prompt", "one", "--model", "m1", "--thinking", "low",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Runtime keys are not part of the spawn configuration, aliases become
+	// their long form, and --approve/--no-approve are one setting (last wins).
+	got := spec.CanonicalSpawnArgs()
+	want := []string{
+		"--approve", "--no-approve",
+		"--extension", "/a.ts", "--extension", "/b.ts",
+		"--append-system-prompt", "one",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CanonicalSpawnArgs = %v, want %v", got, want)
+	}
+	if _, ok := spec.Values["no-approve"]; ok {
+		t.Fatalf("no-approve should be recorded as the approve setting: %v", spec.Values)
+	}
+	if vals := spec.Values["approve"]; !reflect.DeepEqual(vals, []string{"true", "false"}) {
+		t.Fatalf("approve values = %v, want [true false]", vals)
+	}
+}
+
+func TestMergeSpawn(t *testing.T) {
+	// A session created with a system prompt and an extension record; the
+	// requester asks for a different prompt (recorded wins), a new extension
+	// (filled in) and a runtime model (kept for spawn/apply).
+	recorded := []string{"--append-system-prompt", "one", "--extension", "/a.ts"}
+	requested, err := Parse([]string{
+		"--append-system-prompt", "two",
+		"--skill", "/s.ts",
+		"--no-approve",
+		"--model", "m2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := MergeSpawn(recorded, requested)
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, "two") {
+		t.Fatalf("recorded value was overridden: %v", got)
+	}
+	for _, want := range []string{"--append-system-prompt one", "--extension /a.ts", "--skill /s.ts", "--no-approve", "--model m2"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("merged args %q missing %q", joined, want)
+		}
+	}
+}
+
+func TestMergeSpawnFallsBackOnCorruptRecord(t *testing.T) {
+	requested, err := Parse([]string{"--approve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := MergeSpawn([]string{"--not-a-flag"}, requested)
+	if !reflect.DeepEqual(got, requested.Args) {
+		t.Fatalf("corrupt record merge = %v, want %v", got, requested.Args)
 	}
 }

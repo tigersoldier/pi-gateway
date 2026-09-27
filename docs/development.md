@@ -24,16 +24,16 @@ decisions.
 | Binaries | `pi-gatewayd` (daemon), `pi-gateway` (bridge) |
 | Transport/auth | loopback TCP, token file (0600), `--server`/`--port`/`--token-file`, port-file discovery with fallback to `127.0.0.1:7331` |
 | Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags, and `gw_stop_session`/`gw_delete_session` to release pi or destroy the session (`session_busy`/`session_attached` refusals, `force`, tombstoned paths) |
-| Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags |
+| Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags plus durable `spawn` per session; `gw_welcome.features` |
 | Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
-| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
+| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, `inject` context messages (daemon-translated, capability `context`), one capability check per command before dispatch (canonical lowercase types only) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
 | Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state` (including the terminal `deleted`), `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
 | Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics including `pi_gateway_sessions_deleted_total` |
 | Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome` (including the post-welcome attach error), correlates `Do` responses by id, streams `Events()` or delivers frames through `Config.OnEvent`, exposes a resume cursor (`Cursor`/`LastSeq`/`LeafID`, `Reconnect`), decodes gateway events and extension dialogs with typed accessors, and wraps session/catalog/prompt/interject/dialog plus the rest of pi's command surface (models, thinking, modes, compaction, retry, `bash` streaming, entries/tree/stats/export, `set_session_name`, images), so a bot in another Go module can import the client instead of reimplementing it; `examples/chat` is a runnable CLI built only on it |
-| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session`/`gw_stop_session`/`gw_delete_session` require `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
+| Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, `inject` requires `context`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session`/`gw_stop_session`/`gw_delete_session` require `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
 Deferred to M4 (optional, `docs/design.md` §14): session groups across
 daemons, WebSocket transport for non-local clients, and other transport
@@ -341,6 +341,77 @@ unless it is explicitly marked so.
   (throwing away a bot's connection mid-reply is worse than an unbound one);
   and deleting the file from inside `shutdown()` (pi flushes during its own
   shutdown, so the file must go after the reap).
+- **Chat-app bots: durable spawn configuration, context injection, and
+  feature exposure** (operator: "close the gaps" from the pi-chat proposal,
+  against `119f0f2`). Four items, all recorded in `docs/protocol.md`
+  (§3.11, §4.1–§4.3, §10) and `docs/design.md` §6.3–§6.4:
+  - **P2 — durable spawn configuration.** The spawn-only `piArgs` a session
+    was created with (plus its spawn `cwd`) are persisted in a daemon-owned
+    sidecar under `<stateDir>/spawn/<sha256(canonical-path)>.json`, written
+    atomically, never inside pi's session file (that format belongs to pi)
+    and never only in memory. On a cold attach the recorded values win, the
+    requester's arguments fill canonical keys the record never set, and its
+    runtime parameters still apply. On a live attach a differing value for a
+    recorded key is still `spawn_param_conflict`, but a key the session never
+    recorded is ignored instead of refusing the attach (R5; this is the one
+    intentional behaviour change from the pre-existing
+    `SpawnConflict`/"differing value fails the attach" rule, and
+    `--approve`/`--no-approve` are now one logical setting so the trust value
+    cannot be contradicted by the other spelling). Value comparison is a set
+    comparison, so a repeated identical flag (pilish adds its own
+    `--approve`) is a no-op, not a conflict. `gw_delete_session` removes the
+    record and `fork`/`clone` copies it. This fixes the reproduced defect
+    where a session created with `--append-system-prompt` silently lost it
+    after a daemon restart, and removes the G2 forced choice between
+    installing an instruction and attaching.
+  - **P3 — exposure.** `gw_list_sessions[].spawn` reports the recorded
+    configuration (from the live entry or the sidecar), so a client can tell
+    a lost instruction from an absent one before attaching; `gw_welcome`
+    gained a `features` array (`inject`, `spawn_config`) so a client detects
+    the command surface without probing.
+  - **P1 — `inject`.** A new command, gated by the new `context` capability,
+    appends a custom (non-user) message to a session without starting a turn.
+    The daemon transforms the gateway payload onto pi's `send_message`
+    primitive (nested `message` hoisted, `triggerTurn` forced false) and
+    translates the response back to a pi-shaped `inject` response with
+    `{queued:true}`; the optional `dedupeKey` is owned by the daemon and only
+    remembered after pi accepted the message, so a retry after a reconnect is
+    `{"queued":true,"deduplicated":true}` rather than a duplicate. When the
+    managed pi has no `send_message` (all released pi at the time of writing,
+    including 0.85.1), the daemon answers `not_supported` by recognising pi's
+    `Unknown command:` error; `fakepi` and `gwclient` implement the capable
+    path so the forwarding and translation are covered today. This is the
+    piece a bot needs to install a standing instruction once instead of
+    prefixing every prompt, and to refresh it after `compaction_end`.
+  - **P4 — `gw_reload_session{piArgs}`** replaces the recorded spawn
+    configuration and restarts pi with it, for upgrading an instruction in
+    the actual system prompt. The replacement becomes durable only after the
+    restart succeeds. It keeps the existing `control` capability rather than
+    the proposal's `admin`: the invariant is exactly one capability check per
+    command from the single table in `protocol/roles.go`, and a payload-level
+    `admin` check would break it; with `inject` available the disruptive
+    reload is not the normal path anyway.
+
+  Evidence: `go test -race ./...` green (192 test functions, +11: three
+  `piargs` — canonical args, merge, corrupt-record fallback — and eight
+  `internal/daemon` — restart survival, cold merge, live unrecorded key,
+  catalog exposure, welcome features, inject + dedupe, not_supported, reload
+  replacement), `gofmt -l .`/`go vet ./...` clean, and the fake end-to-end
+  lanes green (suite A 15/15, suite B 7/7). `TestSpawnConfigSurvivesDaemonRestart`
+  was checked to fail with the fix reverted (the second daemon spawned pi
+  without the recorded prompt; the test reads the fake pi's argv), as was
+  `TestInjectNonTurnAndDedupe` (the response came back as pi's
+  `send_message`/generic failure instead of the `inject`/dedupe shape).
+  Rejected: storing the configuration in pi's session file (a compatibility
+  promise the gateway cannot keep); refusing an attach that requests a spawn
+  key the session never recorded (that is the G2 forced choice, and the
+  daemon already accepts identical values as no-ops); advertising `inject` as
+  unconditionally working (it is a gateway feature, and `not_supported` is
+  the authoritative pi-dependency answer); and building the primitive with a
+  bundled pi extension instead (a second runtime, an install step per
+  machine, no help for already-spawned sessions, and integration-specific
+  text in the gateway's own path — the proposal's own rejection stands until
+  pi exposes `send_message`).
 
 ### Open
 
@@ -402,7 +473,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (183 tests, a few minutes)
+go test -race ./...                       # everything (192 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

@@ -468,6 +468,7 @@ func (c *conn) handleHello(raw []byte) error {
 		ClientID:       c.id,
 		Kind:           c.info.Kind,
 		Granted:        c.granted,
+		Features:       protocol.GatewayFeatures(),
 		PiVersion:      c.d.piVersion,
 		Concurrency:    "queue",
 		ResyncRequired: resync,
@@ -909,16 +910,29 @@ func (c *conn) handleGWNewSession(raw []byte) {
 	c.sendResponse(id, "gw_new_session", true, "", "", body)
 }
 
-// handleReload restarts pi for a session (docs/protocol.md §3.6).
+// handleReload restarts pi for a session (docs/protocol.md §3.6). A piArgs
+// field replaces the session's recorded spawn configuration (P4), which is how
+// an integration upgrades an installed instruction; without it the actor's
+// current parameters are reused.
 func (c *conn) handleReload(raw []byte) {
 	id := protocol.Field(raw, "id")
 	var req struct {
-		Session string `json:"session"`
-		Force   bool   `json:"force"`
+		Session string   `json:"session"`
+		Force   bool     `json:"force"`
+		PiArgs  []string `json:"piArgs"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame, err.Error(), nil)
 		return
+	}
+	var spec *piargs.Spec
+	if req.PiArgs != nil {
+		parsed, err := piargs.Parse(req.PiArgs)
+		if err != nil {
+			c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame, err.Error(), nil)
+			return
+		}
+		spec = parsed
 	}
 	var actor *session.Actor
 	if req.Session == "" {
@@ -937,12 +951,21 @@ func (c *conn) handleReload(raw []byte) {
 		}
 	}
 	ref := c.Ref()
+	var spawnArgs []string
+	if spec != nil {
+		spawnArgs = spec.Args
+	}
 	// The response goes straight to this connection: the target actor is not
 	// necessarily the one this client is subscribed to, so publishing it on
 	// that session's hub would drop it.
-	err := actor.Restart(req.Force, c.id, &ref, 30*time.Second)
+	err := actor.Restart(req.Force, c.id, &ref, spawnArgs, 30*time.Second)
 	switch {
 	case err == nil:
+		if spec != nil {
+			// The restart succeeded; only now does the replacement become the
+			// session's recorded configuration.
+			c.d.replaceSpawn(actor, spec)
+		}
 		c.sendResponse(id, "gw_reload_session", true, "", "", nil)
 	case errors.Is(err, session.ErrReloadBusy):
 		c.sendResponse(id, "gw_reload_session", false, protocol.CodeReloadBusy,

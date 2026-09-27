@@ -215,6 +215,7 @@ A second `gw_hello` on the same connection is `bad_frame`.
   "clientId": "c_2",
   "kind": "pilish",
   "granted": ["observe", "interject", "prompt", "ui", "control"],
+  "features": ["inject", "spawn_config"],
   "piVersion": "0.81.0",
   "concurrency": "queue",
   "session": null,
@@ -232,6 +233,13 @@ A second `gw_hello` on the same connection is `bad_frame`.
 
 - `granted` is the intersection of the requested capabilities and the token's
   role. The default daemon-generated token grants the full set.
+- `features` names the gateway **command surface** this daemon revision
+  supports, so a client detects support without probing. `inject` is §3.11 and
+  `spawn_config` is durable spawn configuration (§4.3); an older daemon sends
+  no `features` array at all, and a client must then fall back to probing or
+  version checks. `features` describes the daemon, not the managed pi: an
+  advertised `inject` still answers `not_supported` for a pi that lacks the
+  underlying primitive.
 - `session` is `{path, name, id}` when the connection is bound at hello, else
   `null`.
 - `resyncRequired: true` means the requested cursor is not replayable; the
@@ -305,6 +313,7 @@ Response data:
    "messageCount": 42,
    "lastActivity": "2026-01-01T00:02:00Z",
    "createdBy": {"clientId": "c_3", "kind": "integration", "tags": {"channel": "#auth"}},
+   "spawn": {"append-system-prompt": ["You are answering in a Slack thread."], "extension": ["/opt/pi/slack.ts"]},
    "clients": [{"clientId": "c_1", "kind": "pilish"}]}
 ]}
 ```
@@ -312,6 +321,12 @@ Response data:
 `live` means a pi process is attached; non-live sessions exist only as files.
 Rows are ordered live sessions first, then by `lastActivity` descending — the
 same order `/catalog` returns.
+
+`spawn` is the session's **recorded spawn configuration** in canonical
+key→values form (§4.3): the spawn-only parameters it was created with, kept by
+the daemon and re-applied when pi is respawned. It is omitted when nothing is
+recorded, so a client can tell "never installed" from "installed and later
+lost" without attaching.
 
 Discovery: the daemon scans the session roots in this order —
 `$PI_CODING_AGENT_SESSION_DIR`, then `$PI_CODING_AGENT_DIR/sessions`, then
@@ -351,11 +366,14 @@ Attach is pi's `switch_session`, intercepted by the daemon:
 - The daemon resolves the target (path first, then name), joins it if live,
   loads it if hibernated, and **rebinds the connection** (hub subscription and
   command target).
-- If the session has no live pi process, the daemon spawns one with the
-  requester's accepted parameters and the file. The daemon remembers a warm
-  session's spawn configuration for conflict detection only while it is
-  registered; a hibernated session has no persisted record (decision 6), so
-  its next attach supplies the parameters.
+- If the session has no live pi process, the daemon spawns one. The
+  session's **recorded spawn configuration** (§4.3) is re-applied: recorded
+  spawn-only values win, the requester's values fill in the keys the record
+  never set, and the requester's runtime parameters are applied as usual. A
+  session created with `--append-system-prompt` therefore keeps that prompt
+  across hibernation, a daemon restart, and a respawn triggered by another
+  client. A session with no record behaves exactly as before: the requester
+  supplies the parameters.
 - The response is pi-shaped and synthesized by the daemon, not forwarded to the
   current pi:
 
@@ -550,6 +568,62 @@ Notification:
   session from silently becoming a new one; the bridge relies on it and closes
   the UI stream with a pi-shaped error (§12).
 
+### 3.11 Context injection (`inject`)
+
+An integration with a conversation of its own (Slack, Discord, Matrix, an
+issue tracker) must install a standing instruction into a session and refresh
+it after compaction, without the instruction appearing as the person typing
+and without paying for it on every turn. `inject` appends a **custom
+(non-user) message** to the session context and never starts a turn:
+
+```json
+{"type": "inject", "id": "req-10", "deliverAs": "nextTurn",
+ "dedupeKey": "slack:T1:C1:1700000001.000100",
+ "message": {"role": "custom", "customType": "pi-chat/slack-context",
+             "display": false,
+             "content": "[pi-chat] You are answering Alice in a Slack thread; <@U123> mentions a person."}}
+```
+
+- `message.content` and `message.customType` are the text and its namespace;
+  `message.display` decides whether an attached TUI renders it (false is the
+  right default for a format preamble, true for "Bob said …" that a terminal
+  watcher should see).
+- `deliverAs` selects when the message joins the context: `nextTurn` (default
+  — held until the next user prompt), `steer` (with the running turn), or
+  `followUp` (after the current turn finishes).
+- The command is forwarded to pi's `send_message` primitive. `triggerTurn` is
+  forced false by the daemon: an injection never starts a turn regardless of
+  what the payload says. A client that wants a turn sends `prompt`.
+- Response on acceptance follows `prompt`'s "accepted or queued, not
+  complete" semantics:
+
+  ```json
+  {"type": "response", "id": "req-10", "command": "inject", "success": true,
+   "data": {"queued": true}}
+  ```
+
+- `dedupeKey` is optional. The daemon remembers keys pi accepted for the
+  session's current process: a retry with the same key answers
+  `{"queued":true,"deduplicated":true}` without injecting twice, so a client
+  that reconnects and re-injects does not duplicate its instruction. The
+  record lives as long as pi's own in-memory queue, so a respawn genuinely
+  requires re-injection.
+- Ordering is the client's connection's FIFO with its prompts, so an
+  instruction injected immediately before a prompt is in that prompt's
+  context.
+- Capability: `context` (§10), deliberately separate from `prompt`. The
+  authority being granted is "may write into this session's context without
+  being seen as a participant", and it is nameable.
+- Errors: `unknown_session` when unbound without a session to create;
+  `session_crashed` when the session is not running; `not_supported` when the
+  managed pi has no `send_message` primitive (a `pi` older than the one this
+  revision targets). `bad_frame` for a malformed payload.
+
+`steer` and `follow_up` are **not** the primitive: they are user messages that
+queue as work and can start a turn. Writing the instruction into the first
+prompt is not it either: compaction summarizes it away and other clients see
+it as the human talking.
+
 ---
 
 ## 4. Commands
@@ -561,7 +635,7 @@ Notification:
 | `gw_hello` | §2 | handshake, auth, optional bind |
 | `gw_list_sessions` | `{filter}` | session catalog |
 | `gw_new_session` | `{name?, cwd?, piArgs?, tags?}` | explicit create + bind |
-| `gw_reload_session` | `{session?, force?}` | restart pi for a session |
+| `gw_reload_session` | `{session?, force?, piArgs?}` | restart pi for a session |
 | `gw_stop_session` | `{session?, force?}` | stop pi, keep the session file (§3.10) |
 | `gw_delete_session` | `{session?, force?}` | stop pi, delete the session file (§3.10) |
 | `gw_ping` | `{}` | liveness |
@@ -581,6 +655,10 @@ Forwarded verbatim with `id` namespaced per client and restored on responses:
 `set_auto_retry`, `abort_retry`, `bash`, `abort_bash`, `get_session_stats`,
 `export_html`, `get_entries`, `get_tree`, `get_fork_messages`,
 `get_last_assistant_text`, `set_session_name`, `get_commands`.
+
+`inject` (§3.11) is the one command the daemon **transforms**: it maps the
+gateway payload onto pi's `send_message` primitive and translates the response
+back, and the daemon — not pi — owns `dedupeKey`.
 
 `prompt`, `steer` and `follow_up` also accept pi's optional `images` array
 (`ImageContent`: base64 `data` plus `mimeType`); the gateway forwards it
@@ -610,21 +688,49 @@ Accepted set, with pi's short aliases: trust (`--approve`/`-a`,
 `--append-system-prompt`), and `--provider`, `--model`, `--models`,
 `--thinking`, `--name`/`-n`, `--session-dir`, `--no-session`, `--api-key`,
 `--offline`, `--verbose`. Aliases record the same canonical parameter as their
-long form, so `-a` and `--approve` never look like a conflict. Other pi
+long form, so `-a` and `--approve` never look like a conflict, and
+`--approve`/`--no-approve` are **one** setting with opposite values, so the
+trust setting cannot be silently contradicted by the other spelling. Other pi
 options (including session selection and one-shot modes the daemon owns) are
 rejected with `bad_frame`.
 
-- If the session is **not live**, all accepted parameters apply at spawn.
+**Recorded configuration.** The spawn-only parameters a session was created
+with (plus its spawn `cwd`) are persisted by the daemon, keyed by the canonical
+session path, under `<stateDir>/spawn/` (a small sidecar per session, written
+atomically). They are never written into pi's session file — that format
+belongs to pi — and never kept only in memory. The record is what makes a
+`gw_new_session{piArgs}` promise hold over time.
+
+- If the session is **not live**, the recorded configuration is re-applied:
+  spawn-only values from the record win; the requester's arguments are added
+  only for canonical keys the record never set; its runtime parameters are
+  applied at spawn as usual. A requester that names a key the record owns with
+a different value is not refused — the record wins — because the alternative is
+  "attach with your parameters or not at all".
 - If it **is live**:
   - runtime-applicable parameters (`--model`, `--provider`, `--thinking`,
     `--name`) are applied via RPC and change **shared** session state; this is
     session-global, and every client is notified with `gw_state_changed`;
-  - spawn-only parameters are compared to the warm session's recorded spawn
-    config:
-    **identical values are no-ops; a differing value fails the attach** with
-    `spawn_param_conflict` (naming the parameter). A parameter the request does
-    not mention is not a conflict: the session keeps its recorded value. This
-    is required because pilish re-sends `--approve` on every reload.
+  - spawn-only parameters are compared to the recorded configuration:
+    **identical values are no-ops; a differing value for a key the record owns
+    fails the attach** with `spawn_param_conflict` (naming the parameter). A
+    parameter the request does not mention, and a spawn key the record never
+    set, are not conflicts: the session keeps what it has. This is what lets
+    pilish re-send `--approve` on every reload and lets an integration attach
+    without having to guess the session's parameters first (R5).
+- The record is exposed in `gw_list_sessions[].spawn` (§3.2) so a client can
+  check before attaching and can tell a lost instruction from an absent one.
+- `gw_delete_session` removes the record; `fork`/`clone` copies it to the new
+  session; a session created before this mechanism has no record and behaves
+  exactly as before.
+- `gw_reload_session{piArgs}` (P4) **replaces** the recorded configuration and
+  restarts pi with it. It is disruptive (a restart, and a re-attach for every
+  client) and is intended for upgrading an instruction in the actual system
+  prompt; with `inject` (§3.11) an integration normally does not need it. The
+  replacement becomes durable only after the restart succeeds. It requires the
+  existing `control` capability — not a separate `admin` check — because the
+  daemon enforces exactly one capability per command from the single table in
+  `protocol/roles.go` (§10).
 
 ### 4.4 Global session mutations
 
@@ -828,6 +934,7 @@ starts pi, or changes shared state.
 |---|---|
 | `observe` | `get_*`, `export_html`, `gw_list_sessions`, receiving the event stream |
 | `prompt` | `prompt`, `follow_up`, `new_session`, `fork`, `clone`, `bash`, `switch_session` |
+| `context` | `inject` (§3.11) |
 | `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
 | `ui` | `extension_ui_response`, `notify` |
 | `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
@@ -836,8 +943,11 @@ starts pi, or changes shared state.
 
 `bash` requires `prompt` because a prompt-capable client can already cause
 shell work through the agent; `export_html` requires `observe` because it only
-reads the transcript. The cancellation primitives share `interject` with
-`steer`, because `clear_queue` can withdraw work another client queued.
+reads the transcript. `inject` gets its own `context` capability because the
+permission being granted — write into the session's context without being seen
+as a participant — is distinct from causing a turn. The cancellation
+primitives share `interject` with `steer`, because `clear_queue` can withdraw
+work another client queued.
 
 **Event delivery follows `observe`.** A client without `observe` receives only
 records addressed to it — its own responses, errors, and dialogs — and gets no
@@ -880,6 +990,15 @@ will be revisited after implementation.
    `Session()` for you; the bridge refuses the next session-scoped UI command
    with a pi-shaped error and closes the UI stream instead of forwarding a
    command that would land in a fresh session.
+10. **Read `gw_welcome.features` and handle `not_supported`.** A feature in
+    the list means the daemon revision speaks the command, not that the
+    managed pi can deliver it: `inject` answers `not_supported` when pi lacks
+    `send_message`. Treat `not_supported` as "fall back for this session"
+    (for example keep the instruction in the prompt), not as a fatal error.
+11. **Do not assume a spawn parameter was dropped.** `gw_list_sessions[].spawn`
+    reports what the session actually runs with; a recorded value wins over
+    the one you sent when the session was cold, and a spawn key the session
+    never set is ignored while it is live.
 
 ---
 

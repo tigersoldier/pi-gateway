@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -162,7 +163,10 @@ type restartReq struct {
 	force     bool
 	requester string // client that asked; it does not count as "another client"
 	by        *protocol.ClientRef
-	done      chan error
+	// piArgs replaces the spawn arguments for the respawn when non-nil
+	// (gw_reload_session{piArgs}); nil keeps the actor's recorded parameters.
+	piArgs []string
+	done   chan error
 }
 
 // StopRequest asks the actor to stop pi and terminate the session (the daemon
@@ -254,6 +258,14 @@ type Actor struct {
 	pendingUI         map[string]*uiPending
 	lastActive        map[string]time.Time
 	restarting        bool
+	// injects are the dedupe keys of context injections pi has accepted, so a
+	// reconnect that retries an inject does not duplicate the instruction.
+	// The record lives as long as the actor, matching pi's own in-memory queue
+	// (docs/protocol.md §3.11).
+	injects map[string]bool
+	// pendingInject maps a forwarded send_message id to its dedupe key, so the
+	// key is only remembered once pi accepted the command.
+	pendingInject map[string]string
 
 	// terminalState is what shutdown publishes (stateStopped, or stateDeleted
 	// for gw_delete_session). pendingStop is the forced stop waiting for the
@@ -314,6 +326,8 @@ func NewActor(p Params) *Actor {
 		owners:            make(map[string]string),
 		pendingUI:         make(map[string]*uiPending),
 		lastActive:        make(map[string]time.Time),
+		injects:           make(map[string]bool),
+		pendingInject:     make(map[string]string),
 	}
 	a.hub.SetMetrics(p.Metrics)
 	a.timer = time.NewTimer(time.Hour)
@@ -343,11 +357,20 @@ func (a *Actor) Start() error {
 
 // spawnPi starts a pi process for this actor's session.
 func (a *Actor) spawnPi() (*PiProcess, error) {
+	return a.spawnPiArgs(a.params.PiArgs)
+}
+
+// spawnPiArgs starts pi with an explicit accepted-argument list; a nil list
+// falls back to the actor's configured parameters.
+func (a *Actor) spawnPiArgs(piArgs []string) (*PiProcess, error) {
+	if piArgs == nil {
+		piArgs = a.params.PiArgs
+	}
 	args := []string{"--mode", "rpc"}
 	if a.path != "" {
 		args = append(args, "--session", a.path)
 	}
-	args = append(args, a.params.PiArgs...)
+	args = append(args, piArgs...)
 	return StartPi(PiConfig{Bin: a.params.PiBin, Args: args, Dir: a.params.Cwd, Log: a.log})
 }
 
@@ -505,9 +528,11 @@ func (a *Actor) Call(raw []byte, timeout time.Duration) (protocol.Record, error)
 
 // Restart stops pi and respawns it for the same session file (the daemon
 // operation behind gw_reload_session). It is refused with ErrReloadBusy while
-// another client is attached or a turn is running, unless force is set.
-func (a *Actor) Restart(force bool, requesterID string, by *protocol.ClientRef, timeout time.Duration) error {
-	req := &restartReq{force: force, requester: requesterID, by: by, done: make(chan error, 1)}
+// another client is attached or a turn is running, unless force is set. A
+// non-nil piArgs replaces the spawn arguments for the new process, which is
+// how gw_reload_session{piArgs} installs a new spawn configuration.
+func (a *Actor) Restart(force bool, requesterID string, by *protocol.ClientRef, piArgs []string, timeout time.Duration) error {
+	req := &restartReq{force: force, requester: requesterID, by: by, piArgs: piArgs, done: make(chan error, 1)}
 	if !a.send(actorMsg{restart: req}) {
 		return ErrStopped
 	}
@@ -745,6 +770,8 @@ func (a *Actor) handleCommand(c ClientCommand) {
 		a.handlePrompt(c)
 	case "steer":
 		a.forward(c)
+	case "inject":
+		a.handleInject(c)
 	case "abort":
 		// Session-wide; requires `interject`, like steer (docs/protocol.md §10).
 		a.forward(c)
@@ -841,6 +868,84 @@ func (a *Actor) forward(c ClientCommand) {
 	ns := protocol.NamespaceID(c.Client.ID(), c.LocalID)
 	a.owners[ns] = c.Client.ID()
 	a.forwardRaw(c, ns)
+}
+
+// handleInject forwards a context injection to pi as its send_message
+// primitive. It never starts a turn: pi decides when the message joins the
+// context from `deliverAs`, and the message is a custom (non-user) entry
+// (docs/protocol.md §3.11). A dedupe key makes a retry after a reconnect a
+// no-op instead of a duplicated instruction.
+func (a *Actor) handleInject(c ClientCommand) {
+	if a.state != stateReady || a.pi == nil {
+		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
+		return
+	}
+	key := protocol.Field(c.Raw, "dedupeKey")
+	if key != "" && a.injects[key] {
+		a.respond(c, true, []byte(`{"queued":true,"deduplicated":true}`))
+		return
+	}
+	ns := protocol.NamespaceID(c.Client.ID(), c.LocalID)
+	raw, err := buildSendMessage(c.Raw, ns)
+	if err != nil {
+		a.errorResponse(c, protocol.CodeBadFrame, err.Error())
+		return
+	}
+	if err := a.pi.Send(raw); err != nil {
+		a.errorResponse(c, protocol.CodeSessionCrashed, err.Error())
+		return
+	}
+	a.owners[ns] = c.Client.ID()
+	if key != "" {
+		a.pendingInject[ns] = key
+	}
+}
+
+// buildSendMessage maps the gateway's inject frame onto pi's flat send_message
+// command: the nested custom message is hoisted, dedupeKey stays at the
+// gateway, and triggerTurn is forced false because an injection never starts a
+// turn (docs/protocol.md §3.11).
+func buildSendMessage(raw []byte, ns string) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("inject: %w", err)
+	}
+	out := map[string]any{"type": "send_message", "id": ns, "triggerTurn": false}
+	if msg, ok := obj["message"].(map[string]any); ok {
+		for _, k := range []string{"customType", "content", "display"} {
+			if v, ok := msg[k]; ok {
+				out[k] = v
+			}
+		}
+	}
+	if v, ok := obj["deliverAs"]; ok {
+		out["deliverAs"] = v
+	}
+	return json.Marshal(out)
+}
+
+// translateInject rewrites pi's send_message response into the gateway's
+// inject shape: the command name the client used, a `{queued:true}` success
+// payload, and `not_supported` when the managed pi does not know the command
+// (docs/protocol.md §3.11).
+func (a *Actor) translateInject(rec protocol.Record) ([]byte, bool) {
+	key, pending := a.pendingInject[rec.ID]
+	if pending {
+		delete(a.pendingInject, rec.ID)
+	}
+	success := protocol.BoolField(rec.Raw, "success", false)
+	if success {
+		if pending {
+			a.injects[key] = true
+		}
+		return protocol.Response(rec.ID, "inject", true, "", "", []byte(`{"queued":true}`)), true
+	}
+	msg := protocol.Field(rec.Raw, "error")
+	code := ""
+	if strings.HasPrefix(msg, "Unknown command") {
+		code = protocol.CodeNotSupported
+	}
+	return protocol.Response(rec.ID, "inject", false, code, msg, nil), true
 }
 
 func (a *Actor) forwardRaw(c ClientCommand, ns string) {
@@ -1032,6 +1137,14 @@ func (a *Actor) handlePiEvent(rec protocol.Record) {
 				rec.Raw = raw
 			}
 		}
+		// Context injection is the gateway's `inject`; pi answers the
+		// underlying `send_message`, so the response is translated back to the
+		// client-facing command (docs/protocol.md §3.11).
+		if protocol.Field(rec.Raw, "command") == "send_message" {
+			if raw, ok := a.translateInject(rec); ok {
+				rec.Raw = raw
+			}
+		}
 	}
 	if rec.Type == "extension_ui_request" && !a.routeUI(&rec) {
 		return // no ui-capable client: pi's own dialog timeout applies
@@ -1181,6 +1294,7 @@ func (a *Actor) handlePiExit() {
 	a.failInternalCallbacks()
 	a.pendingUI = make(map[string]*uiPending)
 	a.forkPending = make(map[string]bool)
+	a.pendingInject = make(map[string]string)
 	if a.attached.Load() == 0 {
 		a.dead = true
 	}
@@ -1435,7 +1549,7 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 	a.pendingUI = make(map[string]*uiPending)
 	a.forkPending = make(map[string]bool)
 
-	pi, err := a.spawnPi()
+	pi, err := a.spawnPiArgs(req.piArgs)
 	if err != nil {
 		a.setState(stateCrashed)
 		a.publishState(stateCrashed, err.Error(), nil)

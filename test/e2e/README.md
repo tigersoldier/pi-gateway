@@ -73,7 +73,7 @@ options it does not model) and its `real` backend becomes real pi.
 | CLI surfaces | `--version` is daemon-answered, `--help` is client-local, other modes are refused | fake, real |
 | failure modes | daemon down, bad token, unreadable token: fast, loud, no hang | fake, real |
 | restricted tokens | an observer token may read but not prompt, mutate, or run bash | fake, real |
-| spawn parameters | a differing spawn-only value is refused; an omitted parameter is not a conflict | fake, real |
+| spawn parameters | a differing value for a recorded spawn key is refused; a key the session never recorded is ignored | fake, real |
 | session directory | a new session runs pi in the client's directory (recorded in the session header), not the daemon's | fake, real |
 
 The fake lane skips the two cases that need real pi's `--session` resume

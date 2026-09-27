@@ -39,10 +39,11 @@ func StartDaemonHandle(t *testing.T, token string, mutate func(*daemon.Config)) 
 	// developer's real ~/.pi/agent/sessions on every gw_list_sessions.
 	t.Setenv("PI_CODING_AGENT_SESSION_DIR", t.TempDir())
 	cfg := daemon.Config{
-		Addr:  "127.0.0.1:0",
-		Token: token,
-		PiBin: piBin,
-		Log:   Logger(t),
+		Addr:     "127.0.0.1:0",
+		Token:    token,
+		PiBin:    piBin,
+		StateDir: t.TempDir(),
+		Log:      Logger(t),
 	}
 	if mutate != nil {
 		mutate(&cfg)

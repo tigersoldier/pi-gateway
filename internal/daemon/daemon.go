@@ -41,6 +41,9 @@ type Config struct {
 	// CatalogRoots are extra session directories to scan, on top of the ones
 	// pi itself uses (catalog.DefaultRoots).
 	CatalogRoots []string
+	// StateDir is where the daemon keeps its own durable state, currently the
+	// per-session spawn configuration. Empty uses config.Dir().
+	StateDir string
 	// SubscriberBuffer is the per-connection delivery buffer in records.
 	SubscriberBuffer int
 	// DeltaFlush is the streaming-delta coalescing interval.
@@ -55,14 +58,26 @@ type Config struct {
 }
 
 // entry is a registered session: the actor plus the spawn configuration it was
-// started with, used to detect conflicting re-attaches.
+// started with, used to detect conflicting re-attaches and to re-apply the
+// configuration on a later respawn (docs/protocol.md §4.3).
 type entry struct {
 	actor *session.Actor
 	spawn map[string][]string
+	// spawnArgs is the precise spawn-only argv the session was started with, in
+	// canonical long-flag form; it is what the spawn sidecar persists.
+	spawnArgs []string
+	// cwd is the directory the session's pi was spawned in, recorded so a
+	// respawn uses the session's own directory even when the file header is
+	// missing.
+	cwd string
 	// createdBy records the client that explicitly created the session and the
-	// integration tags it supplied, for gw_list_sessions. It lives only as long
-	// as the session is registered (no persisted store, decision 6).
+	// integration tags it supplied, for gw_list_sessions and the spawn record.
+	// It lives only as long as the session is registered (no persisted store,
+	// decision 6); the spawn sidecar persists a copy for the spawn config.
 	createdBy *protocol.ClientRef
+	// createdAt is when the session was first registered, persisted with the
+	// spawn record.
+	createdAt time.Time
 	// attaching counts in-flight binds; retire must not reap a session while a
 	// client is being registered to it.
 	attaching int
@@ -89,6 +104,8 @@ type Daemon struct {
 	sessions map[string]*entry // canonical path -> entry
 	pending  map[*session.Actor]*entry
 	conns    map[*conn]struct{}
+	// spawn persists each session's spawn configuration (docs/protocol.md §4.3).
+	spawn *spawnStore
 	// tombstones are canonical paths deleted by gw_delete_session. They close
 	// the window between the actor stopping and the file being removed, and
 	// keep a repeat attach/delete from resurrecting a deleted session
@@ -138,6 +155,11 @@ func New(cfg Config) *Daemon {
 		done:       make(chan struct{}),
 		started:    time.Now(),
 	}
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = config.Dir()
+	}
+	d.spawn = newSpawnStore(filepath.Join(stateDir, "spawn"))
 	m.Declare()
 	if err := d.SetTokens(cfg.Tokens); err != nil {
 		log.Error("invalid token configuration", "err", err)
@@ -435,13 +457,37 @@ func (d *Daemon) liveActor(target string) (*session.Actor, error) {
 	return e.actor, nil
 }
 
+// replaceSpawn records a replacement spawn configuration for a live session
+// after a successful gw_reload_session{piArgs} (P4).
+func (d *Daemon) replaceSpawn(a *session.Actor, spec *piargs.Spec) {
+	d.mu.Lock()
+	e := d.entryLocked(a)
+	if e != nil {
+		e.spawn = spec.SpawnValues()
+		e.spawnArgs = spec.CanonicalSpawnArgs()
+	}
+	d.mu.Unlock()
+	if e != nil {
+		d.persistSpawn(canonicalPath(a.Path()), e)
+	}
+}
+
 // setCreated records the client that explicitly created a session.
 func (d *Daemon) setCreated(a *session.Actor, ref protocol.ClientRef, tags map[string]string) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if e := d.entryLocked(a); e != nil {
+	e := d.entryLocked(a)
+	var canon string
+	if e != nil {
 		ref.Tags = tags
 		e.createdBy = &ref
+		if e.createdAt.IsZero() {
+			e.createdAt = time.Now().UTC()
+		}
+		canon = canonicalPath(a.Path())
+	}
+	d.mu.Unlock()
+	if e != nil && canon != "" {
+		d.persistSpawn(canon, e)
 	}
 }
 
@@ -458,6 +504,10 @@ type Row struct {
 	LastActivity string                   `json:"lastActivity,omitempty"`
 	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
 	Clients      []protocol.ClientSummary `json:"clients,omitempty"`
+	// Spawn is the session's recorded spawn-only configuration, so a client
+	// can tell a lost instruction from one that was never installed before it
+	// attaches (docs/protocol.md §3.2, §4.3).
+	Spawn map[string][]string `json:"spawn,omitempty"`
 }
 
 // listSessions builds the session catalog: files newest first, enriched with
@@ -484,6 +534,11 @@ func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []Row {
 			row.LastActivity = c.LastActivity.UTC().Format(time.RFC3339)
 		}
 		d.decorate(&row, canon, live)
+		if row.Spawn == nil {
+			if rec, ok := d.spawn.Load(canon); ok {
+				row.Spawn = rec.Spawn
+			}
+		}
 		if liveOnly && !row.Live {
 			continue
 		}
@@ -528,6 +583,7 @@ func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []Row {
 type liveSession struct {
 	actor     *session.Actor
 	createdBy *protocol.ClientRef
+	spawn     map[string][]string
 }
 
 // liveSnapshot copies what the catalog needs from the session table.
@@ -543,6 +599,12 @@ func (d *Daemon) liveSnapshot() map[string]liveSession {
 		if e.createdBy != nil {
 			ref := *e.createdBy
 			ls.createdBy = &ref
+		}
+		if len(e.spawn) > 0 {
+			ls.spawn = make(map[string][]string, len(e.spawn))
+			for k, v := range e.spawn {
+				ls.spawn[k] = append([]string(nil), v...)
+			}
 		}
 		out[path] = ls
 	}
@@ -562,6 +624,9 @@ func (d *Daemon) decorate(row *Row, canon string, live map[string]liveSession) {
 	if ls.createdBy != nil {
 		ref := *ls.createdBy
 		row.CreatedBy = &ref
+	}
+	if ls.spawn != nil {
+		row.Spawn = ls.spawn
 	}
 	if row.Name == "" {
 		row.Name = ls.actor.SessionName()
@@ -622,14 +687,42 @@ func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protoc
 		e = nil
 	}
 	if e == nil {
-		a, err := d.newActor(canon, spec, spawnCwd(canon, cwd))
+		// Cold spawn: a recorded spawn configuration wins over the attaching
+		// client's (docs/protocol.md §4.3). Without a record this is exactly
+		// the historical behavior: the requester supplies the parameters.
+		rec, recorded := d.spawn.Load(canon)
+		effSpec := spec
+		effCwd := spawnCwd(canon, "")
+		if recorded {
+			effSpec = mergeSpawnSpec(rec, spec)
+			if effCwd == "" {
+				effCwd = rec.Cwd
+			}
+		}
+		if effCwd == "" {
+			effCwd = cwd
+		}
+		a, err := d.newActor(canon, effSpec, effCwd)
 		if err != nil {
 			d.mu.Unlock()
 			return nil, err
 		}
-		e = &entry{actor: a, spawn: spec.SpawnValues()}
+		e = &entry{
+			actor:     a,
+			spawn:     effSpec.SpawnValues(),
+			spawnArgs: effSpec.CanonicalSpawnArgs(),
+			cwd:       effCwd,
+			createdAt: time.Now().UTC(),
+		}
+		if recorded {
+			e.createdBy = rec.CreatedBy
+			if !rec.CreatedAt.IsZero() {
+				e.createdAt = rec.CreatedAt
+			}
+		}
 		d.sessions[canon] = e
 		d.mu.Unlock()
+		d.persistSpawn(canon, e)
 		d.log.Info("session started", "session", canon)
 		return e.actor, nil
 	}
@@ -650,7 +743,13 @@ func (d *Daemon) create(spec *piargs.Spec, cwd string) (*session.Actor, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &entry{actor: a, spawn: spec.SpawnValues()}
+	e := &entry{
+		actor:     a,
+		spawn:     spec.SpawnValues(),
+		spawnArgs: spec.CanonicalSpawnArgs(),
+		cwd:       cwd,
+		createdAt: time.Now().UTC(),
+	}
 	d.mu.Lock()
 	d.pending[a] = e
 	d.mu.Unlock()
@@ -711,7 +810,39 @@ func (d *Daemon) onPath(a *session.Actor, path string) {
 	}
 	d.sessions[canon] = e
 	d.mu.Unlock()
+	// Persist the spawn configuration under the path pi actually reported; a
+	// fork/clone therefore copies the configuration to the new session.
+	d.persistSpawn(canon, e)
 	d.log.Debug("session registered", "session", canon)
+}
+
+// persistSpawn writes (or refreshes) the durable spawn record for a session.
+// A record failure is logged, never fatal: durable spawn configuration is a
+// convenience for the next spawn, and a missing record degrades to the
+// historical behavior.
+func (d *Daemon) persistSpawn(canon string, e *entry) {
+	if canon == "" || e == nil {
+		return
+	}
+	d.mu.Lock()
+	cfg := spawnConfig{
+		Path:      canon,
+		PiArgs:    append([]string(nil), e.spawnArgs...),
+		Cwd:       e.cwd,
+		CreatedBy: e.createdBy,
+		CreatedAt: e.createdAt,
+		SessionID: e.actor.SessionID(),
+	}
+	if len(e.spawn) > 0 {
+		cfg.Spawn = make(map[string][]string, len(e.spawn))
+		for k, v := range e.spawn {
+			cfg.Spawn[k] = append([]string(nil), v...)
+		}
+	}
+	d.mu.Unlock()
+	if err := d.spawn.Save(cfg); err != nil {
+		d.log.Warn("cannot persist spawn configuration", "session", canon, "err", err)
+	}
 }
 
 // onStopped drops a finished actor from the table.

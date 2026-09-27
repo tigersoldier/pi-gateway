@@ -250,23 +250,23 @@
 ;;;; 8. Spawn parameters and conflicts
 
 (ert-deftest gateway-e2e-spawn-param-conflict ()
-  "A spawn-only parameter the live session lacks is refused; absent means
-no preference, so a plain client still joins (docs/protocol.md 4.3)."
+  "A differing value for a recorded spawn key is refused; a key the live
+session never recorded is ignored and still attaches (docs/protocol.md 4.3)."
   (e2e-require-lane 'real 'fake)
   (let* ((daemon (e2e-lane-daemon))
-         (a (e2e-start daemon))
-         (b (e2e-start daemon (list "--session-dir" (make-temp-file "e2e-sd" t))))
-         (c (e2e-start daemon))
+         (a (e2e-start daemon (list "--session-dir" (make-temp-file "e2e-a" t))))
+         (b (e2e-start daemon (list "--session-dir" (make-temp-file "e2e-b" t))))
+         (c (e2e-start daemon '("--approve")))
          path)
     (unwind-protect
         (progn
           (setq path (e2e-session-file a))
-          (ert-info ("a differing spawn-only value is refused")
+          (ert-info ("a different value for the recorded key is refused")
             (let ((resp (e2e-rpc b (list :type "switch_session" :sessionPath path) 30)))
               (should resp)
               (should (eq (plist-get resp :success) :false))
               (should (equal (plist-get resp :code) "spawn_param_conflict"))))
-          (ert-info ("an omitted parameter is not a conflict")
+          (ert-info ("an unrecorded spawn key does not refuse attachment")
             (e2e-switch c path)
             (should (equal (e2e-session-file c) path))))
       (e2e-stop a)
