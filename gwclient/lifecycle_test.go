@@ -61,7 +61,14 @@ func TestDeleteSessionClearsBinding(t *testing.T) {
 	if data.Path != path || !data.PiStopped || !data.FileDeleted {
 		t.Fatalf("delete data = %+v, want %s stopped and deleted", data, path)
 	}
-	// The event is delivered before the response, so both are observable now.
+	// The terminal event and the response travel on the same connection but are
+	// enqueued by different goroutines (the request handler writes the response;
+	// the session pump forwards the event), so wait for the event rather than
+	// assuming the daemon ordered them.
+	deadline := time.Now().Add(5 * time.Second)
+	for deleted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if got := deleted.Load(); got != 1 {
 		t.Fatalf("deleted events = %d, want 1", got)
 	}

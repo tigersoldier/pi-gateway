@@ -703,8 +703,8 @@ pi emits `extension_ui_request` and blocks until a matching
 | `observe` | receiving the event stream, `get_*` queries, `export_html`, `gw_list_sessions` |
 | `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
 | `prompt` | `prompt`, `follow_up`, `new_session`, `fork`/`clone`, `bash`, `switch_session` |
-| `ui` | answer extension UI dialogs, `notify` |
-| `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
+| `ui` | answer extension UI dialogs (`extension_ui_response`) |
+| `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name` |
 | `admin` | `gw_new_session`, `gw_stop_session`, `gw_delete_session` (provision and destroy sessions) |
 | *(none)* | `gw_ping`, `gw_bye` |
 

@@ -781,7 +781,9 @@ validated and forwarded to pi. As with pi, the answer echoes the **dialog's
 frame carries that same id.
 
 - Fire-and-forget methods (`notify`, `setStatus`, `setWidget`, `setTitle`,
-  `set_editor_text`) are broadcast.
+  `set_editor_text`) are broadcast. They are **pi → client** only: pi defines
+  them as methods of `extension_ui_request`, not as RPC commands, so a client
+  never sends them; sending one is an unknown-command error from pi.
 - Dialog methods (`select`, `confirm`, `input`, `editor`) are routed to the
   **author of the running turn** (`gw_turn.author`). If that client lacks `ui`
   or has disconnected, the daemon falls back to the most recently active
@@ -897,8 +899,8 @@ starts pi, or changes shared state.
 | `observe` | `get_*`, `export_html`, `gw_list_sessions`, receiving the event stream |
 | `prompt` | `prompt`, `follow_up`, `new_session`, `fork`, `clone`, `bash`, `switch_session` |
 | `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
-| `ui` | `extension_ui_response`, `notify` |
-| `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name`, `set_editor_text` |
+| `ui` | `extension_ui_response` |
+| `control` | `gw_reload_session`, `set_model`, `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`, `set_auto_retry`, `set_session_name` |
 | `admin` | `gw_new_session`, `gw_stop_session`, `gw_delete_session` |
 | *(none)* | `gw_ping`, `gw_bye` |
 

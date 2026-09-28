@@ -454,7 +454,7 @@ unless it is explicitly marked so.
   compared as comma-separated token sets, so reordering a list is not a false
   `spawn_param_conflict`. (e) The in-memory dedupe map is bounded (4096
   entries). Evidence: `go test -race ./...` green (196 test functions after
-  the `inject` removal),
+  the `inject` removal, 198 after the protocol audit),
   including `TestStopReportsUnbound`, `TestSpawnConflictListValues`, and five
   consecutive clean runs of `gwclient.TestStopSessionClearsBinding`.
 - **Remove the speculative `inject` command** (operator decision, after the
@@ -473,6 +473,41 @@ unless it is explicitly marked so.
   keeps it). `fakepi` should mimic real pi (no `send_message`), not a future
   one. Evidence: `go test -race ./...` green after deleting the inject tests,
   `gofmt -l .`/`go vet ./...` clean, fake e2e lanes green.
+- **Remove two non-commands from the capability table** (protocol audit).
+  `notify` and `set_editor_text` were listed as client→daemon commands in
+  `CommandCapability` and the §10 tables, with `ui` and `control`
+  capabilities. They are not pi commands: pi has no `notify` or
+  `set_editor_text` in `RpcCommand` (`rpc-types.d.ts`) or in the `handleCommand`
+  switch, and a probe against `0.85.1` answers `{"command":"notify",
+  "success":false,"error":"Unknown command: notify"}`. Both are **methods of
+  pi's outbound `extension_ui_request`** (the broker already broadcasts them to
+  clients and pilish already renders them), so a client never sends them. The
+  rows were removed, together with the `roles_test` cases. The test that a
+  command pi does not know still reaches the client as pi's own error is a
+  `fakepi` fidelity issue: `default:` answered `success:true`, so no test could
+  see the mismatch. `fakepi` now answers `Unknown command: <type>` like pi, and
+  `TestUnsupportedCommandSurfacesPiError` pins it; `TestEveryPiCommandIsGated`
+  pins the other direction (every command in pi `0.85.1`'s `RpcCommand` plus
+  `extension_ui_response` has a capability, and no UI-request method does).
+  Evidence: real-pi probe
+  (above), `go test -race ./...` green (198 test functions),
+  `gofmt -l .`/`go vet ./...` clean, and both new tests checked to fail with
+  the fix reverted (`CommandCapability("notify") = "ui"`; fakepi answering
+  `success=true` for `notify`).
+- **`fakepi` no longer answers `extension_ui_response`** (protocol audit). Real
+  pi's `handleInputLine` resolves the pending extension request and writes
+  nothing back; `fakepi` echoed a `success:true` response, and three daemon
+  tests asserted that echo, so they proved a behaviour production cannot
+  produce. `fakepi` now stays silent and, when `FAKEPI_UI_RESPONSE_FILE` is
+  set, appends the received frame so a test can still prove routing. The tests
+  assert the observable the gateway really owns: a second answer to the same
+  dialog is `ui_stale` (the pending entry was consumed). Evidence: the three
+  adapted tests plus the real-pi probe of `extension_ui_response` (no response
+  frame). The matching `gwclient.TestExtensionDialogRoundTrip` now proves
+  delivery from `FAKEPI_UI_RESPONSE_FILE`. `TestDeleteSessionClearsBinding`
+  assumed the terminal event was written before the response; they are
+  enqueued by different goroutines, so it now waits for the event (it flaked
+  under a loaded full-suite run).
 
 ### Open
 
@@ -496,6 +531,19 @@ stay open as separate decisions:
   connections-per-session and sessions-per-daemon limits are still not
   implemented (`docs/design.md` §10), so a multi-conversation bot must bound
   its own connections.
+- **`new_session{parentSession}` is dropped.** The daemon intercepts
+  `new_session` and always creates a standalone session, ignoring pi's optional
+  `parentSession` (which tells pi to open a child of an existing session). No
+  known client sends it, and honouring it across the one-pi-process-per-session
+  model needs a decision (map it to a `--fork` of the parent path, or reject it
+  with `not_supported`) rather than silently dropping a field pi defines.
+- **Extension CLI flags are refused by the bridge's allowlist.** pi lets
+  extensions register flags (`--no-lens`, `--mcp-config`, …; see
+  `pi --help`), but `piargs` accepts only the flags the gateway models, so a UI
+  configured with one gets exit 2. The allowlist is deliberate (an accepted
+  flag is recorded as spawn configuration and participates in conflict
+  detection), and the set is open-ended at runtime, so the fix is a
+  per-extension opt-in rather than accepting arbitrary `--*`.
 
 ## Repository layout
 
@@ -537,7 +585,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (196 tests, a few minutes)
+go test -race ./...                       # everything (198 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

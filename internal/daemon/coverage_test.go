@@ -2,6 +2,7 @@ package daemon_test
 
 import (
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -345,12 +346,17 @@ func TestDialogRoutedToUIClientOnly(t *testing.T) {
 		t.Fatalf("ui request has no method: %v", req)
 	}
 	// The turn author owns the dialog and may answer it while the turn runs.
-	// The answer echoes the dialog's id, exactly as with pi.
+	// Real pi writes no response for extension_ui_response, so the observable
+	// the gateway owns is that the pending dialog is consumed: a second answer
+	// from the owner is dropped as ui_stale.
 	dialogID := testutil.Str(req, "id")
 	author.Send(map[string]any{"type": "extension_ui_response", "id": dialogID, "confirmed": true})
-	resp := authorLog.wait(t, testutil.DefaultTimeout, "the dialog answer", response(dialogID))
-	if resp["success"] != true {
-		t.Fatalf("dialog answer refused: %v", resp)
+	author.Send(map[string]any{"type": "extension_ui_response", "id": dialogID, "confirmed": true})
+	resp := authorLog.wait(t, testutil.DefaultTimeout, "the second dialog answer", func(f map[string]any) bool {
+		return f["type"] == "response" && testutil.Str(f, "command") == "extension_ui_response"
+	})
+	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUIStale {
+		t.Fatalf("second dialog answer = %v, want ui_stale", resp)
 	}
 	// The non-ui client never sees it.
 	authorLog.wait(t, 30*time.Second, "the turn to settle", typeIs("agent_settled"))
@@ -676,4 +682,33 @@ func waitSeen(t *testing.T, count func(string) int, typ string) bool {
 	}
 	t.Fatalf("timed out waiting for %s on the lossy client", typ)
 	return false
+}
+
+// TestUnsupportedCommandSurfacesPiError pins the passthrough contract: a
+// command the gateway does not intercept is forwarded to pi, and when pi does
+// not know it the client sees pi's own error rather than a fake success. It is
+// the regression test for fakepi answering success to every unknown type,
+// which hid exactly this class of mismatch (docs/development.md, "Remove two
+// non-commands from the capability table").
+func TestUnsupportedCommandSurfacesPiError(t *testing.T) {
+	dir := t.TempDir()
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	c, _, _ := dialSession(t, addr, filepath.Join(dir, "unsupported.jsonl"))
+
+	// `notify` is a pi extension_ui_request method, not a command. It must not
+	// be gated by a capability (the table no longer lists it) and must come back
+	// as pi's unknown-command error.
+	c.Send(map[string]any{"type": "notify", "id": "n1", "message": "hi"})
+	resp := c.WaitFor(func(f map[string]any) bool {
+		return f["type"] == "response" && testutil.Str(f, "id") == "n1"
+	}, testutil.DefaultTimeout)
+	if resp["success"] != false {
+		t.Fatalf("notify answered success=%v; pi has no notify command", resp["success"])
+	}
+	if got := testutil.Str(resp, "error"); !strings.Contains(got, "Unknown command: notify") {
+		t.Fatalf("notify error = %q, want pi's unknown-command error", got)
+	}
+	if code := testutil.Str(resp, "code"); code == protocol.CodeForbidden {
+		t.Fatalf("notify was capability-gated: %v", resp)
+	}
 }

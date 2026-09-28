@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -190,6 +193,8 @@ func TestCloseClosesEvents(t *testing.T) {
 
 func TestExtensionDialogRoundTrip(t *testing.T) {
 	t.Setenv("FAKEPI_UI_REQUEST", "1")
+	received := filepath.Join(t.TempDir(), "ui-responses.jsonl")
+	t.Setenv("FAKEPI_UI_RESPONSE_FILE", received)
 	c := dial(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -224,18 +229,18 @@ func TestExtensionDialogRoundTrip(t *testing.T) {
 	if err := c.RespondUI(ctx, dialogID, map[string]any{"confirmed": true}); err != nil {
 		t.Fatalf("RespondUI: %v", err)
 	}
+	// Real pi writes no response for extension_ui_response, so delivery is
+	// proved by the frame the fake records, not by a response event.
 	deadline = time.After(15 * time.Second)
 	for {
+		data, _ := os.ReadFile(received)
+		if strings.Contains(string(data), `"id":"`+dialogID+`"`) {
+			return
+		}
 		select {
-		case ev, ok := <-c.Events():
-			if !ok {
-				t.Fatalf("events closed: %v", c.Err())
-			}
-			if ev.Type == "response" && ev.Field("id") == dialogID {
-				return
-			}
 		case <-deadline:
-			t.Fatal("the dialog answer never reached pi")
+			t.Fatalf("the dialog answer never reached pi (recorded %q)", data)
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
 }

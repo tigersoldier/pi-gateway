@@ -39,6 +39,10 @@ func RoleCapabilities(role string) ([]string, bool) {
 // command→capability table from docs/design.md §10; the daemon enforces it
 // once, before dispatching the frame (docs/protocol.md §10).
 //
+// Only commands a client may send appear here. pi's `extension_ui_request`
+// methods (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`)
+// are pi → client notifications, not commands, and are deliberately absent.
+//
 // Command types are canonical: the daemon rejects a frame whose type is not
 // lowercase, so the table never has to consider case variants.
 func CommandCapability(command string) string {
@@ -59,7 +63,7 @@ func CommandCapability(command string) string {
 	case "steer", "abort", "abort_bash", "abort_retry", "clear_queue":
 		return CapInterject
 	// Driving the user's UI.
-	case "extension_ui_response", "notify":
+	case "extension_ui_response":
 		return CapUI
 	// Session-global state and administration.
 	case "gw_reload_session",
@@ -67,7 +71,7 @@ func CommandCapability(command string) string {
 		"set_thinking_level", "cycle_thinking_level",
 		"set_steering_mode", "set_follow_up_mode",
 		"compact", "set_auto_compaction", "set_auto_retry",
-		"set_session_name", "set_editor_text":
+		"set_session_name":
 		return CapControl
 	// Provisioning: creating a session and destroying one are the operator's
 	// authority, not something any attached client may do (docs/design.md §10).

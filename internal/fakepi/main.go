@@ -77,6 +77,7 @@ func main() {
 		withCommands:   os.Getenv("FAKEPI_COMMANDS") != "",
 		exitAfterFirst: os.Getenv("FAKEPI_EXIT_AFTER_FIRST_TURN") != "",
 		abortMarker:    os.Getenv("FAKEPI_ABORT_MARKER"),
+		uiResponseFile: os.Getenv("FAKEPI_UI_RESPONSE_FILE"),
 		slowSettle:     time.Duration(envInt("FAKEPI_ABORT_SLOW_MS", 0)) * time.Millisecond,
 		ignoreAbort:    os.Getenv("FAKEPI_ABORT_IGNORE") != "",
 		flushOnExit:    os.Getenv("FAKEPI_FLUSH_ON_EXIT") != "",
@@ -133,6 +134,11 @@ type state struct {
 	slowSettle  time.Duration
 	ignoreAbort bool
 	flushOnExit bool
+	// uiResponseFile, when set, receives every extension_ui_response pi is
+	// handed. Real pi answers none (rpc-mode.js resolves the pending request and
+	// writes nothing), so the file is how a test observes receipt without the
+	// fake inventing a response frame.
+	uiResponseFile string
 }
 
 // open adopts an existing session file or creates one with a header.
@@ -346,9 +352,10 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 	case "clear_queue":
 		respond("clear_queue", true, map[string]any{"steering": []any{}, "followUp": []any{}}, "")
 	case "extension_ui_response":
-		// pi does not answer dialog responses, but the gateway tests need to
-		// see which id pi was handed.
-		respond(typ, true, map[string]any{"id": id}, "")
+		// pi answers no dialog response (rpc-mode.js resolves the pending request
+		// and writes nothing), so the fake must not either; tests that need to
+		// prove routing read the id from uiResponseFile.
+		s.recordUIResponse(msg)
 	case "clone", "fork":
 		if s.newFile() != nil {
 			respond(typ, true, map[string]any{"cancelled": true}, "")
@@ -388,8 +395,29 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 		s.mu.Unlock()
 		respond("set_session_name", true, data, "")
 	default:
-		respond(typ, true, map[string]any{}, "")
+		// pi rejects an unknown command with an error response
+		// (`Unknown command: <type>`); the fake must too, or a test could pass
+		// against a command real pi does not have.
+		respond(typ, false, nil, "Unknown command: "+typ)
 	}
+}
+
+// recordUIResponse appends the received dialog response to uiResponseFile, if
+// configured. The write is best effort: it exists only for tests.
+func (s *state) recordUIResponse(msg map[string]any) {
+	if s.uiResponseFile == "" {
+		return
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(s.uiResponseFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.Write(append(b, '\n'))
 }
 
 // stateData mirrors pi's get_state payload for the fields the gateway uses.

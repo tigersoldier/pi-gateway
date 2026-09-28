@@ -379,11 +379,14 @@ func TestUIRequestRoutedToTurnAuthor(t *testing.T) {
 	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUIStale {
 		t.Fatalf("non-owner response must be ui_stale: %v", resp)
 	}
+	// The owner's answer is accepted (and consumed); pi writes no response, so a
+	// repeat from the same client is ui_stale — the observable the gateway owns.
+	a.Send(map[string]any{"type": "extension_ui_response", "id": "ui-1", "confirmed": true})
 	a.Send(map[string]any{"type": "extension_ui_response", "id": "ui-1", "confirmed": true})
 	if resp := a.WaitFor(func(f map[string]any) bool {
 		return f["type"] == "response" && testutil.Str(f, "command") == "extension_ui_response"
-	}, testutil.DefaultTimeout); resp["success"] != true {
-		t.Fatalf("owner response failed: %v", resp)
+	}, testutil.DefaultTimeout); resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUIStale {
+		t.Fatalf("repeat owner response must be ui_stale: %v", resp)
 	}
 	a.WaitType("agent_settled", testutil.DefaultTimeout)
 
@@ -397,10 +400,11 @@ func TestUIRequestRoutedToTurnAuthor(t *testing.T) {
 		t.Fatalf("reassigned dialog id = %q", got)
 	}
 	b.Send(map[string]any{"type": "extension_ui_response", "id": "ui-1", "confirmed": true})
+	b.Send(map[string]any{"type": "extension_ui_response", "id": "ui-1", "confirmed": true})
 	if resp := b.WaitFor(func(f map[string]any) bool {
 		return f["type"] == "response" && testutil.Str(f, "command") == "extension_ui_response"
-	}, testutil.DefaultTimeout); resp["success"] != true {
-		t.Fatalf("reassigned owner response failed: %v", resp)
+	}, testutil.DefaultTimeout); resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUIStale {
+		t.Fatalf("repeat reassigned response must be ui_stale: %v", resp)
 	}
 }
 
@@ -734,12 +738,16 @@ func TestDialogNotSentToNonUIClient(t *testing.T) {
 }
 
 // TestDialogAnswerKeepsPiRequestID proves the answer reaches pi with the id pi
-// is waiting for. fakepi echoes the id it received in its response data.
+// is waiting for. Real pi writes no response for extension_ui_response, so the
+// fake records the frame it received in FAKEPI_UI_RESPONSE_FILE rather than
+// inventing a response frame.
 func TestDialogAnswerKeepsPiRequestID(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ui-id.jsonl")
+	received := filepath.Join(dir, "ui-responses.jsonl")
 	t.Setenv("FAKEPI_UI_REQUEST", "1")
 	t.Setenv("FAKEPI_TURN_DELAY_MS", "20")
+	t.Setenv("FAKEPI_UI_RESPONSE_FILE", received)
 	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
 
 	c, _, _ := dialSession(t, addr, path)
@@ -753,11 +761,23 @@ func TestDialogAnswerKeepsPiRequestID(t *testing.T) {
 		t.Fatalf("dialog has no id: %v", req)
 	}
 	c.Send(map[string]any{"type": "extension_ui_response", "id": reqID, "confirmed": true})
-	echoed := c.WaitFor(func(f map[string]any) bool {
+	deadline := time.Now().Add(testutil.DefaultTimeout)
+	for {
+		data, _ := os.ReadFile(received)
+		if strings.Contains(string(data), `"id":"`+reqID+`"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pi never received the dialog answer (recorded %q)", data)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The pending dialog is consumed: a repeat answer from the owner is ui_stale.
+	c.Send(map[string]any{"type": "extension_ui_response", "id": reqID, "confirmed": true})
+	if resp := c.WaitFor(func(f map[string]any) bool {
 		return f["type"] == "response" && testutil.Str(f, "command") == "extension_ui_response"
-	}, testutil.DefaultTimeout)
-	if got := testutil.Str(testutil.Obj(echoed, "data"), "id"); got != reqID {
-		t.Fatalf("pi received dialog id %q, want %q", got, reqID)
+	}, testutil.DefaultTimeout); resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeUIStale {
+		t.Fatalf("repeat dialog answer must be ui_stale: %v", resp)
 	}
 	c.WaitType("agent_settled", testutil.DefaultTimeout)
 }
