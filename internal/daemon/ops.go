@@ -196,11 +196,17 @@ func (d *Daemon) Status() Snapshot {
 	return snap
 }
 
-// CatalogJSON marshals the session catalog response body. Both the
-// gw_list_sessions control and the debug listener's /catalog serve it, so the
-// two can never drift.
+// CatalogJSON marshals the session catalog response body for the
+// unauthenticated debug listener. The recorded spawn configuration is
+// deliberately stripped: it can hold prompt text (and, before redaction, would
+// hold credentials), and the debug endpoint's contract is "no message content
+// beyond catalog titles" (internal/debughttp). The authenticated
+// gw_list_sessions control carries the redacted view instead.
 func (d *Daemon) CatalogJSON(cwd string, limit int) ([]byte, error) {
 	rows := d.listSessions(cwd, false, limit)
+	for i := range rows {
+		rows[i].Spawn = nil
+	}
 	if rows == nil {
 		rows = []Row{}
 	}

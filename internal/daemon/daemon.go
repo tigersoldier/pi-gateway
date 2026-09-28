@@ -159,7 +159,7 @@ func New(cfg Config) *Daemon {
 	if stateDir == "" {
 		stateDir = config.Dir()
 	}
-	d.spawn = newSpawnStore(filepath.Join(stateDir, "spawn"))
+	d.spawn = newSpawnStore(config.SpawnDir(stateDir))
 	m.Declare()
 	if err := d.SetTokens(cfg.Tokens); err != nil {
 		log.Error("invalid token configuration", "err", err)
@@ -601,10 +601,7 @@ func (d *Daemon) liveSnapshot() map[string]liveSession {
 			ls.createdBy = &ref
 		}
 		if len(e.spawn) > 0 {
-			ls.spawn = make(map[string][]string, len(e.spawn))
-			for k, v := range e.spawn {
-				ls.spawn[k] = append([]string(nil), v...)
-			}
+			ls.spawn = piargs.RedactedSpawnValues(e.spawn)
 		}
 		out[path] = ls
 	}
@@ -833,12 +830,10 @@ func (d *Daemon) persistSpawn(canon string, e *entry) {
 		CreatedAt: e.createdAt,
 		SessionID: e.actor.SessionID(),
 	}
-	if len(e.spawn) > 0 {
-		cfg.Spawn = make(map[string][]string, len(e.spawn))
-		for k, v := range e.spawn {
-			cfg.Spawn[k] = append([]string(nil), v...)
-		}
-	}
+	// The on-disk Spawn view is what the catalog exposes: redact credentials
+	// here too, so a hand-read sidecar cannot leak an api-key. The full argv
+	// (including the credential) is kept in PiArgs for respawn.
+	cfg.Spawn = piargs.RedactedSpawnValues(e.spawn)
 	d.mu.Unlock()
 	if err := d.spawn.Save(cfg); err != nil {
 		d.log.Warn("cannot persist spawn configuration", "session", canon, "err", err)

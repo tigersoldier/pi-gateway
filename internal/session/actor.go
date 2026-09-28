@@ -870,6 +870,14 @@ func (a *Actor) forward(c ClientCommand) {
 	a.forwardRaw(c, ns)
 }
 
+// Gateway constants for the inject translation. Keeping pi's command name in
+// one place makes a future upstream rename a one-line change.
+const (
+	piSendMessageCommand      = "send_message"
+	injectPayloadQueued       = `{"queued":true}`
+	injectPayloadDeduplicated = `{"queued":true,"deduplicated":true}`
+)
+
 // handleInject forwards a context injection to pi as its send_message
 // primitive. It never starts a turn: pi decides when the message joins the
 // context from `deliverAs`, and the message is a custom (non-user) entry
@@ -880,15 +888,15 @@ func (a *Actor) handleInject(c ClientCommand) {
 		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
 		return
 	}
-	key := protocol.Field(c.Raw, "dedupeKey")
-	if key != "" && a.injects[key] {
-		a.respond(c, true, []byte(`{"queued":true,"deduplicated":true}`))
-		return
-	}
 	ns := protocol.NamespaceID(c.Client.ID(), c.LocalID)
 	raw, err := buildSendMessage(c.Raw, ns)
 	if err != nil {
 		a.errorResponse(c, protocol.CodeBadFrame, err.Error())
+		return
+	}
+	key := protocol.Field(c.Raw, "dedupeKey")
+	if key != "" && a.injects[key] {
+		a.respond(c, true, []byte(injectPayloadDeduplicated))
 		return
 	}
 	if err := a.pi.Send(raw); err != nil {
@@ -896,30 +904,50 @@ func (a *Actor) handleInject(c ClientCommand) {
 		return
 	}
 	a.owners[ns] = c.Client.ID()
-	if key != "" {
-		a.pendingInject[ns] = key
-	}
+	// Track every forwarded injection, not just keyed ones: the response
+	// translation keys on this id so it does not depend on pi's echoed command
+	// name (a rename must not reshape the client-visible response).
+	a.pendingInject[ns] = key
 }
 
-// buildSendMessage maps the gateway's inject frame onto pi's flat send_message
-// command: the nested custom message is hoisted, dedupeKey stays at the
-// gateway, and triggerTurn is forced false because an injection never starts a
-// turn (docs/protocol.md §3.11).
+// buildSendMessage validates the gateway's inject frame and maps it onto pi's
+// flat send_message command: the nested custom message is hoisted, dedupeKey
+// stays at the gateway, and triggerTurn is forced false because an injection
+// never starts a turn (docs/protocol.md §3.11).
 func buildSendMessage(raw []byte, ns string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, fmt.Errorf("inject: %w", err)
 	}
-	out := map[string]any{"type": "send_message", "id": ns, "triggerTurn": false}
-	if msg, ok := obj["message"].(map[string]any); ok {
-		for _, k := range []string{"customType", "content", "display"} {
-			if v, ok := msg[k]; ok {
-				out[k] = v
-			}
-		}
+	msg, ok := obj["message"].(map[string]any)
+	if !ok {
+		return nil, errors.New("inject requires a message object")
 	}
-	if v, ok := obj["deliverAs"]; ok {
-		out["deliverAs"] = v
+	content, _ := msg["content"].(string)
+	if content == "" {
+		return nil, errors.New("inject requires a non-empty message.content")
+	}
+	customType, _ := msg["customType"].(string)
+	if customType == "" {
+		customType = "pi-gateway/inject"
+	}
+	out := map[string]any{
+		"type":        piSendMessageCommand,
+		"id":          ns,
+		"triggerTurn": false,
+		"customType":  customType,
+		"content":     content,
+	}
+	if v, ok := msg["display"]; ok {
+		out["display"] = v
+	}
+	if v, ok := obj["deliverAs"].(string); ok && v != "" {
+		switch v {
+		case "nextTurn", "steer", "followUp":
+			out["deliverAs"] = v
+		default:
+			return nil, fmt.Errorf("inject: unknown deliverAs %q", v)
+		}
 	}
 	return json.Marshal(out)
 }
@@ -935,10 +963,10 @@ func (a *Actor) translateInject(rec protocol.Record) ([]byte, bool) {
 	}
 	success := protocol.BoolField(rec.Raw, "success", false)
 	if success {
-		if pending {
+		if pending && key != "" {
 			a.injects[key] = true
 		}
-		return protocol.Response(rec.ID, "inject", true, "", "", []byte(`{"queued":true}`)), true
+		return protocol.Response(rec.ID, "inject", true, "", "", []byte(injectPayloadQueued)), true
 	}
 	msg := protocol.Field(rec.Raw, "error")
 	code := ""
@@ -1139,8 +1167,11 @@ func (a *Actor) handlePiEvent(rec protocol.Record) {
 		}
 		// Context injection is the gateway's `inject`; pi answers the
 		// underlying `send_message`, so the response is translated back to the
-		// client-facing command (docs/protocol.md §3.11).
-		if protocol.Field(rec.Raw, "command") == "send_message" {
+		// client-facing command (docs/protocol.md §3.11). Keying on the pending
+		// request id — not on pi's echoed command name — keeps the client-facing
+		// shape stable if pi renames its primitive and avoids rewriting a
+		// hand-sent `send_message` the daemon never originated.
+		if _, pending := a.pendingInject[rec.ID]; pending {
 			if raw, ok := a.translateInject(rec); ok {
 				rec.Raw = raw
 			}
@@ -1295,6 +1326,7 @@ func (a *Actor) handlePiExit() {
 	a.pendingUI = make(map[string]*uiPending)
 	a.forkPending = make(map[string]bool)
 	a.pendingInject = make(map[string]string)
+	a.injects = make(map[string]bool)
 	if a.attached.Load() == 0 {
 		a.dead = true
 	}
@@ -1548,6 +1580,11 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 	a.failTurn()
 	a.pendingUI = make(map[string]*uiPending)
 	a.forkPending = make(map[string]bool)
+	// A new pi process means an empty in-memory queue: forget the dedupe keys
+	// pi accepted, or a re-injection after a reload would be answered
+	// "deduplicated" while the instruction is gone (docs/protocol.md §3.11).
+	a.injects = make(map[string]bool)
+	a.pendingInject = make(map[string]string)
 
 	pi, err := a.spawnPiArgs(req.piArgs)
 	if err != nil {
@@ -1555,6 +1592,12 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 		a.publishState(stateCrashed, err.Error(), nil)
 		req.done <- err
 		return nil, nil
+	}
+	// A replacement configuration becomes the actor's parameters, so a later
+	// plain reload and a cold respawn by another client both agree with the
+	// record (docs/protocol.md §4.3).
+	if req.piArgs != nil {
+		a.params.PiArgs = append([]string(nil), req.piArgs...)
 	}
 	a.pi = pi
 	a.restarting = true

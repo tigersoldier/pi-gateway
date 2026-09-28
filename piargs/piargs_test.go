@@ -40,6 +40,49 @@ func TestParseEqualsForm(t *testing.T) {
 	if got := spec.Values["approve"]; len(got) != 1 || got[0] != "true" {
 		t.Fatalf("boolean equals form: %v", spec.Values)
 	}
+	// pi only accepts the bare boolean spelling, so the forwarded argv must
+	// not carry `--approve=true`.
+	if want := []string{"--model", "sonnet", "--approve"}; !reflect.DeepEqual(spec.Args, want) {
+		t.Fatalf("Args = %v, want %v", spec.Args, want)
+	}
+
+	// A false boolean is dropped when it has no opposite flag; the trust
+	// setting has one and is spelled positively.
+	no := mustParse(t, "--offline=false", "--no-approve=false")
+	if want := []string{"--approve"}; !reflect.DeepEqual(no.Args, want) {
+		t.Fatalf("Args = %v, want %v", no.Args, want)
+	}
+	if got := no.Values["approve"]; !reflect.DeepEqual(got, []string{"true"}) {
+		t.Fatalf("approve after --no-approve=false = %v, want [true]", got)
+	}
+}
+
+func mustParse(t *testing.T, args ...string) *Spec {
+	t.Helper()
+	spec, err := Parse(args)
+	if err != nil {
+		t.Fatalf("Parse(%v): %v", args, err)
+	}
+	return spec
+}
+
+func TestRedactedSpawnValues(t *testing.T) {
+	out := RedactedSpawnValues(map[string][]string{
+		"api-key":              {"sk-secret"},
+		"append-system-prompt": {"instruction"},
+	})
+	if _, ok := out["api-key"]; ok {
+		t.Fatalf("api-key must be redacted: %v", out)
+	}
+	if got := out["append-system-prompt"]; len(got) != 1 || got[0] != "instruction" {
+		t.Fatalf("non-secret key lost: %v", out)
+	}
+	if RedactedSpawnValues(map[string][]string{"api-key": {"x"}}) != nil {
+		t.Fatal("a fully redacted view must be nil (omitted)")
+	}
+	if RedactedSpawnValues(nil) != nil {
+		t.Fatal("nil input must stay nil")
+	}
 }
 
 func TestParseRejects(t *testing.T) {

@@ -54,6 +54,7 @@ func TestCommandCapability(t *testing.T) {
 		"clone":                 CapPrompt,
 		"bash":                  CapPrompt,
 		"switch_session":        CapPrompt,
+		"inject":                CapContext,
 		"steer":                 CapInterject,
 		"abort":                 CapInterject,
 		"abort_bash":            CapInterject,

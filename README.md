@@ -293,7 +293,7 @@ and `/name` for commands, prompt templates and skills.
 |---|---|---|
 | `--listen <host:port>` | `127.0.0.1:7331` | loopback address for the session listener |
 | `--port <n>` | — | port shorthand; overrides `--listen` |
-| `--state-dir <dir>` | `~/.config/pi-gateway` | where `token`, `tokens.json`, `port` and `debug-port` live |
+| `--state-dir <dir>` | `~/.config/pi-gateway` | where `token`, `tokens.json`, `port`, `debug-port` and the per-session `spawn/` records live |
 | `--token-file <path>` | `<state>/token` | token file (mode `0600`) |
 | `--tokens-file <path>` | `<state>/tokens.json` | restricted-token file (mode `0600`) |
 | `--pi <path>` | `pi` | the pi binary to manage |

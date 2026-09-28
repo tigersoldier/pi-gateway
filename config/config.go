@@ -52,6 +52,10 @@ func PortPath(dir string) string { return filepath.Join(dir, "port") }
 // DebugPortPath returns the port file for the read-only debug listener.
 func DebugPortPath(dir string) string { return filepath.Join(dir, "debug-port") }
 
+// SpawnDir returns the directory holding the daemon's durable per-session
+// spawn configuration records (docs/protocol.md §4.3).
+func SpawnDir(dir string) string { return filepath.Join(dir, "spawn") }
+
 // LoadOrCreateToken reads the token at path, generating a stable random token
 // on first use. The file is written mode 0600.
 func LoadOrCreateToken(path string) (string, error) {

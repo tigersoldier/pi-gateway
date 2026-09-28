@@ -187,8 +187,8 @@ message.
 - An absent or empty `client.capabilities` list is treated as the full set
   (the default daemon-generated token grants it). The daemon enforces
   `prompt` (`prompt`, `follow_up`, `new_session`, `fork`/`clone`),
-  `interject` (`steer`), `ui` (answering dialogs), `observe`
-  (`gw_list_sessions`), `control` (`gw_reload_session`), and `admin`
+  `interject` (`steer`), `context` (`inject`, §3.11), `ui` (answering dialogs),
+  `observe` (`gw_list_sessions`), `control` (`gw_reload_session`), and `admin`
   (`gw_new_session`). Per-command `get_*` checks and full role provisioning
   are enforced as of M3 (see §10).
 
@@ -214,7 +214,7 @@ A second `gw_hello` on the same connection is `bad_frame`.
   "protocol": 1,
   "clientId": "c_2",
   "kind": "pilish",
-  "granted": ["observe", "interject", "prompt", "ui", "control"],
+  "granted": ["observe", "interject", "prompt", "context", "ui", "control"],
   "features": ["inject", "spawn_config"],
   "piVersion": "0.81.0",
   "concurrency": "queue",
@@ -323,10 +323,14 @@ Rows are ordered live sessions first, then by `lastActivity` descending — the
 same order `/catalog` returns.
 
 `spawn` is the session's **recorded spawn configuration** in canonical
-key→values form (§4.3): the spawn-only parameters it was created with, kept by
-the daemon and re-applied when pi is respawned. It is omitted when nothing is
-recorded, so a client can tell "never installed" from "installed and later
-lost" without attaching.
+key→values form (§4.3): the spawn-only parameters a respawn would use, kept by
+the daemon. It is omitted when nothing is recorded. Credential values
+(`--api-key`) are never exposed; their key is dropped from this view while the
+value stays internal for the respawn. A missing `spawn` means "nothing
+recorded" — the catalog cannot distinguish that from a record the daemon could
+not read, so treat it as "no recorded configuration" rather than proof that an
+instruction was lost. The unauthenticated debug `/catalog` omits `spawn`
+entirely (§13).
 
 Discovery: the daemon scans the session roots in this order —
 `$PI_CODING_AGENT_SESSION_DIR`, then `$PI_CODING_AGENT_DIR/sessions`, then
@@ -419,6 +423,10 @@ daemon operation:
 - On success pi is stopped and respawned with the session's recorded spawn
   config; the file reloads. Attached clients receive
   `gw_session_state{state:"restarting"}` then `{state:"ready"}`.
+- An optional `piArgs` **replaces** the recorded spawn configuration (P4,
+  §4.3): the new process starts with those arguments, and, only after the
+  restart succeeds, they become the configuration a later plain reload or cold
+  respawn uses. Requires the same `control` capability as the plain form.
 
 ### 3.7 New session (`new_session`)
 
@@ -606,8 +614,12 @@ and without paying for it on every turn. `inject` appends a **custom
   session's current process: a retry with the same key answers
   `{"queued":true,"deduplicated":true}` without injecting twice, so a client
   that reconnects and re-injects does not duplicate its instruction. The
-  record lives as long as pi's own in-memory queue, so a respawn genuinely
-  requires re-injection.
+  record is cleared whenever a new pi process starts — a `gw_reload_session`,
+  or a cold respawn after hibernation or a daemon restart — so a re-injection
+  after a reload is genuinely forwarded, not falsely reported as already
+  installed. Keys are scoped to the **session**, not the client, and the map is
+  in memory for the process lifetime, so a shared session needs a namespaced
+  key (as in the example) and a per-turn key should be bounded by the client.
 - Ordering is the client's connection's FIFO with its prompts, so an
   instruction injected immediately before a prompt is in that prompt's
   context.
@@ -616,8 +628,10 @@ and without paying for it on every turn. `inject` appends a **custom
   being seen as a participant", and it is nameable.
 - Errors: `unknown_session` when unbound without a session to create;
   `session_crashed` when the session is not running; `not_supported` when the
-  managed pi has no `send_message` primitive (a `pi` older than the one this
-  revision targets). `bad_frame` for a malformed payload.
+  managed pi has no `send_message` primitive — as of this writing **no
+  released pi has it**, including 0.85.1, so `inject` succeeds only against a
+  pi that ships it. `bad_frame` for a malformed payload (no `message` object,
+  an empty `message.content`, or an unknown `deliverAs`).
 
 `steer` and `follow_up` are **not** the primitive: they are user messages that
 queue as work and can start a turn. Writing the instruction into the first
@@ -705,8 +719,9 @@ belongs to pi — and never kept only in memory. The record is what makes a
   spawn-only values from the record win; the requester's arguments are added
   only for canonical keys the record never set; its runtime parameters are
   applied at spawn as usual. A requester that names a key the record owns with
-a different value is not refused — the record wins — because the alternative is
-  "attach with your parameters or not at all".
+  a different value is not refused — the record wins — because the alternative
+  is "attach with your parameters or not at all". Those filled-in keys become
+  part of the record, so a later attach sees them.
 - If it **is live**:
   - runtime-applicable parameters (`--model`, `--provider`, `--thinking`,
     `--name`) are applied via RPC and change **shared** session state; this is
@@ -718,11 +733,20 @@ a different value is not refused — the record wins — because the alternative
     set, are not conflicts: the session keeps what it has. This is what lets
     pilish re-send `--approve` on every reload and lets an integration attach
     without having to guess the session's parameters first (R5).
-- The record is exposed in `gw_list_sessions[].spawn` (§3.2) so a client can
-  check before attaching and can tell a lost instruction from an absent one.
+- **R5 is about keys the record never set, not about any difference.** A
+  request that names a *recorded* key with a different value is still refused
+  while the session is live, but the same request against the same hibernated
+  session is accepted (the record wins). The asymmetry is deliberate: a live
+  spawn-only key cannot be changed without a restart, and the alternative —
+  refusing the attach — is the forced choice R5 removes.
+- The record is exposed in `gw_list_sessions[].spawn` (§3.2), redacted of
+  credential values, so a client can see what a respawn would use before
+  attaching.
 - `gw_delete_session` removes the record; `fork`/`clone` copies it to the new
   session; a session created before this mechanism has no record and behaves
-  exactly as before.
+  exactly as before. A record is never garbage-collected otherwise, and a
+  session created with `--no-session` has no path to key one by, so neither
+  has a durable configuration.
 - `gw_reload_session{piArgs}` (P4) **replaces** the recorded configuration and
   restarts pi with it. It is disruptive (a restart, and a re-attach for every
   client) and is intended for upgrading an instruction in the actual system

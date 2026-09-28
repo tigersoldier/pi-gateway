@@ -310,11 +310,16 @@ func (c *Client) GetCommands(ctx context.Context) ([]Command, error) {
 
 // ReloadSession restarts pi for a session (default: the bound one). It fails
 // with the reload_busy code while a turn runs or another client is attached,
-// unless force is set.
-func (c *Client) ReloadSession(ctx context.Context, session string, force bool) (*Response, error) {
+// unless force is set. Optional piArgs replace the session's recorded spawn
+// configuration (docs/protocol.md §4.3); without them the recorded
+// configuration is reused.
+func (c *Client) ReloadSession(ctx context.Context, session string, force bool, piArgs ...string) (*Response, error) {
 	fields := map[string]any{"force": force}
 	if session != "" {
 		fields["session"] = session
+	}
+	if len(piArgs) > 0 {
+		fields["piArgs"] = piArgs
 	}
 	return c.Do(ctx, "gw_reload_session", fields)
 }

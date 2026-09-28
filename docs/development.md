@@ -392,7 +392,8 @@ unless it is explicitly marked so.
     `admin` check would break it; with `inject` available the disruptive
     reload is not the normal path anyway.
 
-  Evidence: `go test -race ./...` green (192 test functions, +11: three
+  Evidence: `go test -race ./...` green (192 test functions at the first
+  commit, 199 after the follow-up fixes; +11 new: three
   `piargs` — canonical args, merge, corrupt-record fallback — and eight
   `internal/daemon` — restart survival, cold merge, live unrecorded key,
   catalog exposure, welcome features, inject + dedupe, not_supported, reload
@@ -413,6 +414,43 @@ unless it is explicitly marked so.
   text in the gateway's own path — the proposal's own rejection stands until
   pi exposes `send_message`).
 
+  **Follow-up review fixes** (independent reviewer subagents found these in
+  `4840d43`; fixed in the next commit). (1) **Security:** `spawn` was exposed
+  on every catalog row and, through `CatalogJSON`, on the unauthenticated
+  `/catalog`, so `--api-key` (an accepted spawn parameter) leaked to any local
+  process and to `observe`-only tokens; credential keys are now redacted from
+  `piargs.RedactedSpawnValues`, the debug catalog omits `spawn` entirely, and
+  the full value stays only in the sidecar's `piArgs` for respawn. (2)
+  **Dedupe lifetime:** `injects` was cleared on pi exit but not on
+  `handleRestart`, so a re-injection after `gw_reload_session` answered
+  `deduplicated:true` for an instruction the fresh pi never received; it is now
+  reset wherever a new pi process starts. (3) **P4 reload chain:** a
+  `gw_reload_session{piArgs}` updated the entry and sidecar but not
+  `Actor.params.PiArgs`, so a later plain reload respawned the old arguments
+  while the catalog advertised the new ones; the actor now adopts a
+  replacement as its parameters. (4) **`bad_frame`:** a malformed `inject`
+  (no `message`, empty `content`, unknown `deliverAs`) is now rejected as
+  documented instead of forwarded content-less. (5) **Boolean `=` spelling:**
+  `--approve=true` is normalized to pi's bare flag rather than forwarded as an
+  unknown flag, and `--no-approve=true`/`=false` no longer inverts the trust
+  value on the wire. (6) **Translation coupling:** the response rewrite keys on
+  the pending inject id, not on pi's echoed `send_message` name, so a future
+  upstream rename cannot reshape the client-visible response. Evidence: `go
+  test -race ./...` green with the new regression tests
+  (`TestInjectAfterReloadIsForwardedAgain`,
+  `TestReloadWithoutPiArgsKeepsReplacement`, `TestInjectMalformedIsBadFrame`,
+  `TestSpawnCatalogRedactsCredentialsAndIsAbsentFromDebug`,
+  `TestCatalogColdRowReadsSidecar`, the `piargs` bool-inline and redaction
+  tests); the first two were checked to fail with their fixes reverted, and
+  the real-model e2e lane ran green (suite A 15/15, suite B 9/9, 0
+  unexpected). One unrelated flake surfaced during this work and is **not**
+  introduced here: `gwclient.TestStopSessionClearsBinding` assumes the
+  terminal `gw_session_state{state:"stopped"}` reaches the client before the
+  stop response, which the daemon does not guarantee; it fails on base
+  `119f0f2` in a clean worktree as well. Fixing it (wait for the event in the
+  test, or clear the binding on a successful stop of the bound session) is a
+  separate follow-up.
+
 ### Open
 
 None. Every gap found while reviewing `docs/protocol.md` draft 2 has been
@@ -425,7 +463,10 @@ stay open as separate decisions:
 
 - **Durable creator tags.** `createdBy`/tags live in daemon memory, so
   `gw_list_sessions` creator filtering only describes sessions the running
-  daemon saw created; persisting them in the session file is the fix.
+  daemon saw created; the spawn sidecar persists a copy of the creator with
+  each session's configuration, but `listSessions` only reads it back for a
+  cold attach, so a hibernated row still reports no creator until then.
+  Persisting them independently in the session file is the full fix.
 - **Prompt idempotency.** A connection dropped after `prompt` leaves the
   prompt's fate ambiguous; a naive retry can duplicate a turn.
 - **Connection caps.** The planned commands-per-second,
@@ -473,7 +514,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (192 tests, a few minutes)
+go test -race ./...                       # everything (199 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

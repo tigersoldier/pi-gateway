@@ -173,7 +173,18 @@ func Parse(args []string) (*Spec, error) {
 			s.Values[key] = append(s.Values[key], val)
 			tokens := []string{flag}
 			if hasInline {
-				tokens = []string{flag + "=" + val}
+				// pi only accepts the bare boolean spelling; `--approve=false`
+				// is an unknown flag to it. Normalize to the flag that expresses
+				// the logical value, and drop a false with no opposite flag
+				// (omitting reproduces the default).
+				tokens = nil
+				if flag, ok := canonicalFlags[key]; ok && val == "true" {
+					tokens = []string{flag}
+				} else if opposite, ok := negatedBool[key]; ok {
+					if oflag, ok := canonicalFlags[opposite]; ok {
+						tokens = []string{oflag}
+					}
+				}
 			}
 			s.Args = append(s.Args, tokens...)
 			s.groups = append(s.groups, argGroup{key: key, tokens: tokens, value: val, runtime: isRuntimeKey(key)})
@@ -236,14 +247,30 @@ func (s *Spec) RuntimeValues() map[string]string {
 	return out
 }
 
-// SpawnArgs returns the accepted arguments for spawn-only keys, in their
-// original spelling and order.
-func (s *Spec) SpawnArgs() []string {
-	var out []string
-	for _, g := range s.groups {
-		if !g.runtime {
-			out = append(out, g.tokens...)
+// secretSpawnKeys are spawn parameters whose value is a credential and must
+// never be exposed through gw_list_sessions or the debug catalog. The value is
+// still persisted (it is needed to respawn) and still participates in conflict
+// detection; only the exposed view drops it.
+var secretSpawnKeys = map[string]bool{
+	"api-key": true,
+}
+
+// RedactedSpawnValues copies a spawn configuration for exposure, dropping
+// credential values. It never returns the input map, so callers cannot leak a
+// secret by mutating the result.
+func RedactedSpawnValues(values map[string][]string) map[string][]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(values))
+	for k, v := range values {
+		if secretSpawnKeys[k] {
+			continue
 		}
+		out[k] = append([]string(nil), v...)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

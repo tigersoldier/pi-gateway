@@ -2,6 +2,7 @@ package daemon_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -346,4 +347,195 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestInjectAfterReloadIsForwardedAgain is the dedupe-lifetime regression: a
+// gw_reload_session gives pi a fresh, empty in-memory queue, so a re-injection
+// with the same dedupeKey must be forwarded again, not answered
+// "deduplicated" (docs/protocol.md §3.11).
+func TestInjectAfterReloadIsForwardedAgain(t *testing.T) {
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	path := filepath.Join(t.TempDir(), "inject-reload.jsonl")
+	c := dial(t, addr, func(h *protocol.Hello) { h.Session = path })
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	inject := func(id string) map[string]any {
+		c.Send(map[string]any{
+			"type": "inject", "id": id, "dedupeKey": "K",
+			"message": map[string]any{"role": "custom", "customType": "test/ctx", "content": "instruction"},
+		})
+		return c.WaitResponse(id, testutil.DefaultTimeout)
+	}
+	if resp := inject("i1"); testutil.Obj(resp, "data")["deduplicated"] == true {
+		t.Fatalf("first inject was deduplicated: %v", resp)
+	}
+
+	c.Send(map[string]any{"type": "gw_reload_session", "id": "r1"})
+	if resp := c.WaitResponse("r1", testutil.DefaultTimeout); resp["success"] != true {
+		t.Fatalf("reload failed: %v", resp)
+	}
+
+	resp := inject("i2")
+	if resp["success"] != true || testutil.Obj(resp, "data")["deduplicated"] == true {
+		t.Fatalf("re-injection after reload was not forwarded: %v", resp)
+	}
+	b, _ := os.ReadFile(path)
+	if got := strings.Count(string(b), "test/ctx"); got != 2 {
+		t.Fatalf("custom messages after reload = %d, want 2:\n%s", got, b)
+	}
+}
+
+// TestReloadWithoutPiArgsKeepsReplacement pins that a replacement configuration
+// becomes the actor's parameters, so a later plain reload does not silently
+// respawn pi with the pre-replacement arguments (docs/protocol.md §4.3).
+func TestReloadWithoutPiArgsKeepsReplacement(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	path := filepath.Join(sessionsDir, "reload-chain.jsonl")
+	addr, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+
+	c := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "one"}
+	})
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+	if argv := waitForArgsFile(t, argsFile); !strings.Contains(argv, "one") {
+		t.Fatalf("initial argv = %q", argv)
+	}
+
+	_ = os.Remove(argsFile)
+	c.Send(map[string]any{
+		"type": "gw_reload_session", "id": "r1",
+		"piArgs": []string{"--append-system-prompt", "two"},
+	})
+	if resp := c.WaitResponse("r1", testutil.DefaultTimeout); resp["success"] != true {
+		t.Fatalf("replacement reload failed: %v", resp)
+	}
+	if argv := waitForArgsFile(t, argsFile); !strings.Contains(argv, "two") {
+		t.Fatalf("replacement argv = %q", argv)
+	}
+
+	_ = os.Remove(argsFile)
+	c.Send(map[string]any{"type": "gw_reload_session", "id": "r2"})
+	if resp := c.WaitResponse("r2", testutil.DefaultTimeout); resp["success"] != true {
+		t.Fatalf("plain reload failed: %v", resp)
+	}
+	argv := waitForArgsFile(t, argsFile)
+	if !strings.Contains(argv, "two") || strings.Contains(argv, "one") {
+		t.Fatalf("plain reload lost the replacement: %q", argv)
+	}
+}
+
+// TestInjectMalformedIsBadFrame pins the documented bad_frame contract for an
+// inject payload that carries no usable message.
+func TestInjectMalformedIsBadFrame(t *testing.T) {
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	c := dial(t, addr, func(h *protocol.Hello) { h.Session = filepath.Join(t.TempDir(), "x.jsonl") })
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	cases := []map[string]any{
+		{"type": "inject", "id": "m1"}, // no message
+		{"type": "inject", "id": "m2", "message": map[string]any{"customType": "x"}},                       // no content
+		{"type": "inject", "id": "m3", "deliverAs": "whenever", "message": map[string]any{"content": "x"}}, // bad deliverAs
+	}
+	for _, frame := range cases {
+		c.Send(frame)
+		id := testutil.Str(frame, "id")
+		resp := c.WaitResponse(id, testutil.DefaultTimeout)
+		if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeBadFrame {
+			t.Fatalf("%s = %v, want bad_frame", id, resp)
+		}
+	}
+}
+
+// TestSpawnCatalogRedactsCredentialsAndIsAbsentFromDebug covers the P3 leak:
+// an api-key is never exposed on gw_list_sessions, and the unauthenticated
+// debug catalog carries no spawn view at all.
+func TestSpawnCatalogRedactsCredentialsAndIsAbsentFromDebug(t *testing.T) {
+	d, addr := startDaemonHandle(t, nil)
+	const secret = "sk-secret-value"
+	const prompt = "PROMPT_MARKER_XYZ"
+	path := filepath.Join(t.TempDir(), "redact.jsonl")
+
+	c := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--api-key", secret, "--append-system-prompt", prompt}
+	})
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	c.Send(map[string]any{"type": "gw_list_sessions", "id": "l1"})
+	resp := c.WaitResponse("l1", testutil.DefaultTimeout)
+	raw, _ := json.Marshal(resp)
+	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), `"api-key"`) {
+		t.Fatalf("gw_list_sessions leaked the api-key: %s", raw)
+	}
+	found := false
+	for _, item := range testutil.Arr(testutil.Obj(resp, "data"), "sessions") {
+		row, _ := item.(map[string]any)
+		if testutil.Str(row, "path") != path {
+			continue
+		}
+		found = true
+		spawn := testutil.Obj(row, "spawn")
+		if got := testutil.StrSlice(spawn, "append-system-prompt"); len(got) != 1 || got[0] != prompt {
+			t.Fatalf("redacted spawn = %v, want the prompt", spawn)
+		}
+	}
+	if !found {
+		t.Fatalf("session %s missing from catalog", path)
+	}
+
+	body, err := d.CatalogJSON("", 0)
+	if err != nil {
+		t.Fatalf("CatalogJSON: %v", err)
+	}
+	if strings.Contains(string(body), secret) || strings.Contains(string(body), prompt) || strings.Contains(string(body), `"spawn"`) {
+		t.Fatalf("debug catalog leaked spawn data: %s", body)
+	}
+}
+
+// TestCatalogColdRowReadsSidecar covers the catalog path a client takes before
+// attaching to a hibernated session: the row's spawn view comes from the
+// durable record, not from a live actor (docs/protocol.md §3.2).
+func TestCatalogColdRowReadsSidecar(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	path := filepath.Join(sessionsDir, "cold-row.jsonl")
+
+	addr, stop := startDaemonWithState(t, stateDir, sessionsDir, nil)
+	a := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--append-system-prompt", "cold"}
+	})
+	a.WaitType("gw_welcome", testutil.DefaultTimeout)
+	waitForArgsFile(t, argsFile)
+	a.Close()
+	stop()
+
+	// A fresh daemon has no actor for the file: the row must come from the
+	// sidecar.
+	addr2, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+	b := dial(t, addr2, nil)
+	b.WaitType("gw_welcome", testutil.DefaultTimeout)
+	b.Send(map[string]any{"type": "gw_list_sessions", "id": "l1"})
+	resp := b.WaitResponse("l1", testutil.DefaultTimeout)
+	for _, item := range testutil.Arr(testutil.Obj(resp, "data"), "sessions") {
+		row, _ := item.(map[string]any)
+		if testutil.Str(row, "path") != path {
+			continue
+		}
+		if row["live"] == true {
+			t.Fatalf("expected a cold row, got live: %v", row)
+		}
+		got := testutil.StrSlice(testutil.Obj(row, "spawn"), "append-system-prompt")
+		if len(got) != 1 || got[0] != "cold" {
+			t.Fatalf("cold row spawn = %v, want append-system-prompt cold", row["spawn"])
+		}
+		return
+	}
+	t.Fatalf("session %s not in catalog: %v", path, resp)
 }
