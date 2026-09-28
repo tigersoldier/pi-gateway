@@ -212,86 +212,11 @@ func TestWelcomeAdvertisesFeatures(t *testing.T) {
 	c := dial(t, addr, nil)
 	w := c.WaitType("gw_welcome", testutil.DefaultTimeout)
 	features := testutil.StrSlice(w, "features")
-	for _, want := range []string{protocol.FeatureInject, protocol.FeatureSpawnConfig} {
-		if !contains(features, want) {
-			t.Fatalf("features = %v, want %q", features, want)
-		}
+	if !contains(features, protocol.FeatureSpawnConfig) {
+		t.Fatalf("features = %v, want %q", features, protocol.FeatureSpawnConfig)
 	}
-}
-
-// TestInjectNonTurnAndDedupe is P1: injection appends to the context without a
-// turn, and a retried dedupe key is answered without a duplicate.
-func TestInjectNonTurnAndDedupe(t *testing.T) {
-	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
-	path := filepath.Join(t.TempDir(), "inject.jsonl")
-	c := dial(t, addr, func(h *protocol.Hello) { h.Session = path })
-	c.WaitType("gw_welcome", testutil.DefaultTimeout)
-
-	c.Send(map[string]any{
-		"type": "inject", "id": "i1", "deliverAs": "nextTurn", "dedupeKey": "slack:1",
-		"message": map[string]any{
-			"role": "custom", "customType": "pi-chat/context", "display": false,
-			"content": "the retry logic is off limits",
-		},
-	})
-	resp := c.WaitResponse("i1", testutil.DefaultTimeout)
-	if resp["success"] != true || testutil.Str(resp, "command") != "inject" {
-		t.Fatalf("inject response = %v", resp)
-	}
-	if testutil.Obj(resp, "data")["queued"] != true {
-		t.Fatalf("inject data = %v, want queued:true", resp["data"])
-	}
-
-	// The message is in the session file as a custom (non-user) entry.
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read session file: %v", err)
-	}
-	if !strings.Contains(string(b), "pi-chat/context") || !strings.Contains(string(b), "retry logic is off limits") {
-		t.Fatalf("injection not persisted:\n%s", b)
-	}
-
-	// A retried dedupe key is a de-duplicated success, not a second entry.
-	c.Send(map[string]any{
-		"type": "inject", "id": "i2", "deliverAs": "nextTurn", "dedupeKey": "slack:1",
-		"message": map[string]any{"role": "custom", "customType": "pi-chat/context", "content": "the retry logic is off limits"},
-	})
-	resp2 := c.WaitResponse("i2", testutil.DefaultTimeout)
-	if resp2["success"] != true || testutil.Obj(resp2, "data")["deduplicated"] != true {
-		t.Fatalf("dedupe response = %v", resp2)
-	}
-	b2, _ := os.ReadFile(path)
-	if strings.Count(string(b2), "pi-chat/context") != 1 {
-		t.Fatalf("dedupe key did not collapse the retry:\n%s", b2)
-	}
-
-	// No turn was started by either injection.
-	for _, f := range c.Drain(150 * time.Millisecond) {
-		switch f["type"] {
-		case "agent_start", "turn_start", "gw_turn":
-			t.Fatalf("inject started a turn: %v", f)
-		}
-	}
-}
-
-// TestInjectReportsNotSupported is P1's dependency answer: a pi without the
-// underlying primitive produces not_supported, not a generic failure.
-func TestInjectReportsNotSupported(t *testing.T) {
-	addr, _ := startDaemonOpts(t, func(c *daemon.Config) {
-		c.IdleTimeout, c.ShortGrace = 30*time.Second, 5*time.Second
-	})
-	t.Setenv("FAKEPI_NO_SEND_MESSAGE", "1")
-	path := filepath.Join(t.TempDir(), "inject-unsupported.jsonl")
-	c := dial(t, addr, func(h *protocol.Hello) { h.Session = path })
-	c.WaitType("gw_welcome", testutil.DefaultTimeout)
-
-	c.Send(map[string]any{
-		"type": "inject", "id": "i1",
-		"message": map[string]any{"role": "custom", "customType": "x", "content": "hi"},
-	})
-	resp := c.WaitResponse("i1", testutil.DefaultTimeout)
-	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeNotSupported {
-		t.Fatalf("unsupported inject = %v, want not_supported", resp)
+	if contains(features, "inject") {
+		t.Fatalf("features still advertise the removed inject command: %v", features)
 	}
 }
 
@@ -349,42 +274,6 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-// TestInjectAfterReloadIsForwardedAgain is the dedupe-lifetime regression: a
-// gw_reload_session gives pi a fresh, empty in-memory queue, so a re-injection
-// with the same dedupeKey must be forwarded again, not answered
-// "deduplicated" (docs/protocol.md §3.11).
-func TestInjectAfterReloadIsForwardedAgain(t *testing.T) {
-	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
-	path := filepath.Join(t.TempDir(), "inject-reload.jsonl")
-	c := dial(t, addr, func(h *protocol.Hello) { h.Session = path })
-	c.WaitType("gw_welcome", testutil.DefaultTimeout)
-
-	inject := func(id string) map[string]any {
-		c.Send(map[string]any{
-			"type": "inject", "id": id, "dedupeKey": "K",
-			"message": map[string]any{"role": "custom", "customType": "test/ctx", "content": "instruction"},
-		})
-		return c.WaitResponse(id, testutil.DefaultTimeout)
-	}
-	if resp := inject("i1"); testutil.Obj(resp, "data")["deduplicated"] == true {
-		t.Fatalf("first inject was deduplicated: %v", resp)
-	}
-
-	c.Send(map[string]any{"type": "gw_reload_session", "id": "r1"})
-	if resp := c.WaitResponse("r1", testutil.DefaultTimeout); resp["success"] != true {
-		t.Fatalf("reload failed: %v", resp)
-	}
-
-	resp := inject("i2")
-	if resp["success"] != true || testutil.Obj(resp, "data")["deduplicated"] == true {
-		t.Fatalf("re-injection after reload was not forwarded: %v", resp)
-	}
-	b, _ := os.ReadFile(path)
-	if got := strings.Count(string(b), "test/ctx"); got != 2 {
-		t.Fatalf("custom messages after reload = %d, want 2:\n%s", got, b)
-	}
-}
-
 // TestReloadWithoutPiArgsKeepsReplacement pins that a replacement configuration
 // becomes the actor's parameters, so a later plain reload does not silently
 // respawn pi with the pre-replacement arguments (docs/protocol.md §4.3).
@@ -425,28 +314,6 @@ func TestReloadWithoutPiArgsKeepsReplacement(t *testing.T) {
 	argv := waitForArgsFile(t, argsFile)
 	if !strings.Contains(argv, "two") || strings.Contains(argv, "one") {
 		t.Fatalf("plain reload lost the replacement: %q", argv)
-	}
-}
-
-// TestInjectMalformedIsBadFrame pins the documented bad_frame contract for an
-// inject payload that carries no usable message.
-func TestInjectMalformedIsBadFrame(t *testing.T) {
-	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
-	c := dial(t, addr, func(h *protocol.Hello) { h.Session = filepath.Join(t.TempDir(), "x.jsonl") })
-	c.WaitType("gw_welcome", testutil.DefaultTimeout)
-
-	cases := []map[string]any{
-		{"type": "inject", "id": "m1"}, // no message
-		{"type": "inject", "id": "m2", "message": map[string]any{"customType": "x"}},                       // no content
-		{"type": "inject", "id": "m3", "deliverAs": "whenever", "message": map[string]any{"content": "x"}}, // bad deliverAs
-	}
-	for _, frame := range cases {
-		c.Send(frame)
-		id := testutil.Str(frame, "id")
-		resp := c.WaitResponse(id, testutil.DefaultTimeout)
-		if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeBadFrame {
-			t.Fatalf("%s = %v, want bad_frame", id, resp)
-		}
 	}
 }
 

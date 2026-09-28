@@ -45,7 +45,7 @@ func TestLoadTokensResolvesRolesAndCapabilities(t *testing.T) {
 		t.Fatalf("grants = %v", grants)
 	}
 	if grants[0].Name != "slack" || !reflect.DeepEqual(grants[0].Capabilities,
-		[]string{protocol.CapObserve, protocol.CapInterject, protocol.CapPrompt, protocol.CapContext, protocol.CapUI}) {
+		[]string{protocol.CapObserve, protocol.CapInterject, protocol.CapPrompt, protocol.CapUI}) {
 		t.Fatalf("slack grant = %+v", grants[0])
 	}
 	// Explicit capability lists are normalized into canonical order.

@@ -565,20 +565,17 @@ first client to attach after a restart decides how pi is spawned.
 - `gw_delete_session` removes the record, `fork`/`clone` copies it, and
   `gw_reload_session{piArgs}` replaces it deliberately.
 
-### 6.4 Context injection
+**Standing instructions are not a gateway feature.** pi exposes the non-turn
+message primitive to extensions only; no released pi reaches it over RPC, so
+the gateway deliberately provides no context-injection command — one that
+could only answer `not_supported` would mislead clients into depending on it.
+An integration with a standing instruction puts it in the first prompt it
+sends in a session, wrapped in integration-specific markers
+(`<slack-specific-instructions>…</slack-specific-instructions>`), or installs
+it into the system prompt at spawn with `--append-system-prompt` when it
+creates the session (where the durable record re-applies it).
 
-`inject` appends a custom (non-user) message to a live session's context
-without starting a turn. It is a daemon-transformed command: the nested
-`message` is hoisted onto pi's `send_message` primitive, `triggerTurn` is
-forced false, and the response is translated back with the `inject` command
-name and `{queued:true}`. The daemon owns the optional `dedupeKey` (a retry
-after a reconnect must not duplicate the instruction), and pi owns the
-session file and the context — the gateway never writes either behind pi's
-back. Where `prompt`/`steer`/`follow_up` are user messages that can start or
-join work, an injection is context the model sees but no participant typed.
-It is capability `context`, separate from `prompt`.
-
-### 6.5 Global mutations
+### 6.4 Global mutations
 
 Shared-state commands (`set_model`, `cycle_model`, `set_thinking_level`,
 `set_steering_mode`, `set_follow_up_mode`, `compact`, `set_auto_compaction`,
@@ -587,7 +584,7 @@ Shared-state commands (`set_model`, `cycle_model`, `set_thinking_level`,
 Per-connection changes (`switch_session`, `new_session`, sole-client
 `fork`/`clone`) rebind only the requester and do not notify others.
 
-### 6.6 Response semantics
+### 6.5 Response semantics
 
 `success: true` on `prompt` means **accepted or queued**, not complete. Clients
 wait for `agent_settled` (or `gw_turn{state:"settled"}`). Responses are

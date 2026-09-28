@@ -73,7 +73,6 @@ func main() {
 		events:         envInt("FAKEPI_TURN_EVENTS", 3),
 		delay:          time.Duration(envInt("FAKEPI_TURN_DELAY_MS", 15)) * time.Millisecond,
 		rejectPrompt:   os.Getenv("FAKEPI_REJECT_PROMPT") != "",
-		noSendMessage:  os.Getenv("FAKEPI_NO_SEND_MESSAGE") != "",
 		uiRequest:      os.Getenv("FAKEPI_UI_REQUEST") != "",
 		withCommands:   os.Getenv("FAKEPI_COMMANDS") != "",
 		exitAfterFirst: os.Getenv("FAKEPI_EXIT_AFTER_FIRST_TURN") != "",
@@ -117,7 +116,6 @@ type state struct {
 	events         int
 	delay          time.Duration
 	rejectPrompt   bool
-	noSendMessage  bool
 	uiRequest      bool
 	withCommands   bool
 	exitAfterFirst bool
@@ -340,13 +338,6 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 		respond("get_commands", true, map[string]any{"commands": s.commandList()}, "")
 	case "prompt":
 		s.handlePrompt(c, msg, respond)
-	case "send_message":
-		if s.noSendMessage {
-			respond("send_message", false, nil, "Unknown command: send_message")
-			break
-		}
-		s.handleSendMessage(msg)
-		respond("send_message", true, map[string]any{"queued": true}, "")
 	case "abort":
 		s.handleAbort()
 		respond("abort", true, map[string]any{}, "")
@@ -460,23 +451,6 @@ func (s *state) flushOnExitFile() {
 	s.appendEntry(map[string]any{"type": "message", "message": map[string]any{
 		"role": "assistant", "content": "flushed during shutdown",
 	}})
-}
-
-// handleSendMessage records a non-turn custom message in the session file, the
-// way pi's send_message primitive does: it participates in the LLM context but
-// is not a user turn.
-func (s *state) handleSendMessage(msg map[string]any) {
-	entry := map[string]any{
-		"type":       "custom_message",
-		"customType": msg["customType"],
-		"content":    msg["content"],
-	}
-	if display, ok := msg["display"].(bool); ok {
-		entry["display"] = display
-	}
-	s.mu.Lock()
-	s.appendEntry(entry)
-	s.mu.Unlock()
 }
 
 // handleAbort unwinds the running turn: the turn goroutine stops streaming

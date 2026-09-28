@@ -98,46 +98,6 @@ func (c *Client) FollowUp(ctx context.Context, message string, images ...protoco
 	return c.Do(ctx, "follow_up", messageFields(message, images))
 }
 
-// InjectRequest is the payload of a context injection (docs/protocol.md
-// §3.11). Content is the text pi adds to the session context; CustomType names
-// the message so the model and any renderer can tell it apart from a person
-// typing. Display controls whether an attached terminal renders it.
-// DeliverAs selects when the message joins the context: "nextTurn" (default),
-// "steer", or "followUp". DedupeKey, when non-empty, makes a retry after a
-// reconnect a no-op instead of a duplicate injection.
-type InjectRequest struct {
-	CustomType string
-	Content    string
-	Display    *bool
-	DeliverAs  string
-	DedupeKey  string
-}
-
-// Inject appends a message to the session context without starting a turn. It
-// is a custom (non-user) message, so it participates in the LLM context
-// without appearing as the person typing. The response reports `queued:true`
-// for acceptance; like Prompt it is not completion. It fails with the
-// not_supported code when the managed pi does not implement the underlying
-// primitive.
-func (c *Client) Inject(ctx context.Context, req InjectRequest) (*Response, error) {
-	message := map[string]any{
-		"role":       "custom",
-		"customType": req.CustomType,
-		"content":    req.Content,
-	}
-	if req.Display != nil {
-		message["display"] = *req.Display
-	}
-	fields := map[string]any{"message": message}
-	if req.DeliverAs != "" {
-		fields["deliverAs"] = req.DeliverAs
-	}
-	if req.DedupeKey != "" {
-		fields["dedupeKey"] = req.DedupeKey
-	}
-	return c.Do(ctx, "inject", fields)
-}
-
 // messageFields builds a prompt/steer/follow_up payload. Images are copied so
 // an empty Type is filled in without mutating the caller's slice.
 func messageFields(message string, images []protocol.ImageContent) map[string]any {

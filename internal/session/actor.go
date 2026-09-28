@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -258,14 +257,6 @@ type Actor struct {
 	pendingUI         map[string]*uiPending
 	lastActive        map[string]time.Time
 	restarting        bool
-	// injects are the dedupe keys of context injections pi has accepted, so a
-	// reconnect that retries an inject does not duplicate the instruction.
-	// The record lives as long as the actor, matching pi's own in-memory queue
-	// (docs/protocol.md §3.11).
-	injects map[string]bool
-	// pendingInject maps a forwarded send_message id to its dedupe key, so the
-	// key is only remembered once pi accepted the command.
-	pendingInject map[string]string
 
 	// terminalState is what shutdown publishes (stateStopped, or stateDeleted
 	// for gw_delete_session). pendingStop is the forced stop waiting for the
@@ -326,8 +317,6 @@ func NewActor(p Params) *Actor {
 		owners:            make(map[string]string),
 		pendingUI:         make(map[string]*uiPending),
 		lastActive:        make(map[string]time.Time),
-		injects:           make(map[string]bool),
-		pendingInject:     make(map[string]string),
 	}
 	a.hub.SetMetrics(p.Metrics)
 	a.timer = time.NewTimer(time.Hour)
@@ -770,8 +759,6 @@ func (a *Actor) handleCommand(c ClientCommand) {
 		a.handlePrompt(c)
 	case "steer":
 		a.forward(c)
-	case "inject":
-		a.handleInject(c)
 	case "abort":
 		// Session-wide; requires `interject`, like steer (docs/protocol.md §10).
 		a.forward(c)
@@ -868,119 +855,6 @@ func (a *Actor) forward(c ClientCommand) {
 	ns := protocol.NamespaceID(c.Client.ID(), c.LocalID)
 	a.owners[ns] = c.Client.ID()
 	a.forwardRaw(c, ns)
-}
-
-// Gateway constants for the inject translation. Keeping pi's command name in
-// one place makes a future upstream rename a one-line change.
-const (
-	piSendMessageCommand      = "send_message"
-	injectPayloadQueued       = `{"queued":true}`
-	injectPayloadDeduplicated = `{"queued":true,"deduplicated":true}`
-	// maxInjectDedupeKeys bounds the per-session dedupe memory. Dedupe is
-	// best-effort: at this many distinct keys the oldest are dropped wholesale
-	// rather than growing the map for the actor's lifetime.
-	maxInjectDedupeKeys = 4096
-)
-
-// handleInject forwards a context injection to pi as its send_message
-// primitive. It never starts a turn: pi decides when the message joins the
-// context from `deliverAs`, and the message is a custom (non-user) entry
-// (docs/protocol.md §3.11). A dedupe key makes a retry after a reconnect a
-// no-op instead of a duplicated instruction.
-func (a *Actor) handleInject(c ClientCommand) {
-	if a.state != stateReady || a.pi == nil {
-		a.errorResponse(c, protocol.CodeSessionCrashed, "session is not running")
-		return
-	}
-	ns := protocol.NamespaceID(c.Client.ID(), c.LocalID)
-	raw, err := buildSendMessage(c.Raw, ns)
-	if err != nil {
-		a.errorResponse(c, protocol.CodeBadFrame, err.Error())
-		return
-	}
-	key := protocol.Field(c.Raw, "dedupeKey")
-	if key != "" && a.injects[key] {
-		a.respond(c, true, []byte(injectPayloadDeduplicated))
-		return
-	}
-	if err := a.pi.Send(raw); err != nil {
-		a.errorResponse(c, protocol.CodeSessionCrashed, err.Error())
-		return
-	}
-	a.owners[ns] = c.Client.ID()
-	// Track every forwarded injection, not just keyed ones: the response
-	// translation keys on this id so it does not depend on pi's echoed command
-	// name (a rename must not reshape the client-visible response).
-	a.pendingInject[ns] = key
-}
-
-// buildSendMessage validates the gateway's inject frame and maps it onto pi's
-// flat send_message command: the nested custom message is hoisted, dedupeKey
-// stays at the gateway, and triggerTurn is forced false because an injection
-// never starts a turn (docs/protocol.md §3.11).
-func buildSendMessage(raw []byte, ns string) ([]byte, error) {
-	var obj map[string]any
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf("inject: %w", err)
-	}
-	msg, ok := obj["message"].(map[string]any)
-	if !ok {
-		return nil, errors.New("inject requires a message object")
-	}
-	content, _ := msg["content"].(string)
-	if content == "" {
-		return nil, errors.New("inject requires a non-empty message.content")
-	}
-	customType, _ := msg["customType"].(string)
-	if customType == "" {
-		customType = "pi-gateway/inject"
-	}
-	out := map[string]any{
-		"type":        piSendMessageCommand,
-		"id":          ns,
-		"triggerTurn": false,
-		"customType":  customType,
-		"content":     content,
-	}
-	if v, ok := msg["display"]; ok {
-		out["display"] = v
-	}
-	if v, ok := obj["deliverAs"].(string); ok && v != "" {
-		switch v {
-		case "nextTurn", "steer", "followUp":
-			out["deliverAs"] = v
-		default:
-			return nil, fmt.Errorf("inject: unknown deliverAs %q", v)
-		}
-	}
-	return json.Marshal(out)
-}
-
-// translateInject rewrites pi's send_message response into the gateway's
-// inject shape: the command name the client used, a `{queued:true}` success
-// payload, and `not_supported` when the managed pi does not know the command
-// (docs/protocol.md §3.11).
-func (a *Actor) translateInject(rec protocol.Record) ([]byte, bool) {
-	key, pending := a.pendingInject[rec.ID]
-	if pending {
-		delete(a.pendingInject, rec.ID)
-	}
-	success := protocol.BoolField(rec.Raw, "success", false)
-	if success {
-		if pending && key != "" {
-			if len(a.injects) >= maxInjectDedupeKeys {
-				a.injects = make(map[string]bool)
-			}
-			a.injects[key] = true
-		}
-		return protocol.Response(rec.ID, "inject", true, "", "", []byte(injectPayloadQueued)), true
-	}
-	msg := protocol.Field(rec.Raw, "error")
-	code := ""
-	if strings.HasPrefix(msg, "Unknown command") {
-		code = protocol.CodeNotSupported
-	}
-	return protocol.Response(rec.ID, "inject", false, code, msg, nil), true
 }
 
 func (a *Actor) forwardRaw(c ClientCommand, ns string) {
@@ -1172,17 +1046,6 @@ func (a *Actor) handlePiEvent(rec protocol.Record) {
 				rec.Raw = raw
 			}
 		}
-		// Context injection is the gateway's `inject`; pi answers the
-		// underlying `send_message`, so the response is translated back to the
-		// client-facing command (docs/protocol.md §3.11). Keying on the pending
-		// request id — not on pi's echoed command name — keeps the client-facing
-		// shape stable if pi renames its primitive and avoids rewriting a
-		// hand-sent `send_message` the daemon never originated.
-		if _, pending := a.pendingInject[rec.ID]; pending {
-			if raw, ok := a.translateInject(rec); ok {
-				rec.Raw = raw
-			}
-		}
 	}
 	if rec.Type == "extension_ui_request" && !a.routeUI(&rec) {
 		return // no ui-capable client: pi's own dialog timeout applies
@@ -1332,8 +1195,6 @@ func (a *Actor) handlePiExit() {
 	a.failInternalCallbacks()
 	a.pendingUI = make(map[string]*uiPending)
 	a.forkPending = make(map[string]bool)
-	a.pendingInject = make(map[string]string)
-	a.injects = make(map[string]bool)
 	if a.attached.Load() == 0 {
 		a.dead = true
 	}
@@ -1587,11 +1448,6 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 	a.failTurn()
 	a.pendingUI = make(map[string]*uiPending)
 	a.forkPending = make(map[string]bool)
-	// A new pi process means an empty in-memory queue: forget the dedupe keys
-	// pi accepted, or a re-injection after a reload would be answered
-	// "deduplicated" while the instruction is gone (docs/protocol.md §3.11).
-	a.injects = make(map[string]bool)
-	a.pendingInject = make(map[string]string)
 
 	pi, err := a.spawnPiArgs(req.piArgs)
 	if err != nil {

@@ -91,6 +91,12 @@ func (c *conn) handleStop(raw []byte, deleteFile bool) {
 		}
 	}
 
+	// Capture whether this command targets the requester's own binding before
+	// the stop runs: the pump may process the terminal gw_session_state and
+	// unbind this connection while we wait for pi, which would make the check
+	// after the fact report false for a self stop.
+	unbound := actor != nil && actor == c.bound()
+
 	// A delete tombstones the path before anything is stopped, so neither a
 	// concurrent attach nor the window before the file is removed can
 	// resurrect the session (docs/protocol.md §3.10).
@@ -165,7 +171,6 @@ func (c *conn) handleStop(raw []byte, deleteFile bool) {
 	// unbound reports whether this command detached the requester from its own
 	// bound session, so a client can clear its binding without waiting for the
 	// terminal gw_session_state (which may lag the response).
-	unbound := actor != nil && actor == c.bound()
 	body := map[string]any{
 		"path":            res.Path,
 		"name":            res.Name,

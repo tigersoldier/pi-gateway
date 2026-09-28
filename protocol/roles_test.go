@@ -11,7 +11,7 @@ func TestRoleCapabilities(t *testing.T) {
 		t.Fatalf("admin = %v, ok=%v", admin, ok)
 	}
 	operator, ok := RoleCapabilities(RoleOperator)
-	if !ok || !reflect.DeepEqual(operator, []string{CapObserve, CapInterject, CapPrompt, CapContext, CapUI}) {
+	if !ok || !reflect.DeepEqual(operator, []string{CapObserve, CapInterject, CapPrompt, CapUI}) {
 		t.Fatalf("operator = %v, ok=%v", operator, ok)
 	}
 	observer, ok := RoleCapabilities(RoleObserver)
@@ -54,7 +54,6 @@ func TestCommandCapability(t *testing.T) {
 		"clone":                 CapPrompt,
 		"bash":                  CapPrompt,
 		"switch_session":        CapPrompt,
-		"inject":                CapContext,
 		"steer":                 CapInterject,
 		"abort":                 CapInterject,
 		"abort_bash":            CapInterject,
