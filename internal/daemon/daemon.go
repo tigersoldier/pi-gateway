@@ -1014,6 +1014,12 @@ func looksLikePath(target string) bool {
 }
 
 func canonicalPath(path string) string {
+	// An unknown session path has no canonical form. Without this, filepath.Abs("")
+	// resolves to the process working directory, so callers' `canon != ""`
+	// guards would silently accept it (GH-1).
+	if path == "" {
+		return ""
+	}
 	if strings.HasPrefix(path, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
 			path = filepath.Join(home, path[2:])

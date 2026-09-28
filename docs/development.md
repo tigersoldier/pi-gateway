@@ -508,6 +508,32 @@ unless it is explicitly marked so.
   assumed the terminal event was written before the response; they are
   enqueued by different goroutines, so it now waits for the event (it flaked
   under a loaded full-suite run).
+- **`gw_new_session` wrote a spawn sidecar keyed by the daemon's cwd** (issue
+  #1, found verifying v0.1.3 end to end). `handleGWNewSession` calls
+  `setCreated` before pi answers `get_state`, so the actor's path is still
+  empty; `setCreated` computed `canonicalPath("")`, and `canonicalPath` used
+  `filepath.Abs`, which resolves `""` to the process working directory. The
+  `canon != ""` guard it was written with could therefore never fire. Every
+  created session left an extra record under `<stateDir>/spawn/<sha256(cwd)>.json`;
+  all of them shared one key, so the file held whichever session was created
+  last, and `gw_delete_session` (which keys on the session path) could never
+  remove it. The correct record was written a moment later by `onPath`, so
+  respawn behaviour was unaffected — this was hygiene, not data loss.
+  `canonicalPath` now returns `""` for an empty input, so the guards in
+  `setCreated`, in `replaceSpawn`, and around `isTombstoned` in `bind` all mean
+  what they read like. The fix is at the helper rather than one call site
+  because the empty-path trap is shared by all of them (`replaceSpawn` has the
+  same latent bug for an unregistered actor). Evidence: `go test -race ./...`
+  green; the regression tests `TestNewSessionWritesOneSpawnRecord` (creates a
+  session with `piArgs` through `gw_new_session` and asserts the spawn
+  directory holds exactly one record, keyed by the returned path) and
+  `TestCanonicalPathOfEmptyIsEmpty` both fail with the fix reverted (the
+  former saw two records — the real one plus `<sha256(cwd)>`; the latter saw
+  the daemon's working directory). Rejected: dropping the `setCreated` persist
+  and letting `onPath`/`replaceSpawn` be the only writers (also correct and
+  smaller, but it leaves `canonicalPath("") == cwd` for the other
+  `canon != ""` guards, so the same class of bug can return at the next call
+  site).
 
 ### Open
 

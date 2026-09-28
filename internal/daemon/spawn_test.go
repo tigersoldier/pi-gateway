@@ -2,6 +2,8 @@ package daemon_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/config"
 	"github.com/tigersoldier/pi-gateway/internal/daemon"
 	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/internal/testutil"
@@ -108,6 +111,81 @@ func TestSpawnConfigSurvivesDaemonRestart(t *testing.T) {
 	if !strings.Contains(argv, "one") {
 		t.Fatalf("respawn lost the recorded spawn parameter: %q", argv)
 	}
+}
+
+// TestNewSessionWritesOneSpawnRecord is GH-1: gw_new_session used to persist a
+// spawn sidecar before pi reported the session path, and canonicalPath("") resolved
+// to the daemon's working directory, so every created session also wrote a record
+// under <sha256(cwd)>. That record could never be deleted (gw_delete_session keys
+// on the session path) and was overwritten by the next created session. Creating
+// one session must leave exactly one sidecar, keyed by the path pi reported.
+func TestNewSessionWritesOneSpawnRecord(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionsDir := t.TempDir()
+	addr, _ := startDaemonWithState(t, stateDir, sessionsDir, nil)
+
+	c := dial(t, addr, nil)
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+	c.Send(map[string]any{
+		"type":   "gw_new_session",
+		"id":     "n1",
+		"name":   "probe",
+		"piArgs": []string{"--append-system-prompt", "MARKER"},
+	})
+	resp := c.WaitResponse("n1", testutil.DefaultTimeout)
+	if resp["success"] != true {
+		t.Fatalf("gw_new_session failed: %v", resp)
+	}
+	path := testutil.Str(testutil.Obj(resp, "data"), "path")
+	if path == "" {
+		t.Fatalf("gw_new_session returned no path: %v", resp)
+	}
+	canon := resolvedPath(t, path)
+
+	spawnDir := config.SpawnDir(stateDir)
+	entries, err := os.ReadDir(spawnDir)
+	if err != nil {
+		t.Fatalf("read spawn dir: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(entries) != 1 {
+		t.Fatalf("spawn dir holds %d records %v, want exactly one keyed by %s", len(entries), names, canon)
+	}
+	sum := sha256.Sum256([]byte(canon))
+	if want := hex.EncodeToString(sum[:]) + ".json"; names[0] != want {
+		t.Fatalf("sidecar name = %q, want %q (keyed by %s)", names[0], want, canon)
+	}
+	raw, err := os.ReadFile(filepath.Join(spawnDir, names[0]))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	var rec struct {
+		Path  string              `json:"path"`
+		Spawn map[string][]string `json:"spawn"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("parse sidecar: %v", err)
+	}
+	if rec.Path != canon {
+		t.Fatalf("sidecar path = %q, want %q", rec.Path, canon)
+	}
+	if got := rec.Spawn["append-system-prompt"]; len(got) != 1 || got[0] != "MARKER" {
+		t.Fatalf("sidecar spawn = %v, want append-system-prompt MARKER", rec.Spawn)
+	}
+}
+
+// resolvedPath mirrors how the daemon canonicalizes a session path: the file
+// exists, so EvalSymlinks resolves it.
+func resolvedPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return resolved
 }
 
 // TestColdAttachMergesUnrecordedSpawnKeys pins the merge rule: a recorded key
