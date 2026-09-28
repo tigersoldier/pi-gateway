@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -491,24 +492,9 @@ func (d *Daemon) setCreated(a *session.Actor, ref protocol.ClientRef, tags map[s
 	}
 }
 
-// Row is one gw_list_sessions entry (docs/protocol.md §3.2).
-type Row struct {
-	Path         string                   `json:"path"`
-	Name         string                   `json:"name,omitempty"`
-	Title        string                   `json:"title,omitempty"`
-	ID           string                   `json:"id,omitempty"`
-	Cwd          string                   `json:"cwd,omitempty"`
-	Live         bool                     `json:"live"`
-	IsStreaming  bool                     `json:"isStreaming"`
-	MessageCount int                      `json:"messageCount"`
-	LastActivity string                   `json:"lastActivity,omitempty"`
-	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
-	Clients      []protocol.ClientSummary `json:"clients,omitempty"`
-	// Spawn is the session's recorded spawn-only configuration, so a client
-	// can tell a lost instruction from one that was never installed before it
-	// attaches (docs/protocol.md §3.2, §4.3).
-	Spawn map[string][]string `json:"spawn,omitempty"`
-}
+// Row is one gw_list_sessions entry. It is an alias for the shared wire type
+// so the daemon and gwclient cannot drift (docs/protocol.md §3.2).
+type Row = protocol.SessionRow
 
 // listSessions builds the session catalog: files newest first, enriched with
 // the live actors' state.
@@ -535,8 +521,10 @@ func (d *Daemon) listSessions(cwd string, liveOnly bool, limit int) []Row {
 		}
 		d.decorate(&row, canon, live)
 		if row.Spawn == nil {
-			if rec, ok := d.spawn.Load(canon); ok {
+			if rec, err := d.spawn.Load(canon); err == nil {
 				row.Spawn = rec.Spawn
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				d.log.Debug("cannot read spawn configuration", "session", canon, "err", err)
 			}
 		}
 		if liveOnly && !row.Live {
@@ -687,7 +675,11 @@ func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protoc
 		// Cold spawn: a recorded spawn configuration wins over the attaching
 		// client's (docs/protocol.md §4.3). Without a record this is exactly
 		// the historical behavior: the requester supplies the parameters.
-		rec, recorded := d.spawn.Load(canon)
+		rec, recErr := d.spawn.Load(canon)
+		recorded := recErr == nil
+		if recErr != nil && !errors.Is(recErr, fs.ErrNotExist) {
+			d.log.Warn("cannot read spawn configuration", "session", canon, "err", recErr)
+		}
 		effSpec := spec
 		effCwd := spawnCwd(canon, "")
 		if recorded {

@@ -150,7 +150,9 @@ func (c *conn) handleStop(raw []byte, deleteFile bool) {
 		c.d.metrics.Inc(metrics.SessionsDeleted)
 		// The session is gone: drop its durable spawn configuration so a later
 		// session created at the same path does not inherit it.
-		c.d.spawn.Delete(canon)
+		if err := c.d.spawn.Delete(canon); err != nil {
+			c.d.log.Warn("cannot remove spawn configuration", "session", canon, "err", err)
+		}
 		c.d.log.Info("session deleted",
 			"session", res.Path, "name", res.Name, "client", c.id, "kind", c.Kind(),
 			"force", req.Force, "detachedClients", res.DetachedClients, "fileDeleted", removed)
@@ -160,12 +162,17 @@ func (c *conn) handleStop(raw []byte, deleteFile bool) {
 			"force", req.Force, "detachedClients", res.DetachedClients)
 	}
 
+	// unbound reports whether this command detached the requester from its own
+	// bound session, so a client can clear its binding without waiting for the
+	// terminal gw_session_state (which may lag the response).
+	unbound := actor != nil && actor == c.bound()
 	body := map[string]any{
 		"path":            res.Path,
 		"name":            res.Name,
 		"sessionId":       res.SessionID,
 		"piStopped":       res.PiStopped,
 		"detachedClients": res.DetachedClients,
+		"unbound":         unbound,
 	}
 	if deleteFile {
 		body["fileDeleted"] = fileDeleted

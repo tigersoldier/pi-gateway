@@ -506,7 +506,8 @@ by name from the file scan. Success carries the outcome:
 ```json
 {"type": "response", "id": "req-9", "command": "gw_delete_session", "success": true,
  "data": {"path": "...", "name": "auth-refactor", "sessionId": "uuid",
-          "piStopped": true, "fileDeleted": true, "detachedClients": 2}}
+          "piStopped": true, "fileDeleted": true, "detachedClients": 2,
+          "unbound": true}}
 ```
 
 - `piStopped` is false only when the target had no live pi.
@@ -515,6 +516,9 @@ by name from the file scan. Success carries the outcome:
   stop.
 - `detachedClients` counts the *other* clients detached by the command (the
   requester does not count itself).
+- `unbound` is true when the target was the requester's own bound session, so
+  the client can clear its binding immediately instead of waiting for the
+  terminal `gw_session_state` (which may lag the response).
 
 | Condition | Result |
 |---|---|
@@ -618,8 +622,9 @@ and without paying for it on every turn. `inject` appends a **custom
   or a cold respawn after hibernation or a daemon restart — so a re-injection
   after a reload is genuinely forwarded, not falsely reported as already
   installed. Keys are scoped to the **session**, not the client, and the map is
-  in memory for the process lifetime, so a shared session needs a namespaced
-  key (as in the example) and a per-turn key should be bounded by the client.
+  in memory for the process lifetime (bounded at 4096 entries, after which it
+  is dropped wholesale), so a shared session needs a namespaced key (as in the
+  example) and a per-turn key should be bounded by the client.
 - Ordering is the client's connection's FIFO with its prompts, so an
   instruction injected immediately before a prompt is in that prompt's
   context.
@@ -739,6 +744,11 @@ belongs to pi — and never kept only in memory. The record is what makes a
   session is accepted (the record wins). The asymmetry is deliberate: a live
   spawn-only key cannot be changed without a restart, and the alternative —
   refusing the attach — is the forced choice R5 removes.
+- List-valued parameters (`--tools`, `--exclude-tools`, `--models`) are
+  compared as comma-separated token sets, so `--tools read,bash` and
+  `--tools bash,read` are not a conflict; repeated flags (for example two
+  `--extension` values) are likewise order-insensitive and a repeated
+  identical flag is a no-op.
 - The record is exposed in `gw_list_sessions[].spawn` (§3.2), redacted of
   credential values, so a client can see what a respawn would use before
   attaching.

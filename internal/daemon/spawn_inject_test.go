@@ -539,3 +539,36 @@ func TestCatalogColdRowReadsSidecar(t *testing.T) {
 	}
 	t.Fatalf("session %s not in catalog: %v", path, resp)
 }
+
+// TestStopReportsUnbound pins the `unbound` field a client uses to clear its
+// binding without waiting for the terminal event: true when the target was the
+// requester's own session, false when it was another.
+func TestStopReportsUnbound(t *testing.T) {
+	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.jsonl")
+	pathB := filepath.Join(dir, "b.jsonl")
+
+	a := dial(t, addr, func(h *protocol.Hello) { h.Session = pathA })
+	a.WaitType("gw_welcome", testutil.DefaultTimeout)
+	b := dial(t, addr, func(h *protocol.Hello) { h.Session = pathB })
+	b.WaitType("gw_welcome", testutil.DefaultTimeout)
+
+	// Stopping another client's busy/attached session is forced and does not
+	// unbind the requester.
+	a.Send(map[string]any{"type": "gw_stop_session", "id": "s1", "session": pathB, "force": true})
+	resp := a.WaitResponse("s1", testutil.DefaultTimeout)
+	if resp["success"] != true {
+		t.Fatalf("stop of another session failed: %v", resp)
+	}
+	if testutil.Obj(resp, "data")["unbound"] == true {
+		t.Fatalf("stopping another session reported unbound: %v", resp)
+	}
+
+	// The requester's own session does unbind it.
+	a.Send(map[string]any{"type": "gw_stop_session", "id": "s2"})
+	resp = a.WaitResponse("s2", testutil.DefaultTimeout)
+	if resp["success"] != true || testutil.Obj(resp, "data")["unbound"] != true {
+		t.Fatalf("self stop = %v, want unbound:true", resp)
+	}
+}

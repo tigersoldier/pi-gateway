@@ -393,7 +393,7 @@ unless it is explicitly marked so.
     reload is not the normal path anyway.
 
   Evidence: `go test -race ./...` green (192 test functions at the first
-  commit, 199 after the follow-up fixes; +11 new: three
+  commit, 201 after the follow-up fixes; +11 new: three
   `piargs` — canonical args, merge, corrupt-record fallback — and eight
   `internal/daemon` — restart survival, cold merge, live unrecorded key,
   catalog exposure, welcome features, inject + dedupe, not_supported, reload
@@ -443,13 +443,28 @@ unless it is explicitly marked so.
   `TestCatalogColdRowReadsSidecar`, the `piargs` bool-inline and redaction
   tests); the first two were checked to fail with their fixes reverted, and
   the real-model e2e lane ran green (suite A 15/15, suite B 9/9, 0
-  unexpected). One unrelated flake surfaced during this work and is **not**
-  introduced here: `gwclient.TestStopSessionClearsBinding` assumes the
+  unexpected). One unrelated flake surfaced during this work and was **not**
+  introduced here: `gwclient.TestStopSessionClearsBinding` assumed the
   terminal `gw_session_state{state:"stopped"}` reaches the client before the
-  stop response, which the daemon does not guarantee; it fails on base
-  `119f0f2` in a clean worktree as well. Fixing it (wait for the event in the
-  test, or clear the binding on a successful stop of the bound session) is a
-  separate follow-up.
+  stop response, which the daemon does not guarantee; it failed on base
+  `119f0f2` in a clean worktree as well. It is fixed below.
+
+  **Cleanup follow-up.** (a) The stop/delete response now carries
+  `unbound: true` when the target was the requester's own session, and
+  `gwclient.StopSession`/`DeleteSession` clear the binding from it, so
+  `Session()` is correct without waiting for the terminal event (this fixes
+  the flake above). (b) `daemon.Row` and `gwclient.SessionRow` were the same
+  twelve-field wire object; both are now aliases of the new
+  `protocol.SessionRow`, so the two cannot drift. (c) A spawn sidecar that
+  exists but cannot be read is now reported (warn on attach, debug on a
+  catalog row) instead of being silently treated as "nothing recorded", and
+  `spawnStore.Delete` returns its error so the delete path can log it. (d)
+  List-valued spawn parameters (`--tools`, `--exclude-tools`, `--models`) are
+  compared as comma-separated token sets, so reordering a list is not a false
+  `spawn_param_conflict`. (e) The in-memory dedupe map is bounded (4096
+  entries). Evidence: `go test -race ./...` green (201 test functions),
+  including `TestStopReportsUnbound`, `TestSpawnConflictListValues`, and five
+  consecutive clean runs of `gwclient.TestStopSessionClearsBinding`.
 
 ### Open
 
@@ -514,7 +529,7 @@ Go 1.22+ is required. The only dependencies are the standard library and
 ### Unit and integration tests
 
 ```bash
-go test -race ./...                       # everything (199 tests, a few minutes)
+go test -race ./...                       # everything (201 tests, a few minutes)
 go test -race ./internal/daemon/          # the largest package
 go test -run TestAttach ./internal/daemon/  # one test
 go test -count=2 ./protocol/          # catch state leaking between runs

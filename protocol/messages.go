@@ -68,6 +68,27 @@ type ClientRef struct {
 	Tags     map[string]string `json:"tags,omitempty"`
 }
 
+// SessionRow is one gw_list_sessions entry (docs/protocol.md §3.2). It is the
+// shared wire object: the daemon builds it and gwclient decodes it, so the two
+// cannot drift.
+type SessionRow struct {
+	Path         string          `json:"path"`
+	Name         string          `json:"name,omitempty"`
+	Title        string          `json:"title,omitempty"`
+	ID           string          `json:"id,omitempty"`
+	Cwd          string          `json:"cwd,omitempty"`
+	Live         bool            `json:"live"`
+	IsStreaming  bool            `json:"isStreaming"`
+	MessageCount int             `json:"messageCount"`
+	LastActivity string          `json:"lastActivity,omitempty"`
+	CreatedBy    *ClientRef      `json:"createdBy,omitempty"`
+	Clients      []ClientSummary `json:"clients,omitempty"`
+	// Spawn is the session's recorded spawn-only configuration in canonical
+	// key→values form, with credential values redacted; omitted when nothing
+	// is recorded (docs/protocol.md §3.2, §4.3).
+	Spawn map[string][]string `json:"spawn,omitempty"`
+}
+
 // TurnState reports the current turn in gw_welcome.
 type TurnState struct {
 	State  string     `json:"state"`

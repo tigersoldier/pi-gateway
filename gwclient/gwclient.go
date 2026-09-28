@@ -145,24 +145,9 @@ type SessionFilter struct {
 	CreatedBy string
 }
 
-// SessionRow is one gw_list_sessions entry.
-type SessionRow struct {
-	Path         string                   `json:"path"`
-	Name         string                   `json:"name,omitempty"`
-	Title        string                   `json:"title,omitempty"`
-	ID           string                   `json:"id,omitempty"`
-	Cwd          string                   `json:"cwd,omitempty"`
-	Live         bool                     `json:"live"`
-	IsStreaming  bool                     `json:"isStreaming"`
-	MessageCount int                      `json:"messageCount"`
-	LastActivity string                   `json:"lastActivity,omitempty"`
-	CreatedBy    *protocol.ClientRef      `json:"createdBy,omitempty"`
-	Clients      []protocol.ClientSummary `json:"clients,omitempty"`
-	// Spawn is the session's recorded spawn-only configuration in canonical
-	// key→values form, so an integration can tell a lost instruction from an
-	// absent one before attaching (docs/protocol.md §3.2, §4.3).
-	Spawn map[string][]string `json:"spawn,omitempty"`
-}
+// SessionRow is one gw_list_sessions entry. It aliases the shared protocol
+// wire type so the daemon and the client cannot drift.
+type SessionRow = protocol.SessionRow
 
 // Event is one frame the daemon sent that was not a response to an
 // outstanding Do. Raw is the complete frame, gateway fields included, so a

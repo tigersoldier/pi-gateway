@@ -876,6 +876,10 @@ const (
 	piSendMessageCommand      = "send_message"
 	injectPayloadQueued       = `{"queued":true}`
 	injectPayloadDeduplicated = `{"queued":true,"deduplicated":true}`
+	// maxInjectDedupeKeys bounds the per-session dedupe memory. Dedupe is
+	// best-effort: at this many distinct keys the oldest are dropped wholesale
+	// rather than growing the map for the actor's lifetime.
+	maxInjectDedupeKeys = 4096
 )
 
 // handleInject forwards a context injection to pi as its send_message
@@ -964,6 +968,9 @@ func (a *Actor) translateInject(rec protocol.Record) ([]byte, bool) {
 	success := protocol.BoolField(rec.Raw, "success", false)
 	if success {
 		if pending && key != "" {
+			if len(a.injects) >= maxInjectDedupeKeys {
+				a.injects = make(map[string]bool)
+			}
 			a.injects[key] = true
 		}
 		return protocol.Response(rec.ID, "inject", true, "", "", []byte(injectPayloadQueued)), true

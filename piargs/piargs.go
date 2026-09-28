@@ -359,11 +359,41 @@ func SpawnConflict(recorded, requested map[string][]string) (string, bool) {
 		if !ok {
 			continue
 		}
-		if !sameValues(rec, want) {
+		if !sameValuesForKey(key, rec, want) {
 			return key, true
 		}
 	}
 	return "", false
+}
+
+// listSpawnKeys are spawn parameters whose value is a comma-separated list in
+// which element order is not meaningful to pi (docs/protocol.md §4.3).
+var listSpawnKeys = map[string]bool{
+	"tools":         true,
+	"exclude-tools": true,
+	"models":        true,
+}
+
+// sameValuesForKey compares two value lists, treating a list-valued parameter
+// as a set of comma-separated tokens so `--tools a,b` and `--tools b,a` are
+// not a false conflict.
+func sameValuesForKey(key string, a, b []string) bool {
+	if listSpawnKeys[key] {
+		return sameValues(splitList(a), splitList(b))
+	}
+	return sameValues(a, b)
+}
+
+func splitList(in []string) []string {
+	var out []string
+	for _, v := range in {
+		for _, part := range strings.Split(v, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // sameValues compares values as sets: flag order is not meaningful, and

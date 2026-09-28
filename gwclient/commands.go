@@ -351,7 +351,22 @@ func (c *Client) stopDelete(ctx context.Context, command, session string, force 
 	if session != "" {
 		fields["session"] = session
 	}
-	return c.Do(ctx, command, fields)
+	resp, err := c.Do(ctx, command, fields)
+	if err != nil {
+		return resp, err
+	}
+	// The daemon unbinds the requester when the target was its own bound
+	// session. Clear locally too: the terminal gw_session_state it also emits
+	// may lag the response, and Session() must not report a binding the client
+	// no longer has (docs/protocol.md §3.10).
+	var data struct {
+		Unbound bool `json:"unbound"`
+	}
+	if resp.Decode(&data) == nil && data.Unbound {
+		c.setSession(nil)
+		c.noteTurn(false)
+	}
+	return resp, nil
 }
 
 // RespondUI answers an extension_ui_request. requestID is the dialog id from

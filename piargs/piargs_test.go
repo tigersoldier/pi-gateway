@@ -279,3 +279,19 @@ func TestMergeSpawnFallsBackOnCorruptRecord(t *testing.T) {
 		t.Fatalf("corrupt record merge = %v, want %v", got, requested.Args)
 	}
 }
+
+func TestSpawnConflictListValues(t *testing.T) {
+	recorded := map[string][]string{"tools": {"read,bash"}}
+	// Comma order and spacing are not meaningful.
+	if key, conflict := SpawnConflict(recorded, map[string][]string{"tools": {"bash, read"}}); conflict {
+		t.Fatalf("reordered tool list reported as conflict on %q", key)
+	}
+	// Repeated occurrences accumulate the same set.
+	if key, conflict := SpawnConflict(recorded, map[string][]string{"tools": {"read", "bash"}}); conflict {
+		t.Fatalf("split tool list reported as conflict on %q", key)
+	}
+	// A genuinely different set is still a conflict.
+	if _, conflict := SpawnConflict(recorded, map[string][]string{"tools": {"read"}}); !conflict {
+		t.Fatal("a missing tool must be a conflict")
+	}
+}

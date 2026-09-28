@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -57,22 +60,24 @@ func (s *spawnStore) recordPath(canon string) string {
 	return filepath.Join(s.dir, hex.EncodeToString(sum[:])+".json")
 }
 
-// Load reads the record for a canonical session path. A missing or unreadable
-// record is "nothing recorded", which is exactly the pre-persistence behavior
-// (docs/protocol.md §4.3); callers never have to distinguish the two.
-func (s *spawnStore) Load(canon string) (spawnConfig, bool) {
+// Load reads the record for a canonical session path. A missing record is
+// reported as fs.ErrNotExist; any other error means a record exists but could
+// not be read, which the caller should surface (a corrupt record otherwise
+// silently reintroduces the "lost instruction" defect this store exists to
+// fix).
+func (s *spawnStore) Load(canon string) (spawnConfig, error) {
 	if s == nil || s.dir == "" || canon == "" {
-		return spawnConfig{}, false
+		return spawnConfig{}, fs.ErrNotExist
 	}
 	b, err := os.ReadFile(s.recordPath(canon))
 	if err != nil {
-		return spawnConfig{}, false
+		return spawnConfig{}, err
 	}
 	var cfg spawnConfig
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		return spawnConfig{}, false
+		return spawnConfig{}, fmt.Errorf("spawn: parse %s: %w", canon, err)
 	}
-	return cfg, true
+	return cfg, nil
 }
 
 // Save writes a record atomically (temp file + rename) so a crash mid-write
@@ -115,12 +120,18 @@ func (s *spawnStore) Save(cfg spawnConfig) error {
 	return os.Rename(name, s.recordPath(cfg.Path))
 }
 
-// Delete removes a session's record, ignoring a missing file.
-func (s *spawnStore) Delete(canon string) {
+// Delete removes a session's record. A missing file is not an error; any other
+// failure is returned so the caller can log it (a surviving record would be
+// inherited by a later session created at the same canonical path).
+func (s *spawnStore) Delete(canon string) error {
 	if s == nil || s.dir == "" || canon == "" {
-		return
+		return nil
 	}
-	_ = os.Remove(s.recordPath(canon))
+	err := os.Remove(s.recordPath(canon))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // mergeSpawnSpec builds the effective spec for spawning a session that has a
