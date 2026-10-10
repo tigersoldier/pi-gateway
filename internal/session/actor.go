@@ -10,6 +10,7 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/internal/gwlog"
 	"github.com/tigersoldier/pi-gateway/internal/metrics"
+	"github.com/tigersoldier/pi-gateway/piargs"
 	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
@@ -158,6 +159,14 @@ type applyReq struct {
 // restartReq asks the actor to stop and respawn pi for the same session. The
 // daemon connection that requested it sends the pi-shaped response itself, so
 // the answer also reaches a requester attached to a different session.
+type restartPhase uint8
+
+const (
+	restartPhaseNone restartPhase = iota
+	restartPhasePreflight
+	restartPhaseStarting
+)
+
 type restartReq struct {
 	force     bool
 	requester string // client that asked; it does not count as "another client"
@@ -165,7 +174,13 @@ type restartReq struct {
 	// piArgs replaces the spawn arguments for the respawn when non-nil
 	// (gw_reload_session{piArgs}); nil keeps the actor's recorded parameters.
 	piArgs []string
-	done   chan error
+	// additiveSpawnArgs is the merged spawn-only configuration. The actor
+	// preserves its current runtime args when applying this form.
+	additiveSpawnArgs []string
+	phase             restartPhase
+	internalID        string
+	runtimeArgs       []string
+	done              chan error
 }
 
 // StopRequest asks the actor to stop pi and terminate the session (the daemon
@@ -204,15 +219,16 @@ type stopOutcome struct {
 }
 
 type actorMsg struct {
-	cmd       *ClientCommand
-	attach    Client
-	attachAck chan struct{}
-	detach    *string
-	call      *callReq
-	apply     *applyReq
-	restart   *restartReq
-	stop      *stopReq
-	info      chan Info
+	cmd            *ClientCommand
+	attach         Client
+	attachAck      chan struct{}
+	detach         *string
+	call           *callReq
+	apply          *applyReq
+	restart        *restartReq
+	restartTimeout *restartReq
+	stop           *stopReq
+	info           chan Info
 }
 
 // Actor owns one pi process, its ordered event log, and the daemon queue.
@@ -257,6 +273,8 @@ type Actor struct {
 	pendingUI         map[string]*uiPending
 	lastActive        map[string]time.Time
 	restarting        bool
+	pendingRestart    *restartReq
+	restartContinue   chan *restartReq
 
 	// terminalState is what shutdown publishes (stateStopped, or stateDeleted
 	// for gw_delete_session). pendingStop is the forced stop waiting for the
@@ -301,6 +319,7 @@ func NewActor(p Params) *Actor {
 		metrics:           p.Metrics,
 		hub:               NewHub(p.HubCapacity, sessionID),
 		in:                make(chan actorMsg, 512),
+		restartContinue:   make(chan *restartReq, 1),
 		stopCh:            make(chan struct{}),
 		finished:          make(chan struct{}),
 		clients:           make(map[string]Client),
@@ -522,6 +541,23 @@ func (a *Actor) Call(raw []byte, timeout time.Duration) (protocol.Record, error)
 // how gw_reload_session{piArgs} installs a new spawn configuration.
 func (a *Actor) Restart(force bool, requesterID string, by *protocol.ClientRef, piArgs []string, timeout time.Duration) error {
 	req := &restartReq{force: force, requester: requesterID, by: by, piArgs: piArgs, done: make(chan error, 1)}
+	return a.restart(req, timeout)
+}
+
+// RestartAddPiArgs restarts with the supplied merged spawn configuration while
+// preserving the actor's existing runtime parameters. Additive changes are
+// deliberately unforced: another attached client or an active turn refuses.
+func (a *Actor) RestartAddPiArgs(requesterID string, by *protocol.ClientRef, spawnArgs []string, timeout time.Duration) error {
+	req := &restartReq{
+		requester:         requesterID,
+		by:                by,
+		additiveSpawnArgs: append([]string{}, spawnArgs...),
+		done:              make(chan error, 1),
+	}
+	return a.restart(req, timeout)
+}
+
+func (a *Actor) restart(req *restartReq, timeout time.Duration) error {
 	if !a.send(actorMsg{restart: req}) {
 		return ErrStopped
 	}
@@ -531,7 +567,26 @@ func (a *Actor) Restart(force bool, requesterID string, by *protocol.ClientRef, 
 	case err := <-req.done:
 		return err
 	case <-t.C:
-		return ErrCallTimeout
+		// Let the actor decide whether the restart completed or must be
+		// canceled. This message uses the same FIFO mailbox as the request.
+		select {
+		case err := <-req.done:
+			return err
+		default:
+		}
+		select {
+		case a.in <- actorMsg{restartTimeout: req}:
+		case err := <-req.done:
+			return err
+		case <-a.finished:
+			return ErrStopped
+		}
+		select {
+		case err := <-req.done:
+			return err
+		case <-a.finished:
+			return ErrStopped
+		}
 	case <-a.finished:
 		return ErrStopped
 	}
@@ -610,8 +665,16 @@ func (a *Actor) loop() {
 	}
 	for !a.dead {
 		select {
+		case req := <-a.restartContinue:
+			piEvents, piDone = a.continueRestart(req, piEvents, piDone)
+			continue
+		default:
+		}
+		select {
 		case m := <-a.in:
 			piEvents, piDone = a.handleMsg(m, piEvents, piDone)
+		case req := <-a.restartContinue:
+			piEvents, piDone = a.continueRestart(req, piEvents, piDone)
 		case rec, ok := <-piEvents:
 			if !ok {
 				piEvents = nil
@@ -674,6 +737,8 @@ func (a *Actor) handleMsg(m actorMsg, events <-chan protocol.Record, done <-chan
 		a.applyRuntime(m.apply)
 	case m.restart != nil:
 		return a.handleRestart(m.restart, events, done)
+	case m.restartTimeout != nil:
+		return a.handleRestartTimeout(m.restartTimeout, events, done)
 	case m.stop != nil:
 		a.handleStop(m.stop)
 	case m.info != nil:
@@ -1298,22 +1363,24 @@ func (a *Actor) failInternalCallbacks() {
 
 // startInternal sends a daemon-generated pi command and runs cb with the
 // response (an empty Record when pi is gone).
-func (a *Actor) startInternal(command string, cb func(protocol.Record)) {
+func (a *Actor) startInternal(command string, cb func(protocol.Record)) string {
 	if a.pi == nil {
 		cb(protocol.Record{})
-		return
+		return ""
 	}
 	id := a.internalID("x")
 	raw, err := protocol.RewriteID([]byte(`{"type":"`+command+`"}`), id)
 	if err != nil {
 		cb(protocol.Record{})
-		return
+		return ""
 	}
 	a.internalCallbacks[id] = cb
 	if err := a.pi.Send(raw); err != nil {
 		delete(a.internalCallbacks, id)
 		cb(protocol.Record{})
+		return ""
 	}
+	return id
 }
 
 // handleStop validates a stop request and either refuses it or begins the
@@ -1413,9 +1480,9 @@ func (a *Actor) discardQueue() {
 	a.publishQueue()
 }
 
-// handleRestart stops and respawns pi for the same session file. It runs on
-// the actor loop and returns the new process channels for the loop to use; nil
-// channels mean there is no process anymore.
+// handleRestart starts the actor-owned restart state machine. Additive reloads
+// first query the live runtime state before stopping Pi; the continuation and
+// timeout messages are serialized by the actor loop.
 func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, done <-chan struct{}) (<-chan protocol.Record, <-chan struct{}) {
 	fail := func(err error) (<-chan protocol.Record, <-chan struct{}) {
 		req.done <- err
@@ -1437,9 +1504,57 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 		a.metrics.Inc(metrics.ReloadsRefused)
 		return fail(ErrReloadBusy)
 	}
+	hasLiveRuntimeState := a.state == stateReady && a.pi != nil
+	if req.additiveSpawnArgs != nil && !hasLiveRuntimeState {
+		current, err := piargs.Parse(a.params.PiArgs)
+		if err != nil {
+			return fail(fmt.Errorf("cannot preserve current runtime parameters: %w", err))
+		}
+		req.runtimeArgs = current.RuntimeArgs()
+		req.piArgs = append(append([]string(nil), req.runtimeArgs...), req.additiveSpawnArgs...)
+	}
 	a.metrics.Inc(metrics.Reloads)
+	a.restarting = true
+	a.pendingRestart = req
+	a.stopTimer()
 	a.setState(stateRestarting)
 	a.publishState(stateRestarting, "reload", nil)
+	if req.additiveSpawnArgs != nil && hasLiveRuntimeState {
+		req.phase = restartPhasePreflight
+		req.internalID = a.startInternal("get_state", func(rec protocol.Record) {
+			if a.pendingRestart != req {
+				return
+			}
+			req.internalID = ""
+			if rec.Type == "" || !protocol.BoolField(rec.Raw, "success", false) {
+				a.pendingRestart = nil
+				a.restarting = false
+				if a.pi != nil && a.state != stateCrashed {
+					a.setState(stateReady)
+					a.publishState(stateReady, "reload preflight failed", nil)
+					a.reevaluateIdle()
+				}
+				req.done <- ErrNoPi
+				return
+			}
+			state := protocol.ParsePiState(rec.Raw)
+			req.runtimeArgs = runtimeArgsFromState(state)
+			req.piArgs = append(append([]string(nil), req.runtimeArgs...), req.additiveSpawnArgs...)
+			req.phase = restartPhaseStarting
+			a.restartContinue <- req
+		})
+		return events, done
+	}
+	req.phase = restartPhaseStarting
+	return a.continueRestart(req, events, done)
+}
+
+// continueRestart stops the old process and starts the replacement. It only
+// runs for the actor's current pending restart request.
+func (a *Actor) continueRestart(req *restartReq, events <-chan protocol.Record, done <-chan struct{}) (<-chan protocol.Record, <-chan struct{}) {
+	if a.pendingRestart != req || req.phase != restartPhaseStarting {
+		return events, done
+	}
 	a.stopPi()
 	// The old process takes the running turn with it: forwarded prompts fail,
 	// while the not-yet-forwarded daemon queue is kept (docs/design.md §4.4).
@@ -1451,21 +1566,21 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 
 	pi, err := a.spawnPiArgs(req.piArgs)
 	if err != nil {
+		a.pendingRestart = nil
+		a.restarting = false
 		a.setState(stateCrashed)
 		a.publishState(stateCrashed, err.Error(), nil)
 		req.done <- err
 		return nil, nil
 	}
-	// A replacement configuration becomes the actor's parameters, so a later
-	// plain reload and a cold respawn by another client both agree with the
-	// record (docs/protocol.md §4.3).
-	if req.piArgs != nil {
-		a.params.PiArgs = append([]string(nil), req.piArgs...)
-	}
 	a.pi = pi
-	a.restarting = true
-	a.startInternal("get_state", func(rec protocol.Record) {
+	req.internalID = a.startInternal("get_state", func(rec protocol.Record) {
+		if a.pendingRestart != req {
+			return
+		}
+		a.pendingRestart = nil
 		a.restarting = false
+		req.internalID = ""
 		if rec.Type == "" || !protocol.BoolField(rec.Raw, "success", false) {
 			a.setState(stateCrashed)
 			a.publishState(stateCrashed, "reload failed", nil)
@@ -1473,10 +1588,12 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 			return
 		}
 		a.setState(stateReady)
+		// Commit actor parameters only after the new process has reported ready.
+		if req.piArgs != nil || req.additiveSpawnArgs != nil {
+			a.params.PiArgs = append([]string(nil), req.piArgs...)
+		}
 		a.publishState(stateReady, "reload", nil)
 		a.publishStateChanged("gw_reload_session", rec.Raw, refClientID(req.by))
-		// Prompts queued while the old process died must run again; without
-		// this the queue would be stranded (no turn is running to settle).
 		if a.queue.Len() > 0 {
 			a.drainQueue()
 		} else {
@@ -1485,6 +1602,47 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 		req.done <- nil
 	})
 	return pi.Events(), pi.Done()
+}
+
+func (a *Actor) handleRestartTimeout(req *restartReq, events <-chan protocol.Record, done <-chan struct{}) (<-chan protocol.Record, <-chan struct{}) {
+	if a.pendingRestart != req {
+		return events, done
+	}
+	if req.internalID != "" {
+		delete(a.internalCallbacks, req.internalID)
+		req.internalID = ""
+	}
+	a.pendingRestart = nil
+	a.restarting = false
+	if req.phase == restartPhasePreflight {
+		a.setState(stateReady)
+		a.publishState(stateReady, "reload timed out before restart", nil)
+		a.reevaluateIdle()
+		req.done <- ErrCallTimeout
+		return events, done
+	}
+	a.stopPi()
+	a.setState(stateCrashed)
+	a.publishState(stateCrashed, "reload timed out", nil)
+	req.done <- ErrCallTimeout
+	return nil, nil
+}
+
+func runtimeArgsFromState(state protocol.PiState) []string {
+	var args []string
+	if state.Model.ID != "" {
+		args = append(args, "--model", state.Model.ID)
+	}
+	if state.Model.Provider != "" {
+		args = append(args, "--provider", state.Model.Provider)
+	}
+	if state.ThinkingLevel != "" {
+		args = append(args, "--thinking", state.ThinkingLevel)
+	}
+	if state.SessionName != "" {
+		args = append(args, "--name", state.SessionName)
+	}
+	return args
 }
 
 // routeUI sends a dialog to one client and remembers the winner; other UI

@@ -1,6 +1,7 @@
 package piargs
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -277,6 +278,68 @@ func TestMergeSpawnFallsBackOnCorruptRecord(t *testing.T) {
 	got := MergeSpawn([]string{"--not-a-flag"}, requested)
 	if !reflect.DeepEqual(got, requested.Args) {
 		t.Fatalf("corrupt record merge = %v, want %v", got, requested.Args)
+	}
+}
+
+func TestMergeSpawnAdditionsIsIdempotent(t *testing.T) {
+	recorded := []string{"--extension", "/old.ts", "--tools", "read,bash", "--approve"}
+	additions := mustParse(t,
+		"-e", "/old.ts",
+		"--extension", "/new.ts",
+		"--tools", "bash,write",
+		"--skill", "/skill.ts",
+		"--append-system-prompt", "later instruction",
+	)
+	merged, err := MergeSpawnAdditions(recorded, additions)
+	if err != nil {
+		t.Fatalf("MergeSpawnAdditions: %v", err)
+	}
+	want := []string{
+		"--extension", "/old.ts", "--tools", "read,bash", "--approve",
+		"--extension", "/new.ts", "--tools", "write", "--skill", "/skill.ts",
+		"--append-system-prompt", "later instruction",
+	}
+	if !reflect.DeepEqual(merged.CanonicalSpawnArgs(), want) {
+		t.Fatalf("merged args = %v, want %v", merged.CanonicalSpawnArgs(), want)
+	}
+
+	again, err := MergeSpawnAdditions(merged.CanonicalSpawnArgs(), additions)
+	if err != nil {
+		t.Fatalf("second MergeSpawnAdditions: %v", err)
+	}
+	if !reflect.DeepEqual(again.CanonicalSpawnArgs(), want) {
+		t.Fatalf("repeated additions changed config: %v", again.CanonicalSpawnArgs())
+	}
+}
+
+func TestMergeSpawnAdditionsRejectsConflictAndRuntimeArgs(t *testing.T) {
+	recorded := []string{"--system-prompt", "old", "--api-key", "secret-value"}
+	merged, err := MergeSpawnAdditions(recorded, mustParse(t, "--system-prompt", "new"))
+	var conflict *SpawnConflictError
+	if merged != nil || !errors.As(err, &conflict) || conflict.Key != "system-prompt" {
+		t.Fatalf("singleton conflict = %v, want system-prompt conflict", err)
+	}
+
+	merged, err = MergeSpawnAdditions(recorded, mustParse(t, "--api-key", "different-secret"))
+	if merged != nil || !errors.As(err, &conflict) || conflict.Key != "api-key" {
+		t.Fatalf("credential conflict = %v, want api-key conflict", err)
+	}
+	if strings.Contains(err.Error(), "secret-value") || strings.Contains(err.Error(), "different-secret") {
+		t.Fatalf("conflict error exposed a credential: %v", err)
+	}
+
+	merged, err = MergeSpawnAdditions(recorded, mustParse(t, "--model", "new-model"))
+	if merged != nil || err == nil || !strings.Contains(err.Error(), "runtime option") {
+		t.Fatalf("runtime addition error = %v, want a rejection", err)
+	}
+	merged, err = MergeSpawnAdditions(recorded, mustParse(t, "--no-session"))
+	if merged != nil || err == nil || !strings.Contains(err.Error(), "--no-session") {
+		t.Fatalf("no-session addition error = %v, want a rejection", err)
+	}
+
+	merged, err = MergeSpawnAdditions([]string{"private-record-value"}, mustParse(t, "--extension", "/new.ts"))
+	if merged != nil || err == nil || strings.Contains(err.Error(), "private-record-value") {
+		t.Fatalf("invalid-record error exposed stored data: %v", err)
 	}
 }
 

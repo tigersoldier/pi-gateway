@@ -25,7 +25,7 @@ decisions.
 | Transport/auth | loopback TCP, token file (0600), `--server`/`--port`/`--token-file`, port-file discovery with fallback to `127.0.0.1:7331` |
 | Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags, and `gw_stop_session`/`gw_delete_session` to release pi or destroy the session (`session_busy`/`session_attached` refusals, `force`, tombstoned paths) |
 | Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags plus durable `spawn` per session; `gw_welcome.features` |
-| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
+| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` replacement and additive spawn-config restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
 | Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
 | Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state` (including the terminal `deleted`), `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
@@ -383,6 +383,17 @@ unless it is explicitly marked so.
     `control` capability rather than the proposal's `admin`: the invariant is
     exactly one capability check per command from the single table in
     `protocol/roles.go`, and a payload-level `admin` check would break it.
+  - **P5 — additive spawn configuration for adopted sessions** (pi-chat
+    proposal follow-up). `gw_reload_session{addPiArgs}` starts from the daemon's
+    authoritative recorded spawn args, validates additions through `piargs`,
+    merges list-valued args idempotently, and rejects conflicting singleton
+    values. It never forces a restart: a running turn, another attached
+    client, or an in-flight attach returns `reload_busy`, even if the request
+    asks for `force`. The merged record is committed only after a successful
+    restart; the operation remains generic, uses the existing `control`
+    capability, and is advertised separately as `spawn_config_additive`;
+    existing `gw_reload_session{piArgs}` replacement behavior remains
+    unchanged.
 
   Evidence: `go test -race ./...` green. The first commit added 192 test
   functions (three `piargs` — canonical args, merge, corrupt-record fallback —
@@ -403,6 +414,42 @@ unless it is explicitly marked so.
   machine, no help for already-spawned sessions, and integration-specific
   text in the gateway's own path — the proposal's own rejection stands until
   pi exposes `send_message`).
+
+  **P5 evidence:** `TestAddPiArgsMergesAndPersistsSpawnConfig` covers idempotent
+  extension merging, catalog exposure, runtime-argument preservation, plain
+  reload, and cold respawn after a daemon restart; the test fails when the
+  additive merge is disabled. `TestAddPiArgsRejectsConflictsAndBusySessions`,
+  `TestAddPiArgsCannotForceRestartDuringTurn`, and
+  `TestAddPiArgsFailedRestartDoesNotCommit` pin conflicts, both busy cases, and
+  failure rollback. `TestNewSessionWritesOneSpawnRecord` also verifies that the
+  Pi `get_state.sessionFile` equals `gw_new_session.path` and that `--extension`
+  is started and persisted. Evidence: `go test -race ./...`, `go vet ./...`,
+  `go build ./...`, `gofmt -l .`, and the fake E2E suites (A 15/15, B 7/7)
+  pass. Rejected: a chat-specific command or capability (the gateway stays
+  app-agnostic) and forcing an adopted session restart while a turn runs or
+  another client is attached.
+
+  **P5 post-review fixes:** live attach checks and spawn-record replacement are
+  serialized per session, and attach reads a snapshot under the daemon mutex.
+  Additive reload captures model/provider/thinking/name from the actor's
+  serialized `get_state` before stopping Pi, rather than reusing startup argv.
+  A restart timeout cancels the operation: a preflight timeout leaves the old
+  process/configuration ready; a replacement-start timeout stops the new Pi and
+  leaves the actor crashed with the old record. A late response cannot commit.
+  If Pi starts but saving the new sidecar fails, the operation returns
+  `spawn_config_persist_failed` (the running process and in-memory record remain
+  on the new config); after fixing storage, retrying the same addition retries
+  persistence. Rejected: reporting durable success when the sidecar write
+  failed, or letting a timed-out replacement later change actor state.
+  Evidence: `TestAddPiArgsMergesAndPersistsSpawnConfig` covers live runtime
+  state; `TestAddPiArgsAttachWaitsForSpawnCommit` covers attach/reload
+  synchronization; `TestAddPiArgsTimeoutCancelsLateReady` and
+  `TestAddPiArgsPreflightTimeoutKeepsOldProcess` cover cancellation on both
+  timeout paths; `TestAddPiArgsReportsPersistenceFailure` covers sidecar-save
+  failure. Validation: `go test -race ./...`, `go vet ./...`, `go build ./...`,
+  `gofmt -l .` (empty), `git diff --check`, and fake E2E suites A (15/15) and
+  B (7/7) pass. The real-model E2E lane was not run because it spends model
+  quota.
 
   **Follow-up review fixes** (independent reviewer subagents found these in
   `4840d43`; fixed in the next commit; the inject-related items were

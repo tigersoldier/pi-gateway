@@ -373,11 +373,31 @@ refreshes state/history but does not restart pi. Restarting pi is explicit:
 ```
 
 - Refused with `reload_busy` while other clients are attached or a turn is
-  running, unless `force: true`.
+  running, unless `force: true`. An in-flight attach returns `reload_busy` even
+  with `force` so it cannot bind across the restart.
 - On success pi is stopped and respawned with the session's recorded spawn
   config; attached clients get `gw_session_state{state:"restarting"}` then
   `{state:"ready"}` and refresh their own view (the event log and ring survive
   the restart, so no replay or snapshot is forced).
+- `gw_reload_session{addPiArgs}` is an optional generic additive operation for
+  adopting spawn settings onto an existing session. It starts from the
+  gateway's authoritative recorded args, canonicalizes additions with the same
+  `piargs` validator, merges list-valued options idempotently, and rejects
+  conflicting singleton values. It always uses an unforced restart: active
+  turns, any other attached client, or an in-flight attach cause `reload_busy`,
+  even when `force` was requested. Before stopping Pi, the actor snapshots
+  current runtime settings from its serialized `get_state`, so live
+  model/provider/thinking/name changes are not replaced with startup argv.
+  Attach conflict checks and spawn-record updates are synchronized per session.
+  A restart timeout cancels the operation: preflight timeout leaves the old
+  process/config ready; if the replacement misses readiness, it is stopped and
+  the actor becomes crashed with the old record intact. If Pi is ready but
+  saving the sidecar fails, the operation reports
+  `spawn_config_persist_failed` instead of claiming durability; the running
+  process and in-memory record remain on the new config, which can be persisted
+  by retrying after storage is repaired. The operation uses the existing
+  `control` capability; app-specific confirmation and binding policy stay in
+  pi-chat.
 
 ### 4.5 Daemon restart
 
@@ -563,7 +583,11 @@ first client to attach after a restart decides how pi is spawned.
   installing its parameters and attaching (R5). (Required because pilish
   re-sends `--approve`.)
 - `gw_delete_session` removes the record, `fork`/`clone` copies it, and
-  `gw_reload_session{piArgs}` replaces it deliberately.
+  `gw_reload_session{piArgs}` replaces it deliberately. The optional
+  `gw_reload_session{addPiArgs}` form adds validated options from the
+  authoritative record, deduplicates list-valued arguments, rejects
+  conflicting singleton values, and commits only after a successful
+  unforced restart (§4.4).
 
 **Standing instructions are not a gateway feature.** pi exposes the non-turn
 message primitive to extensions only; no released pi reaches it over RPC, so
