@@ -432,8 +432,10 @@ unless it is explicitly marked so.
   **P5 post-review fixes:** live attach checks and spawn-record replacement are
   serialized per session, and attach reads a snapshot under the daemon mutex.
   Additive reload captures model/provider/thinking/name from the actor's
-  serialized `get_state` before stopping Pi, rather than reusing startup argv.
-  A restart timeout cancels the operation: a preflight timeout leaves the old
+  serialized `get_state` before stopping a live Pi, rather than reusing startup
+  argv. The actor retains acknowledged runtime-setting changes so a reload of a
+  crashed actor does not revert to stale startup args. A restart timeout cancels
+  the operation: a preflight timeout leaves the old
   process/configuration ready; a replacement-start timeout stops the new Pi and
   leaves the actor crashed with the old record. A late response cannot commit.
   If Pi starts but saving the new sidecar fails, the operation returns
@@ -442,8 +444,9 @@ unless it is explicitly marked so.
   persistence. Rejected: reporting durable success when the sidecar write
   failed, or letting a timed-out replacement later change actor state.
   Evidence: `TestAddPiArgsMergesAndPersistsSpawnConfig` covers live runtime
-  state; `TestAddPiArgsAttachWaitsForSpawnCommit` covers attach/reload
-  synchronization; `TestAddPiArgsTimeoutCancelsLateReady` and
+  state; `TestAddPiArgsPreservesRuntimeAfterCrash` covers crash recovery;
+  `TestAddPiArgsAttachWaitsForSpawnCommit` covers attach/reload synchronization;
+  `TestAddPiArgsTimeoutCancelsLateReady` and
   `TestAddPiArgsPreflightTimeoutKeepsOldProcess` cover cancellation on both
   timeout paths; `TestAddPiArgsReportsPersistenceFailure` covers sidecar-save
   failure. Validation: `go test -race ./...`, `go vet ./...`, `go build ./...`,

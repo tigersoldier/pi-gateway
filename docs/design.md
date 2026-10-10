@@ -387,7 +387,9 @@ refreshes state/history but does not restart pi. Restarting pi is explicit:
   turns, any other attached client, or an in-flight attach cause `reload_busy`,
   even when `force` was requested. Before stopping Pi, the actor snapshots
   current runtime settings from its serialized `get_state`, so live
-  model/provider/thinking/name changes are not replaced with startup argv.
+  model/provider/thinking/name changes are not replaced with startup argv. The
+  actor also retains acknowledged runtime-setting changes, so an additive
+  reload after a Pi crash does not fall back to stale startup values.
   Attach conflict checks and spawn-record updates are synchronized per session.
   A restart timeout cancels the operation: preflight timeout leaves the old
   process/config ready; if the replacement misses readiness, it is stopped and

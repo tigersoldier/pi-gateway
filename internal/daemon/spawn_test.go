@@ -544,6 +544,71 @@ func TestAddPiArgsMergesAndPersistsSpawnConfig(t *testing.T) {
 	}
 }
 
+// TestAddPiArgsPreservesRuntimeAfterCrash ensures acknowledged runtime changes
+// survive additive restart even when Pi has already exited and get_state is no
+// longer available.
+func TestAddPiArgsPreservesRuntimeAfterCrash(t *testing.T) {
+	t.Setenv("FAKEPI_EXIT_AFTER_FIRST_TURN", "1")
+	argsFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	path := filepath.Join(t.TempDir(), "runtime-after-crash.jsonl")
+	_, addr := startDaemonHandle(t, nil)
+	c := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--model", "startup-model", "--provider", "startup-provider", "--thinking", "low"}
+	})
+	c.WaitType("gw_welcome", testutil.DefaultTimeout)
+	frames := newFrameLog(c)
+	runtimeClient := dial(t, addr, func(h *protocol.Hello) {
+		h.Session = path
+		h.PiArgs = []string{"--model", "live-model", "--provider", "live-provider", "--thinking", "high", "--name", "live-name"}
+	})
+	runtimeWelcome := runtimeClient.WaitType("gw_welcome", testutil.DefaultTimeout)
+	runtimeID := testutil.Str(runtimeWelcome, "clientId")
+	runtimeClient.Send(map[string]any{"type": "get_state", "id": "runtime-state"})
+	state := runtimeClient.WaitResponse("runtime-state", testutil.DefaultTimeout)
+	stateData := testutil.Obj(state, "data")
+	model := testutil.Obj(stateData, "model")
+	if testutil.Str(model, "id") != "live-model" || testutil.Str(model, "provider") != "live-provider" ||
+		testutil.Str(stateData, "thinkingLevel") != "high" || testutil.Str(stateData, "sessionName") != "live-name" {
+		t.Fatalf("live runtime changes did not apply: %v", stateData)
+	}
+	runtimeClient.Close()
+	frames.wait(t, testutil.DefaultTimeout, "runtime client leave", func(frame map[string]any) bool {
+		client, _ := frame["client"].(map[string]any)
+		return frame["type"] == "gw_presence" && frame["event"] == "leave" &&
+			testutil.Str(client, "clientId") == runtimeID
+	})
+	c.Send(map[string]any{"type": "prompt", "id": "prompt1", "message": "crash after model change"})
+	frames.wait(t, testutil.DefaultTimeout, "prompt response", response("prompt1"))
+	frames.wait(t, testutil.DefaultTimeout, "turn settle", typeIs("agent_settled"))
+	frames.wait(t, testutil.DefaultTimeout, "Pi crash", func(frame map[string]any) bool {
+		return frame["type"] == "gw_session_state" && testutil.Str(frame, "state") == "crashed"
+	})
+
+	if err := os.Remove(argsFile); err != nil {
+		t.Fatalf("remove pre-crash argv: %v", err)
+	}
+	c.Send(map[string]any{
+		"type": "gw_reload_session", "id": "add-after-crash",
+		"addPiArgs": []string{"--extension", "/after-crash.ts"},
+	})
+	resp := frames.wait(t, testutil.DefaultTimeout, "additive reload response", response("add-after-crash"))
+	if resp["success"] != true {
+		t.Fatalf("additive reload after crash failed: %v", resp)
+	}
+	argv := waitForArgsFile(t, argsFile)
+	for _, pair := range [][2]string{
+		{"--model", "live-model"}, {"--provider", "live-provider"},
+		{"--thinking", "high"}, {"--name", "live-name"},
+		{"--extension", "/after-crash.ts"},
+	} {
+		if !strings.Contains(argv, pair[0]+"\n"+pair[1]+"\n") {
+			t.Fatalf("crash recovery dropped %s=%s: %q", pair[0], pair[1], argv)
+		}
+	}
+}
+
 // TestAddPiArgsAttachWaitsForSpawnCommit ensures a concurrent live attach
 // validates against the new record, not the record from before a reload.
 func TestAddPiArgsAttachWaitsForSpawnCommit(t *testing.T) {
@@ -594,6 +659,9 @@ func TestAddPiArgsTimeoutCancelsLateReady(t *testing.T) {
 	t.Setenv("FAKEPI_GET_STATE_DELAY_MS", "1500")
 	argsFile := filepath.Join(t.TempDir(), "argv")
 	t.Setenv("FAKEPI_ARGS_FILE", argsFile)
+	exitMarker := filepath.Join(t.TempDir(), "replacement-exited")
+	t.Setenv("FAKEPI_EXIT_MARKER", exitMarker)
+	t.Setenv("FAKEPI_EXIT_MARKER_ON_ARG", "/late-extension.ts")
 	stateDir := t.TempDir()
 	path := filepath.Join(t.TempDir(), "timeout-reload.jsonl")
 	_, addr := startDaemonHandle(t, func(cfg *daemon.Config) {
@@ -641,6 +709,18 @@ func TestAddPiArgsTimeoutCancelsLateReady(t *testing.T) {
 	})
 	if resp["success"] != false || resp["code"] != protocol.CodeReloadTimeout {
 		t.Fatalf("timed-out reload = %v, want reload_timeout", resp)
+	}
+	waitFor(t, testutil.DefaultTimeout, "timed-out replacement to exit", func() bool {
+		_, err := os.Stat(exitMarker)
+		return err == nil
+	})
+	timer := time.NewTimer(100 * time.Millisecond)
+	<-timer.C
+	if late := frames.find(func(frame map[string]any) bool {
+		return frame["type"] == "gw_session_state" &&
+			testutil.Str(frame, "state") == "ready" && testutil.Str(frame, "reason") == "reload"
+	}); late != nil {
+		t.Fatalf("replacement became ready after timeout: %v", late)
 	}
 	got, err := os.ReadFile(recordPath)
 	if err != nil {

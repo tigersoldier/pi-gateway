@@ -435,9 +435,11 @@ daemon operation:
   returns `reload_busy`. The merge starts from the daemon's authoritative spawn
   record; list-valued additions are idempotent
   and conflicting singleton values fail with `spawn_param_conflict`. The new
-  record is committed only after pi successfully restarts. Current runtime
-  model/provider/thinking/name values are captured by the actor before it stops
-  pi. A restart that exceeds the daemon's 30-second default timeout is canceled
+  record is committed only after pi successfully restarts. For a live Pi, the
+  actor snapshots current runtime model/provider/thinking/name values before
+  stopping it; acknowledged runtime-setting changes are retained for recovery
+  if the actor is already crashed. A restart that exceeds the daemon's 30-second
+  default timeout is canceled
   and returns `reload_timeout`; a preflight timeout keeps the old process, while
   a replacement timeout stops the replacement. A late `get_state` cannot commit
   the new configuration. If pi reports ready but the sidecar cannot be saved,

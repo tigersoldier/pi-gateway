@@ -98,11 +98,14 @@ func main() {
 	if path := os.Getenv("FAKEPI_ARGS_FILE"); path != "" {
 		_ = os.WriteFile(path, []byte(strings.Join(os.Args, "\n")+"\n"), 0o644)
 	}
+	exitMarker := os.Getenv("FAKEPI_EXIT_MARKER")
+	exitMarkerArg := os.Getenv("FAKEPI_EXIT_MARKER_ON_ARG")
 	codec := protocol.NewCodec(os.Stdin, os.Stdout)
 	for {
 		raw, err := codec.Read()
 		if err != nil {
 			s.flushOnExitFile()
+			writeExitMarker(exitMarker, exitMarkerArg, args)
 			return
 		}
 		var msg map[string]any
@@ -652,6 +655,13 @@ func appendLine(path string, v any) {
 	}
 	defer func() { _ = f.Close() }()
 	_, _ = f.Write(append(b, '\n'))
+}
+
+func writeExitMarker(path, matchArg string, args []string) {
+	if path == "" || (matchArg != "" && !slices.Contains(args, matchArg)) {
+		return
+	}
+	_ = os.WriteFile(path, []byte("exited\n"), 0o600)
 }
 
 func envInt(key string, def int) int {

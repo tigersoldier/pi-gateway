@@ -251,12 +251,13 @@ type Actor struct {
 	clients  map[string]Client
 	attached atomic.Int64
 
-	state       string
-	stopReason  string
-	path        string
-	sessionName string
-	sessionID   string
-	hasMessages bool
+	state        string
+	stopReason   string
+	path         string
+	sessionName  string
+	sessionID    string
+	runtimeState protocol.PiState
+	hasMessages  bool
 
 	turnState  string
 	turnID     string
@@ -326,6 +327,7 @@ func NewActor(p Params) *Actor {
 		state:             stateStarting,
 		path:              p.SessionPath,
 		sessionID:         sessionID,
+		runtimeState:      runtimeStateFromArgs(p.PiArgs),
 		turnState:         turnIdle,
 		pendingCalls:      make(map[string]chan protocol.Record),
 		internalCallbacks: make(map[string]func(protocol.Record)),
@@ -1147,6 +1149,7 @@ func (a *Actor) handleInternalResponse(rec protocol.Record) {
 		if !protocol.BoolField(rec.Raw, "success", false) {
 			return
 		}
+		a.updateRuntimeStateFromResponse(sc.Command, rec.Raw)
 		sc.Data = protocol.DataField(rec.Raw)
 		if raw, err := json.Marshal(sc); err == nil {
 			a.hub.Publish(protocol.Record{Raw: raw, Type: "gw_state_changed"})
@@ -1183,8 +1186,11 @@ func (a *Actor) postProcess(rec protocol.Record) {
 				}
 			}
 		}
-		if success && globalMutations[cmd] {
-			a.publishStateChanged(cmd, rec.Raw, rec.Owner)
+		if success {
+			a.updateRuntimeStateFromResponse(cmd, rec.Raw)
+			if globalMutations[cmd] {
+				a.publishStateChanged(cmd, rec.Raw, rec.Owner)
+			}
 		}
 	}
 }
@@ -1214,6 +1220,7 @@ func (a *Actor) adoptState(raw []byte) {
 	}
 
 	st := protocol.ParsePiState(data)
+	a.runtimeState = st
 	if st.SessionName != "" {
 		a.sessionName = st.SessionName
 	}
@@ -1506,11 +1513,7 @@ func (a *Actor) handleRestart(req *restartReq, events <-chan protocol.Record, do
 	}
 	hasLiveRuntimeState := a.state == stateReady && a.pi != nil
 	if req.additiveSpawnArgs != nil && !hasLiveRuntimeState {
-		current, err := piargs.Parse(a.params.PiArgs)
-		if err != nil {
-			return fail(fmt.Errorf("cannot preserve current runtime parameters: %w", err))
-		}
-		req.runtimeArgs = current.RuntimeArgs()
+		req.runtimeArgs = runtimeArgsFromState(a.runtimeState)
 		req.piArgs = append(append([]string(nil), req.runtimeArgs...), req.additiveSpawnArgs...)
 	}
 	a.metrics.Inc(metrics.Reloads)
@@ -1628,6 +1631,20 @@ func (a *Actor) handleRestartTimeout(req *restartReq, events <-chan protocol.Rec
 	return nil, nil
 }
 
+func runtimeStateFromArgs(args []string) protocol.PiState {
+	var state protocol.PiState
+	spec, err := piargs.Parse(args)
+	if err != nil {
+		return state
+	}
+	values := spec.RuntimeValues()
+	state.Model.ID = values[piargs.KeyModel]
+	state.Model.Provider = values[piargs.KeyProvider]
+	state.ThinkingLevel = values[piargs.KeyThinking]
+	state.SessionName = values[piargs.KeyName]
+	return state
+}
+
 func runtimeArgsFromState(state protocol.PiState) []string {
 	var args []string
 	if state.Model.ID != "" {
@@ -1643,6 +1660,63 @@ func runtimeArgsFromState(state protocol.PiState) []string {
 		args = append(args, "--name", state.SessionName)
 	}
 	return args
+}
+
+func (a *Actor) updateRuntimeStateFromResponse(command string, raw []byte) {
+	var data struct {
+		ID       string `json:"id"`
+		ModelID  string `json:"modelId"`
+		Provider string `json:"provider"`
+		Model    *struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+		} `json:"model"`
+		Level         string  `json:"level"`
+		ThinkingLevel string  `json:"thinkingLevel"`
+		Name          *string `json:"name"`
+		SessionName   *string `json:"sessionName"`
+	}
+	if err := json.Unmarshal(protocol.DataField(raw), &data); err != nil {
+		return
+	}
+	switch command {
+	case "set_model", "cycle_model":
+		modelID, provider := data.ID, data.Provider
+		if data.ModelID != "" {
+			modelID = data.ModelID
+		}
+		if data.Model != nil {
+			if data.Model.ID != "" {
+				modelID = data.Model.ID
+			}
+			if data.Model.Provider != "" {
+				provider = data.Model.Provider
+			}
+		}
+		if modelID != "" {
+			a.runtimeState.Model.ID = modelID
+		}
+		if provider != "" {
+			a.runtimeState.Model.Provider = provider
+		}
+		if data.ThinkingLevel != "" {
+			a.runtimeState.ThinkingLevel = data.ThinkingLevel
+		}
+	case "set_thinking_level", "cycle_thinking_level":
+		level := data.Level
+		if data.ThinkingLevel != "" {
+			level = data.ThinkingLevel
+		}
+		if level != "" {
+			a.runtimeState.ThinkingLevel = level
+		}
+	case "set_session_name":
+		if data.Name != nil {
+			a.runtimeState.SessionName = *data.Name
+		} else if data.SessionName != nil {
+			a.runtimeState.SessionName = *data.SessionName
+		}
+	}
 }
 
 // routeUI sends a dialog to one client and remembers the winner; other UI
