@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,13 @@ import (
 
 func main() {
 	args := os.Args[1:]
+	if failArg := os.Getenv("FAKEPI_EXIT_ON_ARG"); failArg != "" {
+		for _, arg := range args {
+			if arg == failArg {
+				os.Exit(42)
+			}
+		}
+	}
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Println("fakepi 0.1.0")
 		return
@@ -62,6 +70,8 @@ func main() {
 			noSession = true
 		}
 	}
+	delayArg := os.Getenv("FAKEPI_GET_STATE_DELAY_ON_ARG")
+	delayGetState := delayArg != "" && slices.Contains(args, delayArg)
 	s := &state{
 		sessionFile:    sessionFile,
 		sessionDir:     sessionDir,
@@ -70,6 +80,8 @@ func main() {
 		model:          model,
 		provider:       provider,
 		thinking:       thinking,
+		delayGetState:  delayGetState,
+		getStateDelay:  time.Duration(envInt("FAKEPI_GET_STATE_DELAY_MS", 0)) * time.Millisecond,
 		events:         envInt("FAKEPI_TURN_EVENTS", 3),
 		delay:          time.Duration(envInt("FAKEPI_TURN_DELAY_MS", 15)) * time.Millisecond,
 		rejectPrompt:   os.Getenv("FAKEPI_REJECT_PROMPT") != "",
@@ -86,11 +98,14 @@ func main() {
 	if path := os.Getenv("FAKEPI_ARGS_FILE"); path != "" {
 		_ = os.WriteFile(path, []byte(strings.Join(os.Args, "\n")+"\n"), 0o644)
 	}
+	exitMarker := os.Getenv("FAKEPI_EXIT_MARKER")
+	exitMarkerArg := os.Getenv("FAKEPI_EXIT_MARKER_ON_ARG")
 	codec := protocol.NewCodec(os.Stdin, os.Stdout)
 	for {
 		raw, err := codec.Read()
 		if err != nil {
 			s.flushOnExitFile()
+			writeExitMarker(exitMarker, exitMarkerArg, args)
 			return
 		}
 		var msg map[string]any
@@ -112,6 +127,8 @@ type state struct {
 	model          string
 	provider       string
 	thinking       string
+	delayGetState  bool
+	getStateDelay  time.Duration
 	messageCount   int
 	streaming      bool
 	events         int
@@ -251,6 +268,10 @@ func (s *state) handle(c *protocol.Codec, msg map[string]any) {
 
 	switch typ {
 	case "get_state":
+		if s.delayGetState {
+			timer := time.NewTimer(s.getStateDelay)
+			<-timer.C
+		}
 		respond("get_state", true, s.stateData(), "")
 	case "get_entries":
 		s.mu.Lock()
@@ -634,6 +655,13 @@ func appendLine(path string, v any) {
 	}
 	defer func() { _ = f.Close() }()
 	_, _ = f.Write(append(b, '\n'))
+}
+
+func writeExitMarker(path, matchArg string, args []string) {
+	if path == "" || (matchArg != "" && !slices.Contains(args, matchArg)) {
+		return
+	}
+	_ = os.WriteFile(path, []byte("exited\n"), 0o600)
 }
 
 func envInt(key string, def int) int {

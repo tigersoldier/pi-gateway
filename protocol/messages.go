@@ -119,12 +119,13 @@ type Welcome struct {
 // Gateway features advertised in gw_welcome.features. A client uses them to
 // detect a gateway revision's command surface without probing.
 const (
-	FeatureSpawnConfig = "spawn_config"
+	FeatureSpawnConfig         = "spawn_config"
+	FeatureSpawnConfigAdditive = "spawn_config_additive"
 )
 
 // GatewayFeatures lists the features every daemon revision advertises.
 func GatewayFeatures() []string {
-	return []string{FeatureSpawnConfig}
+	return []string{FeatureSpawnConfig, FeatureSpawnConfigAdditive}
 }
 
 // TurnEvent is a gw_turn lifecycle notification.
@@ -239,22 +240,24 @@ func NewError(code, msg string) ErrorEvent {
 
 // Error codes from docs/protocol.md §8.
 const (
-	CodeUnauthorized       = "unauthorized"
-	CodeForbidden          = "forbidden"
-	CodeBadFrame           = "bad_frame"
-	CodeUnknownSession     = "unknown_session"
-	CodeAmbiguousSession   = "ambiguous_session"
-	CodeSpawnParamConflict = "spawn_param_conflict"
-	CodeSharedSession      = "shared_session"
-	CodeReloadBusy         = "reload_busy"
-	CodeSessionBusy        = "session_busy"
-	CodeSessionAttached    = "session_attached"
-	CodeQueueFull          = "queue_full"
-	CodeSlowConsumer       = "slow_consumer"
-	CodeUIStale            = "ui_stale"
-	CodeSessionCrashed     = "session_crashed"
-	CodeResyncRequired     = "resync_required"
-	CodeNotSupported       = "not_supported"
+	CodeUnauthorized             = "unauthorized"
+	CodeForbidden                = "forbidden"
+	CodeBadFrame                 = "bad_frame"
+	CodeUnknownSession           = "unknown_session"
+	CodeAmbiguousSession         = "ambiguous_session"
+	CodeSpawnParamConflict       = "spawn_param_conflict"
+	CodeSharedSession            = "shared_session"
+	CodeReloadBusy               = "reload_busy"
+	CodeReloadTimeout            = "reload_timeout"
+	CodeSpawnConfigPersistFailed = "spawn_config_persist_failed"
+	CodeSessionBusy              = "session_busy"
+	CodeSessionAttached          = "session_attached"
+	CodeQueueFull                = "queue_full"
+	CodeSlowConsumer             = "slow_consumer"
+	CodeUIStale                  = "ui_stale"
+	CodeSessionCrashed           = "session_crashed"
+	CodeResyncRequired           = "resync_required"
+	CodeNotSupported             = "not_supported"
 )
 
 // Response builds a pi-shaped response frame with a local id. data may be nil.

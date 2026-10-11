@@ -49,6 +49,8 @@ type Config struct {
 	SubscriberBuffer int
 	// DeltaFlush is the streaming-delta coalescing interval.
 	DeltaFlush time.Duration
+	// ReloadTimeout bounds a gw_reload_session restart; 0 uses 30 seconds.
+	ReloadTimeout time.Duration
 	// Log receives structured operational records.
 	Log gwlog.Logger
 	// Metrics collects counters and gauges; nil creates a private registry.
@@ -62,8 +64,10 @@ type Config struct {
 // started with, used to detect conflicting re-attaches and to re-apply the
 // configuration on a later respawn (docs/protocol.md §4.3).
 type entry struct {
-	actor *session.Actor
-	spawn map[string][]string
+	actor           *session.Actor
+	spawnMu         sync.Mutex // serializes spawn-config reloads and attach validation
+	pendingAttaches int        // protected by spawnMu; includes conflict-checked clients not yet bound
+	spawn           map[string][]string
 	// spawnArgs is the precise spawn-only argv the session was started with, in
 	// canonical long-flag form; it is what the spawn sidecar persists.
 	spawnArgs []string
@@ -143,6 +147,9 @@ func New(cfg Config) *Daemon {
 	}
 	if cfg.DeltaFlush <= 0 {
 		cfg.DeltaFlush = defaultDeltaFlush
+	}
+	if cfg.ReloadTimeout <= 0 {
+		cfg.ReloadTimeout = 30 * time.Second
 	}
 	d := &Daemon{
 		cfg:        cfg,
@@ -460,7 +467,7 @@ func (d *Daemon) liveActor(target string) (*session.Actor, error) {
 
 // replaceSpawn records a replacement spawn configuration for a live session
 // after a successful gw_reload_session{piArgs} (P4).
-func (d *Daemon) replaceSpawn(a *session.Actor, spec *piargs.Spec) {
+func (d *Daemon) replaceSpawn(a *session.Actor, spec *piargs.Spec) error {
 	d.mu.Lock()
 	e := d.entryLocked(a)
 	if e != nil {
@@ -468,9 +475,10 @@ func (d *Daemon) replaceSpawn(a *session.Actor, spec *piargs.Spec) {
 		e.spawnArgs = spec.CanonicalSpawnArgs()
 	}
 	d.mu.Unlock()
-	if e != nil {
-		d.persistSpawn(canonicalPath(a.Path()), e)
+	if e == nil {
+		return errors.New("session entry disappeared during reload")
 	}
+	return d.persistSpawn(canonicalPath(a.Path()), e)
 }
 
 // setCreated records the client that explicitly created a session.
@@ -659,10 +667,10 @@ func spawnCwd(path, clientCwd string) string {
 // attach resolves a target path or name, joining a live session or spawning
 // pi for a hibernated/absent one. The returned actor is live but not yet bound
 // to the client.
-func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protocol.ClientRef) (*session.Actor, error) {
+func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protocol.ClientRef) (*session.Actor, error, func()) {
 	canon, err := d.resolveTarget(target)
 	if err != nil {
-		return nil, err
+		return nil, err, nil
 	}
 
 	d.mu.Lock()
@@ -694,7 +702,7 @@ func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protoc
 		a, err := d.newActor(canon, effSpec, effCwd)
 		if err != nil {
 			d.mu.Unlock()
-			return nil, err
+			return nil, err, nil
 		}
 		e = &entry{
 			actor:     a,
@@ -709,20 +717,25 @@ func (d *Daemon) attach(target string, spec *piargs.Spec, cwd string, by *protoc
 				e.createdAt = rec.CreatedAt
 			}
 		}
+		e.pendingAttaches = 1
 		d.sessions[canon] = e
 		d.mu.Unlock()
 		d.persistSpawn(canon, e)
 		d.log.Info("session started", "session", canon)
-		return e.actor, nil
+		return e.actor, nil, func() { d.finishAttach(e) }
 	}
 	d.mu.Unlock()
 
-	if key, conflict := piargs.SpawnConflict(e.spawn, spec.SpawnValues()); conflict {
+	e.spawnMu.Lock()
+	if key, conflict := piargs.SpawnConflict(d.spawnSnapshot(e), spec.SpawnValues()); conflict {
+		e.spawnMu.Unlock()
 		return nil, &attachError{protocol.CodeSpawnParamConflict,
-			fmt.Sprintf("session is live with a different value for %s", key)}
+			fmt.Sprintf("session is live with a different value for %s", key)}, nil
 	}
 	d.applyRuntime(e, spec, by)
-	return e.actor, nil
+	e.pendingAttaches++
+	e.spawnMu.Unlock()
+	return e.actor, nil, func() { d.finishAttach(e) }
 }
 
 // create starts a session whose file path is not known yet; the actor reports
@@ -809,9 +822,9 @@ func (d *Daemon) onPath(a *session.Actor, path string) {
 // A record failure is logged, never fatal: durable spawn configuration is a
 // convenience for the next spawn, and a missing record degrades to the
 // historical behavior.
-func (d *Daemon) persistSpawn(canon string, e *entry) {
+func (d *Daemon) persistSpawn(canon string, e *entry) error {
 	if canon == "" || e == nil {
-		return
+		return nil
 	}
 	d.mu.Lock()
 	cfg := spawnConfig{
@@ -829,7 +842,9 @@ func (d *Daemon) persistSpawn(canon string, e *entry) {
 	d.mu.Unlock()
 	if err := d.spawn.Save(cfg); err != nil {
 		d.log.Warn("cannot persist spawn configuration", "session", canon, "err", err)
+		return err
 	}
+	return nil
 }
 
 // onStopped drops a finished actor from the table.
@@ -896,6 +911,26 @@ func (d *Daemon) registerClient(a *session.Actor, c *conn) bool {
 	e.attaching--
 	d.mu.Unlock()
 	return ok
+}
+
+// spawnSnapshot returns a deep copy of an entry's spawn values. Caller need not
+// hold d.mu; replacement and attach conflict checks share this lock boundary.
+func (d *Daemon) finishAttach(e *entry) {
+	e.spawnMu.Lock()
+	if e.pendingAttaches > 0 {
+		e.pendingAttaches--
+	}
+	e.spawnMu.Unlock()
+}
+
+func (d *Daemon) spawnSnapshot(e *entry) map[string][]string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make(map[string][]string, len(e.spawn))
+	for key, values := range e.spawn {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
 }
 
 // entryLocked finds the table entry for an actor. Caller holds d.mu.

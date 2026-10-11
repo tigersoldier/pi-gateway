@@ -16,7 +16,8 @@ draft 1.
   with token roles and capability provisioning (`tokens.json`, SIGHUP reload, per-command `get_*` checks),
   token/port discovery, lazy session creation, attach/rebind by path **or
   name**, `new_session`, the catalog (`gw_list_sessions`), `gw_new_session`,
-  `gw_reload_session`, `fork`/`clone` policy, the extension UI broker, the
+  `gw_reload_session` replacement/additive spawn configuration,
+  `fork`/`clone` policy, the extension UI broker, the
   daemon queue, replay (`liveOnly` / `resume.sinceSeq`) and durable resume
   (`resume.leafEntryId`), `gw_snapshot`, coalescing with `allowLossy`/`gw_lag`,
   hibernation/reaping, and the read-only HTTP debug endpoints (§13). See
@@ -188,7 +189,8 @@ message.
   (the default daemon-generated token grants it). The daemon enforces
   `prompt` (`prompt`, `follow_up`, `new_session`, `fork`/`clone`),
   `interject` (`steer`), `ui` (answering dialogs), `observe`
-  (`gw_list_sessions`), `control` (`gw_reload_session`), and `admin`
+  (`gw_list_sessions`), `control` (`gw_reload_session`, including
+  `addPiArgs`), and `admin`
   (`gw_new_session`). Per-command `get_*` checks and full role provisioning
   are enforced as of M3 (see §10).
 
@@ -215,7 +217,7 @@ A second `gw_hello` on the same connection is `bad_frame`.
   "clientId": "c_2",
   "kind": "pilish",
   "granted": ["observe", "interject", "prompt", "ui", "control"],
-  "features": ["spawn_config"],
+  "features": ["spawn_config", "spawn_config_additive"],
   "piVersion": "0.81.0",
   "concurrency": "queue",
   "session": null,
@@ -235,8 +237,9 @@ A second `gw_hello` on the same connection is `bad_frame`.
   role. The default daemon-generated token grants the full set.
 - `features` names the gateway **command surface** this daemon revision
   supports, so a client detects support without probing. `spawn_config` is
-  durable spawn configuration (§4.3); an older daemon sends no `features`
-  array at all, and a client must then fall back to probing or version checks.
+  durable spawn configuration (§4.3); `spawn_config_additive` advertises
+  `gw_reload_session{addPiArgs}`. An older daemon sends no `features` array at
+  all, and a client must then fall back to probing or version checks.
 - `session` is `{path, name, id}` when the connection is bound at hello, else
   `null`.
 - `resyncRequired: true` means the requested cursor is not replayable; the
@@ -416,7 +419,8 @@ daemon operation:
 ```
 
 - Refused with `reload_busy` while other clients are attached or a turn is
-  running, unless `force: true`.
+  running, unless `force: true`. An in-flight attach returns `reload_busy` even
+  with `force`, so it cannot bind across the restart.
 - On success pi is stopped and respawned with the session's recorded spawn
   config; the file reloads. Attached clients receive
   `gw_session_state{state:"restarting"}` then `{state:"ready"}`.
@@ -424,6 +428,26 @@ daemon operation:
   §4.3): the new process starts with those arguments, and, only after the
   restart succeeds, they become the configuration a later plain reload or cold
   respawn uses. Requires the same `control` capability as the plain form.
+- An optional `addPiArgs` **adds** accepted spawn arguments without replacing
+  existing ones (P5, §4.3). It is mutually exclusive with `piArgs`; `force`
+  is never honored, so a running turn or another attached client returns
+  `reload_busy` even when `force:true` is sent; an in-flight attach also
+  returns `reload_busy`. The merge starts from the daemon's authoritative spawn
+  record; list-valued additions are idempotent
+  and conflicting singleton values fail with `spawn_param_conflict`. The new
+  record is committed only after pi successfully restarts. For a live Pi, the
+  actor snapshots current runtime model/provider/thinking/name values before
+  stopping it; acknowledged runtime-setting changes are retained for recovery
+  if the actor is already crashed. A restart that exceeds the daemon's 30-second
+  default timeout is canceled
+  and returns `reload_timeout`; a preflight timeout keeps the old process, while
+  a replacement timeout stops the replacement. A late `get_state` cannot commit
+  the new configuration. If pi reports ready but the sidecar cannot be saved,
+  the command returns
+  `spawn_config_persist_failed`: the live process and in-memory record use the
+  new configuration, but it is not durable. After storage is repaired, retry
+  the same addition to persist it. Requires `spawn_config_additive` and the
+  same `control` capability.
 
 ### 3.7 New session (`new_session`)
 
@@ -586,7 +610,7 @@ Notification:
 | `gw_hello` | §2 | handshake, auth, optional bind |
 | `gw_list_sessions` | `{filter}` | session catalog |
 | `gw_new_session` | `{name?, cwd?, piArgs?, tags?}` | explicit create + bind |
-| `gw_reload_session` | `{session?, force?, piArgs?}` | restart pi for a session |
+| `gw_reload_session` | `{session?, force?, piArgs?, addPiArgs?}` | restart with replacement or additive spawn config |
 | `gw_stop_session` | `{session?, force?}` | stop pi, keep the session file (§3.10) |
 | `gw_delete_session` | `{session?, force?}` | stop pi, delete the session file (§3.10) |
 | `gw_ping` | `{}` | liveness |
@@ -688,11 +712,22 @@ belongs to pi — and never kept only in memory. The record is what makes a
 - `gw_reload_session{piArgs}` (P4) **replaces** the recorded configuration and
   restarts pi with it. It is disruptive (a restart, and a re-attach for every
   client) and is intended for installing a durable system-prompt instruction on
-  a session the client did not create. The
-  replacement becomes durable only after the restart succeeds. It requires the
-  existing `control` capability — not a separate `admin` check — because the
-  daemon enforces exactly one capability per command from the single table in
-  `protocol/roles.go` (§10).
+  a session the client did not create. The replacement becomes durable only
+  after the restart succeeds. It requires the existing `control` capability —
+  not a separate `admin` check — because the daemon enforces exactly one
+  capability per command from the single table in `protocol/roles.go` (§10).
+- `gw_reload_session{addPiArgs}` (P5) is the optional generic adoption path.
+  It starts from the gateway's authoritative recorded spawn arguments and
+  validates additions with the same parser. Repeated `--extension`, `--skill`,
+  `--prompt-template`, `--theme`, and `--append-system-prompt` values; the
+  comma-separated lists `--models`, `--tools`, and `--exclude-tools` also
+  merge idempotently. Conflicting singleton values fail with
+  `spawn_param_conflict`. Runtime parameters and `--no-session` are not valid
+  additions. It is mutually exclusive with `piArgs`; `force` is never honored,
+  so an active turn or another attached client returns `reload_busy`, even when
+  `force:true` was requested. A successful restart commits the merged spawn
+  record; a failed restart leaves the old record intact. It uses the existing
+  `control` capability and adds no app-specific policy.
 
 ### 4.4 Global session mutations
 
@@ -804,7 +839,9 @@ frame carries that same id.
 | `ambiguous_session` | name resolved to more than one session |
 | `spawn_param_conflict` | spawn-only parameter differs from the live session config |
 | `shared_session` | `fork`/`clone` requested while other clients are attached |
-| `reload_busy` | reload refused: other clients attached or a turn running |
+| `reload_busy` | reload refused: other clients attached, a turn running, or another client attaching |
+| `reload_timeout` | reload canceled after the runtime-state query or replacement readiness exceeded the daemon timeout |
+| `spawn_config_persist_failed` | pi restarted, but the new spawn configuration could not be saved durably |
 | `session_busy` | stop/delete refused: a turn is running and `force` was not set |
 | `session_attached` | `gw_stop_session` refused: other clients are attached and `force` was not set |
 | `queue_full` | command rejected: the session actor is busy or shutting down (its inbound queue is full) |

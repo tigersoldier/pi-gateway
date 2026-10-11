@@ -5,6 +5,7 @@
 package piargs
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -247,6 +248,19 @@ func (s *Spec) RuntimeValues() map[string]string {
 	return out
 }
 
+// RuntimeArgs returns the runtime-applicable arguments in their original order.
+// The session actor uses these when an additive spawn-config change restarts
+// Pi, so the restart does not discard its existing runtime parameters.
+func (s *Spec) RuntimeArgs() []string {
+	var out []string
+	for _, g := range s.groups {
+		if g.runtime {
+			out = append(out, g.tokens...)
+		}
+	}
+	return out
+}
+
 // secretSpawnKeys are spawn parameters whose value is a credential and must
 // never be exposed through gw_list_sessions or the debug catalog. The value is
 // still persisted (it is needed to respawn) and still participates in conflict
@@ -331,6 +345,139 @@ func MergeSpawn(recordedSpawnArgs []string, requested *Spec) []string {
 		out = append(out, g.tokens...)
 	}
 	return out
+}
+
+// SpawnConflictError reports an addition that would change an existing
+// singleton spawn option. It deliberately names only the option, never its
+// value (which may be a credential).
+type SpawnConflictError struct {
+	Key string
+}
+
+func (e *SpawnConflictError) Error() string {
+	flag := canonicalFlags[e.Key]
+	if flag == "" {
+		flag = e.Key
+	}
+	return fmt.Sprintf("conflicting value for %s", flag)
+}
+
+// MergeSpawnAdditions adds accepted, spawn-only arguments to the daemon's
+// authoritative record. Repeated/list-valued settings are deduplicated;
+// conflicting singleton values are rejected. Both inputs and the result use
+// canonical argument spelling.
+func MergeSpawnAdditions(recordedSpawnArgs []string, additions *Spec) (*Spec, error) {
+	recorded, err := Parse(recordedSpawnArgs)
+	if err != nil {
+		// The record can contain credentials; do not include parser details in
+		// an error that will be returned to the requesting client.
+		return nil, errors.New("invalid recorded spawn configuration")
+	}
+	for _, g := range recorded.groups {
+		if g.runtime {
+			return nil, fmt.Errorf("recorded configuration contains runtime option %s", canonicalFlags[g.key])
+		}
+	}
+	if additions == nil {
+		return nil, errors.New("no spawn arguments to add")
+	}
+	for _, g := range additions.groups {
+		if g.runtime {
+			return nil, fmt.Errorf("runtime option %s cannot be added to spawn configuration", canonicalFlags[g.key])
+		}
+		if g.key == "no-session" {
+			return nil, fmt.Errorf("--no-session cannot be added to an existing session")
+		}
+		if len(g.tokens) == 0 {
+			return nil, fmt.Errorf("spawn option %s has no canonical argument form", canonicalFlags[g.key])
+		}
+	}
+
+	// Re-parse canonical arguments so aliases never enter a durable record.
+	adds, err := Parse(additions.CanonicalSpawnArgs())
+	if err != nil {
+		return nil, err
+	}
+	groups := append([]argGroup(nil), recorded.groups...)
+	values := make(map[string][]string, len(recorded.Values))
+	for key, got := range recorded.Values {
+		values[key] = append([]string(nil), got...)
+	}
+	for _, g := range adds.groups {
+		if isCommaSeparatedList(g.key) {
+			present := make(map[string]bool)
+			for _, item := range splitList(values[g.key]) {
+				present[item] = true
+			}
+			var missing []string
+			for _, item := range splitList([]string{g.value}) {
+				if !present[item] {
+					present[item] = true
+					missing = append(missing, item)
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			value := strings.Join(missing, ",")
+			groups = append(groups, argGroup{
+				key: g.key, value: value,
+				tokens: []string{canonicalFlags[g.key], value},
+			})
+			values[g.key] = append(values[g.key], value)
+			continue
+		}
+		if isRepeatedList(g.key) {
+			found := false
+			for _, value := range values[g.key] {
+				if value == g.value {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+			groups = append(groups, g)
+			values[g.key] = append(values[g.key], g.value)
+			continue
+		}
+
+		if current := values[g.key]; len(current) > 0 {
+			for _, value := range current {
+				if value != g.value {
+					return nil, &SpawnConflictError{Key: g.key}
+				}
+			}
+			continue
+		}
+		groups = append(groups, g)
+		values[g.key] = append(values[g.key], g.value)
+	}
+
+	var mergedArgs []string
+	for _, g := range groups {
+		mergedArgs = append(mergedArgs, g.tokens...)
+	}
+	return Parse(mergedArgs)
+}
+
+func isRepeatedList(key string) bool {
+	switch key {
+	case "extension", "skill", "prompt-template", "theme", "append-system-prompt":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCommaSeparatedList(key string) bool {
+	switch key {
+	case "models", "tools", "exclude-tools":
+		return true
+	default:
+		return false
+	}
 }
 
 // SpawnValues returns every canonical value except the runtime-applicable

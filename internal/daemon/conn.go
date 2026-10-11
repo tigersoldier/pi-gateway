@@ -422,9 +422,13 @@ func (c *conn) handleHello(raw []byte) error {
 
 	var actor *session.Actor
 	var attachErr error
+	var releaseAttach func()
 	if h.Session != "" {
 		ref := c.Ref()
-		actor, attachErr = c.d.attach(h.Session, spec, cwd, &ref)
+		actor, attachErr, releaseAttach = c.d.attach(h.Session, spec, cwd, &ref)
+	}
+	if releaseAttach != nil {
+		defer releaseAttach()
 	}
 	// Subscribe before reading the replay window: records published between the
 	// two must land in the subscriber buffer (the pump's watermark drops the
@@ -782,7 +786,10 @@ func (c *conn) handleSwitch(raw []byte, id string) {
 		return
 	}
 	ref := c.Ref()
-	actor, err := c.d.attach(path, c.piSpec, c.cwd, &ref)
+	actor, err, releaseAttach := c.d.attach(path, c.piSpec, c.cwd, &ref)
+	if releaseAttach != nil {
+		defer releaseAttach()
+	}
 	if err != nil {
 		c.d.metrics.Inc(metrics.AttachFailures)
 		c.sendResponse(id, "switch_session", false, errorCode(err), err.Error(), nil)
@@ -910,22 +917,27 @@ func (c *conn) handleGWNewSession(raw []byte) {
 	c.sendResponse(id, "gw_new_session", true, "", "", body)
 }
 
-// handleReload restarts pi for a session (docs/protocol.md §3.6). A piArgs
-// field replaces the session's recorded spawn configuration (P4), which is how
-// an integration upgrades an installed instruction; without it the actor's
-// current parameters are reused.
+// handleReload restarts pi for a session (docs/protocol.md §3.6). piArgs
+// replaces the recorded spawn configuration (P4); addPiArgs merges additions
+// into the authoritative record without forcing a restart (P5).
 func (c *conn) handleReload(raw []byte) {
 	id := protocol.Field(raw, "id")
 	var req struct {
-		Session string   `json:"session"`
-		Force   bool     `json:"force"`
-		PiArgs  []string `json:"piArgs"`
+		Session   string   `json:"session"`
+		Force     bool     `json:"force"`
+		PiArgs    []string `json:"piArgs"`
+		AddPiArgs []string `json:"addPiArgs"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame, err.Error(), nil)
 		return
 	}
-	var spec *piargs.Spec
+	if req.PiArgs != nil && req.AddPiArgs != nil {
+		c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame,
+			"piArgs and addPiArgs are mutually exclusive", nil)
+		return
+	}
+	var spec, additions *piargs.Spec
 	if req.PiArgs != nil {
 		parsed, err := piargs.Parse(req.PiArgs)
 		if err != nil {
@@ -933,6 +945,19 @@ func (c *conn) handleReload(raw []byte) {
 			return
 		}
 		spec = parsed
+	}
+	if req.AddPiArgs != nil {
+		if len(req.AddPiArgs) == 0 {
+			c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame,
+				"addPiArgs must contain at least one spawn argument", nil)
+			return
+		}
+		parsed, err := piargs.Parse(req.AddPiArgs)
+		if err != nil {
+			c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame, err.Error(), nil)
+			return
+		}
+		additions = parsed
 	}
 	var actor *session.Actor
 	if req.Session == "" {
@@ -950,26 +975,83 @@ func (c *conn) handleReload(raw []byte) {
 			return
 		}
 	}
+	c.d.mu.Lock()
+	e := c.d.entryLocked(actor)
+	c.d.mu.Unlock()
+	if e == nil {
+		c.sendResponse(id, "gw_reload_session", false, protocol.CodeUnknownSession,
+			"session has no recorded spawn configuration", nil)
+		return
+	}
+	// Reconfiguration requests for a session are serialized across the full
+	// restart-and-commit sequence so no request merges from stale config.
+	e.spawnMu.Lock()
+	defer e.spawnMu.Unlock()
+	if e.pendingAttaches > 0 {
+		c.d.metrics.Inc(metrics.ReloadsRefused)
+		c.sendResponse(id, "gw_reload_session", false, protocol.CodeReloadBusy,
+			"another client is attaching to the session", nil)
+		return
+	}
+	if additions != nil {
+		if canonicalPath(actor.Path()) == "" {
+			c.sendResponse(id, "gw_reload_session", false, protocol.CodeUnknownSession,
+				"session path is not ready", nil)
+			return
+		}
+		c.d.mu.Lock()
+		recorded := append([]string(nil), e.spawnArgs...)
+		c.d.mu.Unlock()
+		merged, err := piargs.MergeSpawnAdditions(recorded, additions)
+		if err != nil {
+			var conflict *piargs.SpawnConflictError
+			if errors.As(err, &conflict) {
+				c.sendResponse(id, "gw_reload_session", false, protocol.CodeSpawnParamConflict, err.Error(), nil)
+			} else {
+				c.sendResponse(id, "gw_reload_session", false, protocol.CodeBadFrame, err.Error(), nil)
+			}
+			return
+		}
+		spec = merged
+	}
 	ref := c.Ref()
 	var spawnArgs []string
 	if spec != nil {
-		spawnArgs = spec.Args
+		// Keep an empty-but-present replacement distinct from a plain reload,
+		// which reuses the actor's current arguments.
+		spawnArgs = make([]string, len(spec.Args))
+		copy(spawnArgs, spec.Args)
 	}
 	// The response goes straight to this connection: the target actor is not
 	// necessarily the one this client is subscribed to, so publishing it on
 	// that session's hub would drop it.
-	err := actor.Restart(req.Force, c.id, &ref, spawnArgs, 30*time.Second)
+	var err error
+	if additions != nil {
+		// Additive changes always use non-forced semantics, even if force was
+		// requested: shared or busy sessions are never disrupted by adoption.
+		err = actor.RestartAddPiArgs(c.id, &ref, spec.CanonicalSpawnArgs(), c.d.cfg.ReloadTimeout)
+	} else {
+		err = actor.Restart(req.Force, c.id, &ref, spawnArgs, c.d.cfg.ReloadTimeout)
+	}
 	switch {
 	case err == nil:
 		if spec != nil {
-			// The restart succeeded; only now does the replacement become the
-			// session's recorded configuration.
-			c.d.replaceSpawn(actor, spec)
+			// Commit the new record only after the replacement process reports
+			// ready. A failed sidecar save is reported even though the live
+			// process and in-memory record now use the new configuration.
+			if err := c.d.replaceSpawn(actor, spec); err != nil {
+				c.sendResponse(id, "gw_reload_session", false, protocol.CodeSpawnConfigPersistFailed,
+					"pi restarted with the new configuration, but it could not be saved durably; retry after fixing storage", nil)
+				return
+			}
 		}
 		c.sendResponse(id, "gw_reload_session", true, "", "", nil)
 	case errors.Is(err, session.ErrReloadBusy):
 		c.sendResponse(id, "gw_reload_session", false, protocol.CodeReloadBusy,
 			"a turn is running or another client is attached", nil)
+	case errors.Is(err, session.ErrCallTimeout):
+		c.sendResponse(id, "gw_reload_session", false, protocol.CodeReloadTimeout,
+			"session reload timed out and was canceled", nil)
 	default:
 		c.sendResponse(id, "gw_reload_session", false, protocol.CodeSessionCrashed, err.Error(), nil)
 	}

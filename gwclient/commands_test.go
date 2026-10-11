@@ -23,6 +23,28 @@ func TestPingRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReloadSessionWithAdditions(t *testing.T) {
+	c := dial(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if !c.HasFeature(protocol.FeatureSpawnConfigAdditive) {
+		t.Fatalf("gateway features = %v, missing additive spawn config", c.Features())
+	}
+	if _, err := c.NewSession(ctx, gwclient.NewSessionRequest{
+		Cwd:    t.TempDir(),
+		PiArgs: []string{"--extension", "/first.ts"},
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	resp, err := c.ReloadSessionWithAdditions(ctx, "", "--extension", "/second.ts")
+	if err != nil {
+		t.Fatalf("ReloadSessionWithAdditions: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("additive reload response = %+v", resp)
+	}
+}
+
 // TestPingTimesOutWithoutPong pins that Ping actually waits: the old
 // implementation only sent gw_ping and reported success without an answer.
 func TestPingTimesOutWithoutPong(t *testing.T) {

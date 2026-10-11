@@ -284,6 +284,23 @@ func (c *Client) ReloadSession(ctx context.Context, session string, force bool, 
 	return c.Do(ctx, "gw_reload_session", fields)
 }
 
+// ReloadSessionWithAdditions adds accepted spawn arguments without replacing
+// the recorded configuration. It requires the daemon's additive feature and
+// never requests a forced restart; busy or shared sessions return reload_busy.
+func (c *Client) ReloadSessionWithAdditions(ctx context.Context, session string, addPiArgs ...string) (*Response, error) {
+	if !c.HasFeature(protocol.FeatureSpawnConfigAdditive) {
+		return nil, fmt.Errorf("gateway does not advertise %s", protocol.FeatureSpawnConfigAdditive)
+	}
+	if len(addPiArgs) == 0 {
+		return nil, fmt.Errorf("at least one pi argument must be added")
+	}
+	fields := map[string]any{"addPiArgs": addPiArgs}
+	if session != "" {
+		fields["session"] = session
+	}
+	return c.Do(ctx, "gw_reload_session", fields)
+}
+
 // StopSession stops a session's pi process and keeps the session file
 // (gw_stop_session). An empty session addresses this client's bound session;
 // a name or path resolves like switch_session, including a hibernated
