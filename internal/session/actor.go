@@ -875,7 +875,10 @@ func (a *Actor) handlePrompt(c ClientCommand) {
 		a.forwardCommand(item, c.Client, c.LocalID)
 		return
 	}
-	a.queue.Push(item)
+	if !a.queue.TryPush(item, int64(len(c.Raw))) {
+		a.errorResponse(c, protocol.CodeQueueFull, "pending prompt queue limit reached")
+		return
+	}
 	a.metrics.Inc(metrics.PromptsQueued)
 	a.respond(c, true, []byte(`{"queued":true}`))
 	a.publishQueue()

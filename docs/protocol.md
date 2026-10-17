@@ -497,6 +497,14 @@ for cross-client ordering.
 - `gw_queue` reports the daemon queue with author tags:
   `{pending:[{id, mode:"followUp", author:{clientId,kind,name}, preview}]}`.
 - Author/kind tags are informational and never change delivery order.
+- The daemon accepts at most 64 pending `prompt`/`follow_up` items per session,
+  32 per client per session, and 16 MiB aggregate serialized command bytes per
+  session. An item that would exceed any limit is rejected immediately with a
+  pi-shaped `response` carrying `code:"queue_full"`; the accepted queue and
+  its FIFO order are unchanged. These limits apply only to daemon-pending
+  items, not the active turn or an immediate `steer`. They do not schedule
+  clients fairly: accepted work remains in global arrival order. Pop, clear,
+  crash, and stop release its item and byte accounting.
 
 Because the daemon holds the queue, `clear_queue` and `abort` are defined in
 terms of the daemon queue and pi's turn:
@@ -854,7 +862,7 @@ frame carries that same id.
 | `spawn_config_persist_failed` | pi restarted, but the new spawn configuration could not be saved durably |
 | `session_busy` | stop/delete refused: a turn is running and `force` was not set |
 | `session_attached` | `gw_stop_session` refused: other clients are attached and `force` was not set |
-| `queue_full` | command rejected: the session actor is busy or shutting down (its inbound queue is full) |
+| `queue_full` | command rejected because the actor is stopped/stopping, its inbound queue is full, or the pending prompt queue would exceed a session, per-client, or byte limit |
 | `slow_consumer` | client disconnected for not reading |
 | `ui_stale` | extension UI response arrived after resolution |
 | `session_crashed` | pi exited; command not accepted |

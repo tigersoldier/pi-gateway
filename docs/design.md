@@ -653,9 +653,17 @@ cross-client ordering.
 - Otherwise it is enqueued in the per-client tagged FIFO.
 - When `agent_settled` arrives, the actor dequeues the next prompt and forwards
   it as a normal `prompt`.
+- Pending daemon-queued `prompt` and `follow_up` commands are bounded at 64
+  items per session, 32 items per client per session, and 16 MiB aggregate
+  serialized command bytes per session. An item that would exceed any limit is
+  rejected immediately with `queue_full`; accepted queue state is unchanged.
+  These limits exclude the active turn and immediate `steer`. They bound
+  admission only and do not alter global FIFO or introduce fair scheduling.
 
 Queue entries carry `{id, mode:"followUp", author:{clientId, kind, name},
-preview}`; author/kind tags are informational and never change order.
+preview}`; author/kind tags are informational and never change order. Item and
+byte accounting is released when an entry is popped or the queue is cleared,
+including crash and stop cleanup.
 
 ### 8.2 Interjections
 

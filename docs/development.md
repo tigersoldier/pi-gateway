@@ -193,6 +193,17 @@ unless it is explicitly marked so.
   interjection forwarded to pi immediately; `follow_up` is enqueued like a
   mid-turn prompt. `gw_queue` reports the daemon queue with author/kind tags.
   pi's own queue is not used for cross-client ordering.
+- **Pending prompt queue bounds** (operator). To bound memory and prevent a
+  single client from occupying the whole pending queue without changing global
+  FIFO or introducing fair scheduling, each session accepts at most 64 pending
+  `prompt`/`follow_up` items, at most 32 from any one client, and at most 16
+  MiB of aggregate serialized command bytes. An item that would exceed any
+  limit is rejected immediately with the existing `queue_full` response, and
+  does not mutate accepted queue state. The limits apply only to daemon-pending
+  items: an active turn and immediate `steer` are excluded. Pop, clear, crash,
+  and stop release item and byte accounting. Evidence: queue and actor tests
+  cover each cap, exact-boundary acceptance, rejection without mutation, FIFO,
+  and accounting after pop/clear; the required race tests cover daemon paths.
 - **`abort` / `clear_queue` under sharing** (operator). **pi-native,
   session-wide, requiring `interject`.** `abort` stops the shared turn, and
   queued prompts remain and run afterwards (pi-native behavior);
