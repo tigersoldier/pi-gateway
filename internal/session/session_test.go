@@ -1,8 +1,10 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -77,12 +79,120 @@ func TestHubDropsSlowSubscriber(t *testing.T) {
 	}
 }
 
+func queueTestItem(clientID, id string) QueuedItem {
+	return QueuedItem{ClientID: clientID, Kind: "test", LocalID: id, Type: "prompt", Message: id}
+}
+
+func TestQueueSessionItemLimitAndRejectedPushDoesNotMutate(t *testing.T) {
+	if maxPendingItems != 64 || maxPendingItemsPerClient != 32 || maxPendingCommandBytes != 16<<20 {
+		t.Fatalf("queue limits = (%d, %d, %d), want (64, 32, %d)",
+			maxPendingItems, maxPendingItemsPerClient, maxPendingCommandBytes, 16<<20)
+	}
+	var q Queue
+	for i := 0; i < maxPendingItems; i++ {
+		clientID := "c_1"
+		if i >= maxPendingItemsPerClient {
+			clientID = "c_2"
+		}
+		if !q.TryPush(queueTestItem(clientID, fmt.Sprintf("r%d", i)), 1) {
+			t.Fatalf("push %d rejected before session limit", i)
+		}
+	}
+	if q.Len() != maxPendingItems || q.commandByte != maxPendingItems {
+		t.Fatalf("at session limit: items=%d bytes=%d", q.Len(), q.commandByte)
+	}
+	beforeItems := append([]QueuedItem(nil), q.items...)
+	beforeClients := map[string]int{"c_1": q.perClient["c_1"], "c_2": q.perClient["c_2"]}
+	if q.TryPush(queueTestItem("c_3", "overflow"), 1) {
+		t.Fatal("push beyond the session item limit was accepted")
+	}
+	if q.Len() != maxPendingItems || q.commandByte != maxPendingItems ||
+		!reflect.DeepEqual(q.items, beforeItems) || !reflect.DeepEqual(q.perClient, beforeClients) {
+		t.Fatal("rejected session-limit push mutated accepted queue state")
+	}
+}
+
+func TestQueuePerClientItemLimitAndRejectedPushDoesNotMutate(t *testing.T) {
+	var q Queue
+	for i := 0; i < maxPendingItemsPerClient; i++ {
+		if !q.TryPush(queueTestItem("c_1", fmt.Sprintf("r%d", i)), 1) {
+			t.Fatalf("push %d rejected before per-client limit", i)
+		}
+	}
+	beforeItems := append([]QueuedItem(nil), q.items...)
+	beforeBytes := q.commandByte
+	if q.TryPush(queueTestItem("c_1", "overflow"), 1) {
+		t.Fatal("push beyond the per-client item limit was accepted")
+	}
+	if q.Len() != maxPendingItemsPerClient || q.commandByte != beforeBytes ||
+		!reflect.DeepEqual(q.items, beforeItems) || q.perClient["c_1"] != maxPendingItemsPerClient {
+		t.Fatal("rejected per-client-limit push mutated accepted queue state")
+	}
+	if !q.TryPush(queueTestItem("c_2", "other-client"), 1) {
+		t.Fatal("another client was rejected after the first client's rejected push")
+	}
+}
+
+func TestQueueSerializedCommandByteLimitAndRejectedPushDoesNotMutate(t *testing.T) {
+	var q Queue
+	if !q.TryPush(queueTestItem("c_1", "large"), maxPendingCommandBytes-3) ||
+		!q.TryPush(queueTestItem("c_2", "boundary"), 3) {
+		t.Fatal("push at the exact aggregate byte limit was rejected")
+	}
+	beforeItems := append([]QueuedItem(nil), q.items...)
+	beforeClients := map[string]int{"c_1": q.perClient["c_1"], "c_2": q.perClient["c_2"]}
+	if q.commandByte != maxPendingCommandBytes {
+		t.Fatalf("aggregate bytes = %d, want %d", q.commandByte, maxPendingCommandBytes)
+	}
+	if q.TryPush(queueTestItem("c_3", "overflow"), 1) {
+		t.Fatal("push beyond the aggregate byte limit was accepted")
+	}
+	if q.Len() != 2 || q.commandByte != maxPendingCommandBytes ||
+		!reflect.DeepEqual(q.items, beforeItems) || !reflect.DeepEqual(q.perClient, beforeClients) {
+		t.Fatal("rejected byte-limit push mutated accepted queue state")
+	}
+}
+
+func TestQueueAccountingReleasedOnPopAndClear(t *testing.T) {
+	var q Queue
+	for _, entry := range []struct {
+		client string
+		id     string
+		bytes  int64
+	}{{"c_1", "first", 5}, {"c_1", "second", 10}, {"c_2", "third", 7}} {
+		if !q.TryPush(queueTestItem(entry.client, entry.id), entry.bytes) {
+			t.Fatalf("push %q rejected", entry.id)
+		}
+	}
+	popped, ok := q.Pop()
+	if !ok || popped.LocalID != "first" {
+		t.Fatalf("Pop = %+v, %v", popped, ok)
+	}
+	if q.Len() != 2 || q.commandByte != 17 || q.perClient["c_1"] != 1 || q.perClient["c_2"] != 1 {
+		t.Fatalf("after pop: items=%d bytes=%d clients=%v", q.Len(), q.commandByte, q.perClient)
+	}
+	cleared := q.Clear()
+	if len(cleared) != 2 || cleared[0].LocalID != "second" || cleared[1].LocalID != "third" {
+		t.Fatalf("Clear order = %+v", cleared)
+	}
+	if q.Len() != 0 || q.commandByte != 0 || len(q.perClient) != 0 {
+		t.Fatalf("after clear: items=%d bytes=%d clients=%v", q.Len(), q.commandByte, q.perClient)
+	}
+	if !q.TryPush(queueTestItem("c_1", "reused"), maxPendingCommandBytes) {
+		t.Fatal("queue accounting was not reset by Clear")
+	}
+}
+
 func TestQueueFIFOAndTags(t *testing.T) {
 	var q Queue
-	q.Push(QueuedItem{ClientID: "c_1", Kind: "pilish", Name: "laptop", LocalID: "req-1",
-		Type: "prompt", Message: "  hello \n world  "})
-	q.Push(QueuedItem{ClientID: "c_2", Kind: "bot", Name: "slack", LocalID: "req-2",
-		Type: "follow_up", Message: strings.Repeat("x", 200)})
+	if !q.TryPush(QueuedItem{ClientID: "c_1", Kind: "pilish", Name: "laptop", LocalID: "req-1",
+		Type: "prompt", Message: "  hello \n world  "}, 1) {
+		t.Fatal("first queue push rejected")
+	}
+	if !q.TryPush(QueuedItem{ClientID: "c_2", Kind: "bot", Name: "slack", LocalID: "req-2",
+		Type: "follow_up", Message: strings.Repeat("x", 200)}, 1) {
+		t.Fatal("second queue push rejected")
+	}
 
 	pending := q.Pending()
 	if len(pending) != 2 {
@@ -214,6 +324,52 @@ func TestActorPromptThenQueue(t *testing.T) {
 	// The first prompt's response comes from pi and is addressed to its owner.
 	if !hasFrame(recs, "response", `"id":"c_1:r1"`) {
 		t.Fatalf("missing owned response in %s", dump(recs))
+	}
+}
+
+func TestActorPendingQueueLimitUsesQueueFullWithoutChangingQueue(t *testing.T) {
+	t.Setenv("FAKEPI_TURN_DELAY_MS", "10000")
+	a := startTestActor(t, Params{SessionPath: filepath.Join(t.TempDir(), "s.jsonl"), HubCapacity: 256})
+	client := &fakeClient{id: "c_1", kind: "test", name: "one",
+		caps: map[string]bool{"prompt": true, "observe": true}}
+	if !a.AttachSync(client, time.Second) {
+		t.Fatal("attach failed")
+	}
+	sub := a.Subscribe(client.id, SubOptions{Buffer: 256})
+
+	if err := a.Submit(promptCmd(client, "running", "active")); err != nil {
+		t.Fatal(err)
+	}
+	collectUntil(t, sub, func(rec protocol.Record) bool {
+		return rec.Type == "gw_turn" && strings.Contains(string(rec.Raw), `"running"`)
+	}, 5*time.Second)
+	for i := 0; i < maxPendingItemsPerClient; i++ {
+		id := fmt.Sprintf("queued-%d", i)
+		if err := a.Submit(promptCmd(client, id, id)); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if got := a.Info().Turn.Queued; got != maxPendingItemsPerClient {
+		t.Fatalf("queued before overflow = %d, want %d", got, maxPendingItemsPerClient)
+	}
+	if err := a.Submit(promptCmd(client, "overflow", "rejected")); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Info().Turn.Queued; got != maxPendingItemsPerClient {
+		t.Fatalf("rejected prompt mutated queue: queued = %d, want %d", got, maxPendingItemsPerClient)
+	}
+	recs := collectUntil(t, sub, func(rec protocol.Record) bool {
+		return rec.Type == "response" && protocol.Field(rec.Raw, "id") == "overflow"
+	}, 5*time.Second)
+	var rejected protocol.Record
+	for _, rec := range recs {
+		if rec.Type == "response" && protocol.Field(rec.Raw, "id") == "overflow" {
+			rejected = rec
+			break
+		}
+	}
+	if protocol.BoolField(rejected.Raw, "success", true) || protocol.Field(rejected.Raw, "code") != protocol.CodeQueueFull {
+		t.Fatalf("overflow response = %s, want failed queue_full", rejected.Raw)
 	}
 }
 
