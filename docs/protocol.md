@@ -13,7 +13,7 @@ draft 1.
   behavior is noted in §6 (mid-turn attach) and will be revisited after
   implementation.
 - **Implementation status.** M1, M2, and M3 are implemented: handshake/auth
-  with token roles and capability provisioning (`tokens.json`, SIGHUP reload, per-command `get_*` checks),
+  with token roles and capability provisioning (`tokens.json`, SIGHUP reload, explicit command/capability checks),
   token/port discovery, lazy session creation, attach/rebind by path **or
   name**, `new_session`, the catalog (`gw_list_sessions`), `gw_new_session`,
   `gw_reload_session` replacement/additive spawn configuration,
@@ -191,8 +191,9 @@ message.
   `interject` (`steer`), `ui` (answering dialogs), `observe`
   (`gw_list_sessions`), `control` (`gw_reload_session`, including
   `addPiArgs`), and `admin`
-  (`gw_new_session`). Per-command `get_*` checks and full role provisioning
-  are enforced as of M3 (see §10).
+  (`gw_new_session`). These are representative command examples; §10 gives
+  the complete command-to-capability mapping and enforcement rules, implemented
+  as of M3.
 
 The `granted` array in the reply is the intersection of the requested
 capabilities with the token's role. The default daemon-generated token grants
@@ -644,6 +645,14 @@ Intercepted (not forwarded to the current pi):
 | `gw_new_session` | admin control: create with `name`/`piArgs`/`tags`/`cwd`, rebind requester (§3.3) |
 | `fork`, `clone` | sole client: forward, adopt the new file, rebind requester; shared: `shared_session` (§3.8) |
 
+After the §2 handshake, §§4.1–4.2 define the complete client command surface.
+Unsupported non-`gw_*` command names are rejected with a pi-shaped
+`not_supported` response before lazy session creation or forwarding to pi.
+Adding a pi command requires listing it here and assigning its existing or
+deliberately approved capability in §10; unknown `get_*` names are not
+implicitly authorized. Unknown `gw_*` messages retain their
+`gw_error{code:"not_supported"}` behavior.
+
 `abort` and `clear_queue` are **session-wide** and require `interject`, the
 same capability as `steer` (§3.9, §10): clearing can withdraw prompts another
 client queued or had forwarded.
@@ -818,7 +827,8 @@ frame carries that same id.
 - Fire-and-forget methods (`notify`, `setStatus`, `setWidget`, `setTitle`,
   `set_editor_text`) are broadcast. They are **pi → client** only: pi defines
   them as methods of `extension_ui_request`, not as RPC commands, so a client
-  never sends them; sending one is an unknown-command error from pi.
+  never sends them; sending one is rejected by the gateway as an unsupported
+  command and is not forwarded to pi.
 - Dialog methods (`select`, `confirm`, `input`, `editor`) are routed to the
   **author of the running turn** (`gw_turn.author`). If that client lacks `ui`
   or has disconnected, the daemon falls back to the most recently active
@@ -924,16 +934,19 @@ all <- gw_session_state{state:"ready"}
 
 ## 10. Capability enforcement
 
-Every command is checked once, before dispatch, against the token's role
-(docs/design.md §10). Command types are canonical: a frame whose `type` is not
-lowercase is rejected with `bad_frame` rather than forwarded, so case variants
-cannot dodge the table. A missing capability answers `forbidden` without
-dispatching the command, so a refused command never lazily creates a session,
-starts pi, or changes shared state.
+Every supported command is checked once, before dispatch, against the token's
+role (docs/design.md §10). Command types are canonical: a frame whose `type` is
+not lowercase is rejected with `bad_frame` rather than forwarded, so case
+variants cannot dodge the table. A missing capability answers `forbidden`
+without dispatching the command, so a refused command never lazily creates a
+session, starts pi, or changes shared state. A command outside the documented
+surface is rejected with `not_supported`; no unknown non-`gw_*` command is
+forwarded to pi. Unknown `gw_*` messages keep the `gw_error` response described
+in §4.1/§8.
 
 | Capability | Commands |
 |---|---|
-| `observe` | `get_*`, `export_html`, `gw_list_sessions`, receiving the event stream |
+| `observe` | `get_state`, `get_messages`, `get_available_models`, `get_available_thinking_levels`, `get_session_stats`, `get_entries`, `get_tree`, `get_fork_messages`, `get_last_assistant_text`, `get_commands`, `export_html`, `gw_list_sessions`, receiving the event stream |
 | `prompt` | `prompt`, `follow_up`, `new_session`, `fork`, `clone`, `bash`, `switch_session` |
 | `interject` | `steer`, `abort`, `abort_bash`, `abort_retry`, `clear_queue` |
 | `ui` | `extension_ui_response` |

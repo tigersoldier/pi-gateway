@@ -43,43 +43,67 @@ func TestNormalizeCapabilities(t *testing.T) {
 
 func TestCommandCapability(t *testing.T) {
 	cases := map[string]string{
-		"get_state":             CapObserve,
-		"get_messages":          CapObserve,
-		"export_html":           CapObserve,
-		"gw_list_sessions":      CapObserve,
-		"prompt":                CapPrompt,
-		"follow_up":             CapPrompt,
-		"new_session":           CapPrompt,
-		"fork":                  CapPrompt,
-		"clone":                 CapPrompt,
-		"bash":                  CapPrompt,
-		"switch_session":        CapPrompt,
-		"steer":                 CapInterject,
-		"abort":                 CapInterject,
-		"abort_bash":            CapInterject,
-		"abort_retry":           CapInterject,
-		"clear_queue":           CapInterject,
-		"extension_ui_response": CapUI,
-		"set_model":             CapControl,
-		"cycle_thinking_level":  CapControl,
-		"compact":               CapControl,
-		"gw_reload_session":     CapControl,
-		"gw_new_session":        CapAdmin,
-		"gw_stop_session":       CapAdmin,
-		"gw_delete_session":     CapAdmin,
-		"gw_ping":               "",
-		"gw_bye":                "",
+		"get_state":                     CapObserve,
+		"get_messages":                  CapObserve,
+		"get_available_models":          CapObserve,
+		"get_available_thinking_levels": CapObserve,
+		"get_session_stats":             CapObserve,
+		"get_entries":                   CapObserve,
+		"get_tree":                      CapObserve,
+		"get_fork_messages":             CapObserve,
+		"get_last_assistant_text":       CapObserve,
+		"get_commands":                  CapObserve,
+		"export_html":                   CapObserve,
+		"gw_list_sessions":              CapObserve,
+		"prompt":                        CapPrompt,
+		"follow_up":                     CapPrompt,
+		"new_session":                   CapPrompt,
+		"fork":                          CapPrompt,
+		"clone":                         CapPrompt,
+		"bash":                          CapPrompt,
+		"switch_session":                CapPrompt,
+		"steer":                         CapInterject,
+		"abort":                         CapInterject,
+		"abort_bash":                    CapInterject,
+		"abort_retry":                   CapInterject,
+		"clear_queue":                   CapInterject,
+		"extension_ui_response":         CapUI,
+		"set_model":                     CapControl,
+		"cycle_model":                   CapControl,
+		"set_thinking_level":            CapControl,
+		"cycle_thinking_level":          CapControl,
+		"set_steering_mode":             CapControl,
+		"set_follow_up_mode":            CapControl,
+		"compact":                       CapControl,
+		"set_auto_compaction":           CapControl,
+		"set_auto_retry":                CapControl,
+		"set_session_name":              CapControl,
+		"gw_reload_session":             CapControl,
+		"gw_new_session":                CapAdmin,
+		"gw_stop_session":               CapAdmin,
+		"gw_delete_session":             CapAdmin,
+		"gw_ping":                       "",
+		"gw_bye":                        "",
 	}
 	for command, want := range cases {
 		if got := CommandCapability(command); got != want {
 			t.Errorf("CommandCapability(%q) = %q, want %q", command, got, want)
 		}
+		if !IsSupportedCommand(command) {
+			t.Errorf("IsSupportedCommand(%q) = false, want true", command)
+		}
 	}
 	// pi's `extension_ui_request` methods are notifications to the client, not
 	// commands, so they must not be in the table (docs/design.md §9).
-	for _, notACommand := range []string{"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"} {
+	for _, notACommand := range []string{
+		"notify", "setStatus", "setWidget", "setTitle", "set_editor_text",
+		"get_future_feature", "unknown_command",
+	} {
 		if got := CommandCapability(notACommand); got != "" {
-			t.Errorf("CommandCapability(%q) = %q; it is a pi UI notification, not a command", notACommand, got)
+			t.Errorf("CommandCapability(%q) = %q; it is not a supported command", notACommand, got)
+		}
+		if IsSupportedCommand(notACommand) {
+			t.Errorf("IsSupportedCommand(%q) = true; it is not a supported command", notACommand)
 		}
 	}
 }
@@ -106,6 +130,9 @@ func TestEveryPiCommandIsGated(t *testing.T) {
 	for _, command := range piCommands {
 		if got := CommandCapability(command); got == "" {
 			t.Errorf("CommandCapability(%q) = \"\"; every pi command needs a capability", command)
+		}
+		if !IsSupportedCommand(command) {
+			t.Errorf("IsSupportedCommand(%q) = false; every documented pi command must be supported", command)
 		}
 	}
 }

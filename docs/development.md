@@ -26,7 +26,7 @@ decisions.
 | Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags, and `gw_stop_session`/`gw_delete_session` to release pi or destroy the session (`session_busy`/`session_attached` refusals, `force`, tombstoned paths) |
 | Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags plus durable `spawn` per session; `gw_welcome.features` |
 | Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` replacement and additive spawn-config restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
-| Commands | passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
+| Commands | documented command allowlist with fail-closed dispatch, passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
 | Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state` (including the terminal `deleted`), `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
@@ -98,6 +98,20 @@ unless it is explicitly marked so.
   metadata (paths, names, titles) to any local process. It must never gain a
   mutating endpoint; putting it behind the token again is a one-line change if
   that exposure is unwanted.
+- **RPC command allowlist and fail-closed dispatch** (operator requirement,
+  based on the documented §4.2 surface). The documented pi commands are the
+  complete client command surface; an unlisted non-`gw_*` type is rejected as
+  `not_supported` before it can lazily create a session or reach pi. The
+  capability table must contain each supported command explicitly: an unknown
+  `get_*` type is not implicitly an `observe` command, and an empty capability
+  result is not authorization for an unknown type. Preserve each existing
+  capability for documented commands; in post-handshake command dispatch,
+  `gw_ping` and `gw_bye` remain the only supported commands requiring no
+  capability (`gw_hello` is handled by the handshake). Unknown `gw_*` types
+  keep their existing `gw_error{code:"not_supported"}` handling. Rejected:
+  forwarding unknown pi commands and relying on pi to reject them, because
+  that makes the authorization boundary fail open and can expose future
+  commands without a deliberate capability decision.
 - **Token roles and provisioning** (operator). **Default token full authority;
   optional `tokens.json` for restricted tokens.** The daemon-generated
   `~/.config/pi-gateway/token` always grants every capability.

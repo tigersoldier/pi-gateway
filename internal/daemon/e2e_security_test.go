@@ -40,6 +40,23 @@ func dialWithToken(t *testing.T, addr, token string) *testutil.Conn {
 	return c
 }
 
+// TestUnknownCommandRejectedForRestrictedToken pins rejection before an
+// unknown command can exploit the no-capability path or create a session.
+func TestUnknownCommandRejectedForRestrictedToken(t *testing.T) {
+	d, addr := observerDaemon(t, protocol.CapObserve)
+	c := dialWithToken(t, addr, "restricted-token")
+
+	const command = "unknown_admin_operation"
+	c.Send(map[string]any{"type": command, "id": "unknown-1"})
+	resp := c.WaitResponse("unknown-1", testutil.DefaultTimeout)
+	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeNotSupported {
+		t.Fatalf("unknown command as observer = %v, want not_supported", resp)
+	}
+	if snap := d.Status(); snap.Registered != 0 || snap.Live != 0 {
+		t.Fatalf("rejected unknown command created a session: %+v", snap)
+	}
+}
+
 // TestObserverCannotRunPrivilegedCommands is the M3 review regression: before
 // the capability table, any authenticated token could run `bash` (arbitrary
 // shell as the daemon user) and dump the transcript with `export_html`.
