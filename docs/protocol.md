@@ -852,7 +852,7 @@ frame carries that same id.
 | `spawn_config_persist_failed` | pi restarted, but the new spawn configuration could not be saved durably |
 | `session_busy` | stop/delete refused: a turn is running and `force` was not set |
 | `session_attached` | `gw_stop_session` refused: other clients are attached and `force` was not set |
-| `queue_full` | command rejected because the actor's inbound queue is full or the pending prompt queue would exceed a session, per-client, or byte limit |
+| `queue_full` | command rejected because the actor is stopped/stopping, its inbound queue is full, or the pending prompt queue would exceed a session, per-client, or byte limit |
 | `slow_consumer` | client disconnected for not reading |
 | `ui_stale` | extension UI response arrived after resolution |
 | `session_crashed` | pi exited; command not accepted |
