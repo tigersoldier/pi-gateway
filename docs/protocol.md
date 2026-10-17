@@ -191,8 +191,9 @@ message.
   `interject` (`steer`), `ui` (answering dialogs), `observe`
   (`gw_list_sessions`), `control` (`gw_reload_session`, including
   `addPiArgs`), and `admin`
-  (`gw_new_session`). Explicit checks for each supported command and full role
-  provisioning are enforced as of M3 (see §10).
+  (`gw_new_session`). These are representative command examples; §10 gives
+  the complete command-to-capability mapping and enforcement rules, implemented
+  as of M3.
 
 The `granted` array in the reply is the intersection of the requested
 capabilities with the token's role. The default daemon-generated token grants
