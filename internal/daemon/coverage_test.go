@@ -684,31 +684,24 @@ func waitSeen(t *testing.T, count func(string) int, typ string) bool {
 	return false
 }
 
-// TestUnsupportedCommandSurfacesPiError pins the passthrough contract: a
-// command the gateway does not intercept is forwarded to pi, and when pi does
-// not know it the client sees pi's own error rather than a fake success. It is
-// the regression test for fakepi answering success to every unknown type,
-// which hid exactly this class of mismatch (docs/development.md, "Remove two
-// non-commands from the capability table").
-func TestUnsupportedCommandSurfacesPiError(t *testing.T) {
+// TestUnsupportedCommandDoesNotReachPi pins the fake-Pi forwarding boundary:
+// unknown non-gw_* commands are rejected by the gateway before pi can answer.
+func TestUnsupportedCommandDoesNotReachPi(t *testing.T) {
 	dir := t.TempDir()
 	addr, _ := startDaemon(t, 30*time.Second, 5*time.Second)
 	c, _, _ := dialSession(t, addr, filepath.Join(dir, "unsupported.jsonl"))
 
-	// `notify` is a pi extension_ui_request method, not a command. It must not
-	// be gated by a capability (the table no longer lists it) and must come back
-	// as pi's unknown-command error.
-	c.Send(map[string]any{"type": "notify", "id": "n1", "message": "hi"})
-	resp := c.WaitFor(func(f map[string]any) bool {
-		return f["type"] == "response" && testutil.Str(f, "id") == "n1"
-	}, testutil.DefaultTimeout)
-	if resp["success"] != false {
-		t.Fatalf("notify answered success=%v; pi has no notify command", resp["success"])
+	const command = "unknown_pi_command"
+	c.Send(map[string]any{"type": command, "id": "n1"})
+	resp := c.WaitResponse("n1", testutil.DefaultTimeout)
+	if resp["success"] != false || testutil.Str(resp, "code") != protocol.CodeNotSupported {
+		t.Fatalf("unsupported command response = %v, want not_supported", resp)
 	}
-	if got := testutil.Str(resp, "error"); !strings.Contains(got, "Unknown command: notify") {
-		t.Fatalf("notify error = %q, want pi's unknown-command error", got)
+	want := command + " is not supported by this daemon revision"
+	if got := testutil.Str(resp, "error"); got != want {
+		t.Fatalf("unsupported command error = %q, want gateway rejection %q (not a fake-Pi response)", got, want)
 	}
-	if code := testutil.Str(resp, "code"); code == protocol.CodeForbidden {
-		t.Fatalf("notify was capability-gated: %v", resp)
+	if strings.Contains(testutil.Str(resp, "error"), "Unknown command:") {
+		t.Fatalf("unsupported command reached fake Pi: %v", resp)
 	}
 }

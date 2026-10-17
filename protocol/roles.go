@@ -1,7 +1,5 @@
 package protocol
 
-import "strings"
-
 // Capability roles bundle the capabilities a provisioned token confers
 // (docs/design.md §10). A token in ~/.config/pi-gateway/tokens.json names
 // either one of these presets ("role") or an explicit capability list.
@@ -34,56 +32,82 @@ func RoleCapabilities(role string) ([]string, bool) {
 	return nil, false
 }
 
-// CommandCapability returns the capability a client command requires, or ""
-// when any authenticated client may send it. This is the single
-// command→capability table from docs/design.md §10; the daemon enforces it
-// once, before dispatching the frame (docs/protocol.md §10).
-//
-// Only commands a client may send appear here. pi's `extension_ui_request`
-// methods (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`)
-// are pi → client notifications, not commands, and are deliberately absent.
-//
-// Command types are canonical: the daemon rejects a frame whose type is not
-// lowercase, so the table never has to consider case variants.
-func CommandCapability(command string) string {
-	if strings.HasPrefix(command, "get_") {
-		// pi's queries only observe a session.
-		return CapObserve
-	}
-	switch command {
+// commandCapabilities is the explicit client-command allowlist and the single
+// command→capability table from docs/design.md §10. Empty values are supported
+// commands requiring no capability; absence means unsupported, not allowed.
+// Keep this synchronized with the complete command surface in docs/protocol.md
+// §4. The daemon checks IsSupportedCommand before dispatch and checks the
+// returned capability once before any command can create a session.
+var commandCapabilities = map[string]string{
 	// Reading a session or its transcript.
-	case "gw_list_sessions", "export_html":
-		return CapObserve
+	"get_state":                     CapObserve,
+	"get_messages":                  CapObserve,
+	"get_available_models":          CapObserve,
+	"get_available_thinking_levels": CapObserve,
+	"get_session_stats":             CapObserve,
+	"get_entries":                   CapObserve,
+	"get_tree":                      CapObserve,
+	"get_fork_messages":             CapObserve,
+	"get_last_assistant_text":       CapObserve,
+	"get_commands":                  CapObserve,
+	"export_html":                   CapObserve,
+	"gw_list_sessions":              CapObserve,
 	// Causing work in the session. `bash` runs a shell command as the daemon
 	// user, which a prompt-capable client could reach through the agent
 	// anyway; `switch_session` may start pi for a hibernated session.
-	case "prompt", "follow_up", "new_session", "fork", "clone", "bash", "switch_session":
-		return CapPrompt
+	"prompt":         CapPrompt,
+	"follow_up":      CapPrompt,
+	"new_session":    CapPrompt,
+	"fork":           CapPrompt,
+	"clone":          CapPrompt,
+	"bash":           CapPrompt,
+	"switch_session": CapPrompt,
 	// Interjecting into (or cancelling) a running turn.
-	case "steer", "abort", "abort_bash", "abort_retry", "clear_queue":
-		return CapInterject
+	"steer":       CapInterject,
+	"abort":       CapInterject,
+	"abort_bash":  CapInterject,
+	"abort_retry": CapInterject,
+	"clear_queue": CapInterject,
 	// Driving the user's UI.
-	case "extension_ui_response":
-		return CapUI
+	"extension_ui_response": CapUI,
 	// Session-global state and administration.
-	case "gw_reload_session",
-		"set_model", "cycle_model",
-		"set_thinking_level", "cycle_thinking_level",
-		"set_steering_mode", "set_follow_up_mode",
-		"compact", "set_auto_compaction", "set_auto_retry",
-		"set_session_name":
-		return CapControl
+	"gw_reload_session":    CapControl,
+	"set_model":            CapControl,
+	"cycle_model":          CapControl,
+	"set_thinking_level":   CapControl,
+	"cycle_thinking_level": CapControl,
+	"set_steering_mode":    CapControl,
+	"set_follow_up_mode":   CapControl,
+	"compact":              CapControl,
+	"set_auto_compaction":  CapControl,
+	"set_auto_retry":       CapControl,
+	"set_session_name":     CapControl,
 	// Provisioning: creating a session and destroying one are the operator's
 	// authority, not something any attached client may do (docs/design.md §10).
-	case "gw_new_session", "gw_stop_session", "gw_delete_session":
-		return CapAdmin
-	}
-	// Deliberately open to any authenticated client: only the connection
-	// keep-alives. Everything that changes or cancels session work is gated,
-	// including the cancellation primitives (they share `interject` with
-	// `steer`, because `clear_queue` can withdraw another client's queued or
-	// forwarded prompt).
-	return ""
+	"gw_new_session":    CapAdmin,
+	"gw_stop_session":   CapAdmin,
+	"gw_delete_session": CapAdmin,
+	// Connection keep-alives are the only supported commands with no capability.
+	"gw_ping": "",
+	"gw_bye":  "",
+}
+
+// IsSupportedCommand reports whether command is part of the gateway's client
+// command surface. Unknown types are not made valid by an empty capability.
+func IsSupportedCommand(command string) bool {
+	_, ok := commandCapabilities[command]
+	return ok
+}
+
+// CommandCapability returns the capability a supported command requires, or
+// "" if it requires no capability or is unsupported. Callers that dispatch a
+// command must first check IsSupportedCommand. Only commands a client may send
+// appear in the table; pi's `extension_ui_request` methods (`notify`,
+// `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) are outbound
+// notifications, not commands. Command types are canonical: the daemon rejects
+// frames whose type is not lowercase, so case variants are not in the table.
+func CommandCapability(command string) string {
+	return commandCapabilities[command]
 }
 
 // NormalizeCapabilities keeps the known capabilities from caps in canonical

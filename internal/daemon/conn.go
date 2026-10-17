@@ -697,6 +697,13 @@ func (c *conn) handleFrame(raw []byte) {
 		return
 	}
 	id := protocol.Field(raw, "id")
+	if !protocol.IsSupportedCommand(typ) && !protocol.IsGatewayType(typ) {
+		// Fail closed: an unknown pi-shaped type is not a capability-free
+		// command and must never reach pi or lazily create a session.
+		c.sendResponse(id, typ, false, protocol.CodeNotSupported,
+			fmt.Sprintf("%s is not supported by this daemon revision", typ), nil)
+		return
+	}
 	// Capability enforcement happens here, once, before any command is
 	// dispatched or can lazily create a session (docs/design.md §10). The
 	// actor only enforces ownership (for example which client owns a dialog).
