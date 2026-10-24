@@ -19,19 +19,24 @@ decisions.
 
 **M1 (session core), M2 (multi-client sharing) and M3 (operations) are implemented.**
 
+The TypeScript package is the canonical production daemon and bridge. It
+requires Node.js >=22.19.0 and uses Pi's SDK in-process. The Go daemon, bridge,
+and internal server packages are retired; the public Go protocol/client
+packages and `examples/chat` remain supported.
+
 | Area | Status |
 | --- | --- |
-| Binaries | `pi-gatewayd` (daemon), `pi-gateway` (bridge) |
+| Runtime | TypeScript daemon and bridge under `typescript/`; one Pi SDK `AgentSession` per live gateway session |
 | Transport/auth | loopback TCP, token file (0600), `--server`/`--port`/`--token-file`, port-file discovery with fallback to `127.0.0.1:7331` |
-| Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags, and `gw_stop_session`/`gw_delete_session` to release pi or destroy the session (`session_busy`/`session_attached` refusals, `force`, tombstoned paths) |
-| Catalog | `gw_list_sessions` with cwd/live/limit filters over pi's session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags plus durable `spawn` per session; `gw_welcome.features` |
-| Process | one pi per session, crash/exit reporting, idle hibernation, short-grace reaping, `gw_reload_session` replacement and additive spawn-config restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
-| Commands | documented command allowlist with fail-closed dispatch, passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application via RPC plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
+| Sessions | attach by path **or name**, implicit creation on the first command, server-side `switch_session` rebinding, `new_session` rebinding only the requester, explicit `gw_new_session` with creator tags, and `gw_stop_session`/`gw_delete_session` to dispose the SDK session or destroy its file (`session_busy`/`session_attached` refusals, `force`, tombstoned paths) |
+| Catalog | `gw_list_sessions` with cwd/live/limit filters over Pi session files plus live actors; name resolution with `unknown_session`/`ambiguous_session`; in-memory `createdBy`/tags plus durable spawn configuration per session; `gw_welcome.features` |
+| Runtime lifecycle | one in-process Pi SDK session per gateway session, crash reporting, idle hibernation, short-grace reaping, `gw_reload_session` replacement and additive spawn-config restarts (`reload_busy`/`force`), `fork`/`clone` adoption for a sole client (`shared_session` otherwise), explicit stop/delete with a forced-abort grace |
+| Commands | documented command allowlist with fail-closed dispatch, passthrough with `id` namespacing, spawn-param conflict detection, runtime-parameter application through the Pi SDK plus `gw_state_changed`, one capability check per command before dispatch (canonical lowercase types only) |
 | Queue | daemon-owned per-client tagged FIFO, immediate `steer`, `abort`, session-wide `clear_queue` returning cleared text |
 | Events | per-session ordered log with `gw_seq`, `gw_turn`, `gw_queue`, `gw_presence`, `gw_session_state` (including the terminal `deleted`), `gw_error`; `liveOnly` and `resume.sinceSeq` replay; `gw_snapshot` resync; `resume.leafEntryId` durable resume across daemon restarts |
 | Extension UI | dialogs routed to the turn author, then the most recently active `ui` client, reassigned when that client disconnects; non-owner answers are `ui_stale`; fire-and-forget methods broadcast |
 | Backpressure | per-connection buffers, streaming-delta coalescing (default 50 ms/8 KB), terminal events never dropped, `allowLossy` clients get `gw_lag` instead of being dropped, `slow_consumer` close |
-| Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured `log/slog` logging (`--log-format`/`--log-level`), Prometheus-text metrics including `pi_gateway_sessions_deleted_total` |
+| Operations | systemd user unit (`packaging/pi-gatewayd.service`), separate loopback debug listener at `127.0.0.1:7332` with `/status` `/catalog` `/metrics` (read-only, no auth), token roles/presets + `tokens.json` + `--provision-token`, SIGHUP token reload, structured logging (`--log-format`/`--log-level`), Prometheus-text metrics including `pi_gateway_sessions_deleted_total` |
 | Client library | `protocol`/`config`/`piargs` exported at module root, and a `gwclient` package that dials and discovers the daemon, performs `gw_hello`/`gw_welcome` (including the post-welcome attach error), correlates `Do` responses by id, streams `Events()` or delivers frames through `Config.OnEvent`, exposes a resume cursor (`Cursor`/`LastSeq`/`LeafID`, `Reconnect`), decodes gateway events and extension dialogs with typed accessors, and wraps session/catalog/prompt/interject/dialog plus the rest of pi's command surface (models, thinking, modes, compaction, retry, `bash` streaming, entries/tree/stats/export, `set_session_name`, images), so a bot in another Go module can import the client instead of reimplementing it; `examples/chat` is a runnable CLI built only on it |
 | Roles | `admin`/`operator`/`observer` presets or explicit capability lists; `granted` = request ∩ token role; `get_*`/`export_html`/`gw_list_sessions` and receiving events require `observe`, `bash`/`prompt`/`switch_session` require `prompt`, shared-state mutations require `control`, `steer`/`abort`/`clear_queue` require `interject`, `gw_new_session`/`gw_stop_session`/`gw_delete_session` require `admin`. Starting a session (implicit creation, `get_state`, `gw_hello.session`) is not itself privileged: the session a client starts is its own, and everything it may do inside it is governed by this table |
 
@@ -42,8 +47,10 @@ adapters behind the same protocol.
 ## Decision log
 
 Every decision below was resolved with the operator (or by research) and is
-recorded with its evidence. Nothing here should be treated as provisional
-unless it is explicitly marked so.
+recorded with its evidence. Some entries describe the retired Go runtime and
+are historical implementation records; the current runtime status and package
+layout above describe the TypeScript production implementation. Nothing here
+should be treated as provisional unless it is explicitly marked so.
 
 ### Resolved
 
@@ -60,9 +67,10 @@ unless it is explicitly marked so.
   **token** is required because any local process can reach a loopback port.
 - **Network surface** (operator). **Local-only** — no network listener, no TLS.
 - **Session lifecycle** (operator). **Idle timeout.** After the last client
-  detaches and the agent settles, pi keeps running for a configurable grace
-  period (default 15 minutes), then hibernates: pi stops and only the session
-  file remains. Never mid-turn. The next attach respawns pi and loads the file.
+  detaches and the agent settles, the SDK session remains active for a
+  configurable grace period (default 15 minutes), then is disposed; only the
+  session file remains. Never mid-turn. The next attach restores an SDK session
+  from the file.
 - **Cross-client concurrency** (operator). **Queue.** Any attached client may
   prompt; prompts run FIFO one turn at a time; mid-turn prompts queue as
   follow-ups (or `steer` when asked) and are never rejected with `turn_held`.
@@ -133,7 +141,7 @@ unless it is explicitly marked so.
   `--log-format text|json` and `--log-level` on the daemon (text suits journald);
   counters and gauges are exposed on the debug listener's `/metrics` in
   Prometheus text format with no extra dependencies.
-- **Daemon restart** (operator). **Lazy re-adoption.** No pi processes at boot;
+- **Daemon restart** (operator). **Lazy re-adoption.** No SDK sessions at boot;
   the next attach loads the session file. In-flight turns are lost (accepted).
 - **Mid-turn attach** (operator, *provisional — revisit after implementation*).
   **Live-only.** A client attaching to a running turn joins the stream where it
@@ -182,7 +190,7 @@ unless it is explicitly marked so.
   stays pi-shaped (`success` + `data.cancelled`) and the following `get_state`
   reports the new file, so pilish's `/new` works unchanged.
 - **`fork` / `clone` under sharing** (operator). **Refuse when shared; forward
-  when alone.** pi's `fork`/`clone` switch the live pi process to a newly
+  when alone.** Pi's `fork`/`clone` switch the live SDK session to a newly
   created session file, so they are refused with `shared_session` whenever
   other clients are attached (no client is ever moved). When the requester is
   the only client, the daemon forwards the command, adopts the new file as a
@@ -610,12 +618,24 @@ unless it is explicitly marked so.
   `canon != ""` guards, so the same class of bug can return at the next call
   site).
 
-### Open
+### Remaining design decisions
 
-None. Every gap found while reviewing `docs/protocol.md` draft 2 has been
-resolved and recorded above. The **mid-turn attach** entry is deliberately
-provisional (live-only) and is the first item to revisit now that the daemon
-is implemented.
+The protocol-draft review gaps are recorded above. The **mid-turn attach**
+entry remains deliberately provisional (live-only).
+
+- **TypeScript runtime cutover** (resolved). The TypeScript daemon and bridge
+  implement protocol v1 and the accepted session/CLI behavior; the Go runtime
+  is removed after mapping its runtime assertions to TypeScript tests. Retain
+  the Go `protocol`, `config`, `piargs`, and `gwclient` packages and the chat
+  example as client APIs. The wire contract and source-test mapping are
+  documented in `docs/protocol.md` and `docs/test-parity.md`. No protocol
+  expansion is part of this cutover.
+
+- **Pi executable selection (accepted CLI exception).** The TypeScript daemon
+  resolves the default `pi` executable/SDK from `PATH`; its CLI has no `--pi`
+  override. This intentionally differs from the former Go daemon's CLI, so
+  strict CLI parity is not claimed. The runtime may inject an SDK path in tests
+  without adding a CLI override.
 
 The v0.1.0 library review also named gaps that are **not** library fixes and
 stay open as separate decisions:
@@ -649,83 +669,73 @@ stay open as separate decisions:
 ## Repository layout
 
 ```text
-cmd/pi-gatewayd/     daemon: listener, auth, session table, connections
-cmd/pi-gateway/      bridge: gateway protocol upstream, raw pi RPC on stdio
-gwclient/            exported client library: dial, handshake, commands, events,
-                     reconnect/resume, typed event and UI helpers
-examples/chat/       example interactive CLI built only on gwclient
-config/              token/port/tokens-file paths, discovery, roles, provisioning
-piargs/              accepted pi parameter parsing (shared daemon/client)
-protocol/            strict JSONL codec, gw_* messages, id namespacing, capability table
-internal/catalog/   session file scanning, name resolution, durable leaf ids
-internal/client/     bridge implementation (argv, token/port, relay)
-internal/daemon/     session table, attach/rebind, spawn-param checks
-internal/debughttp/  read-only /status /catalog /metrics over loopback HTTP
-internal/gwlog/      structured logging (log/slog: text for journald, or JSON)
-internal/metrics/    Prometheus-text counters and gauges
-internal/session/    SessionActor, Hub, PromptQueue, PiProcess
-internal/fakepi/     fake pi used by the tests
-internal/gwtest/     shared daemon harness for end-to-end tests
-internal/testutil/   test helpers (build fake pi, raw protocol client)
-packaging/           systemd user unit
+typescript/bin/       TypeScript daemon and bridge entry points
+typescript/src/       SDK runtime, session actor/hub/queue, protocol adapter,
+                      bridge, catalog, config, logging, metrics, debug HTTP
+typescript/test/      unit, lifecycle, protocol, CLI, and executable E2E tests
+protocol/             retained Go JSONL codec, messages, roles, capability table
+config/               retained Go token/port paths, discovery, and provisioning
+piargs/               retained Go Pi-argument parser
+gwclient/             retained public Go client and its wire-level test fixture
+examples/chat/        runnable Go client example
+packaging/            systemd user unit
+test/e2e/             Emacs + pilish local-provider ERT suites
+docs/                 protocol, architecture, migration map, and development guide
 ```
 
 ## Building and testing
 
-### Building and static checks
+### TypeScript runtime
+
+Node.js >=22.19.0 is required. The runtime uses native TypeScript stripping and
+has no compile step. For a local install:
 
 ```bash
-gofmt -l .        # must print nothing
+npm install --global ./typescript
+pi-gatewayd --version
+pi-gateway --help
+```
+
+Run the TypeScript suite and static checks from the package directory:
+
+```bash
+cd typescript
+npm test
+npm run typecheck
+```
+
+### Retained Go client packages
+
+Go 1.22+ is required for the public protocol/client packages and example; no
+Go daemon or bridge is built from this repository.
+
+```bash
+go test -race ./...
 go vet ./...
-go build ./...
+gofmt -l .
+go run ./examples/chat
 ```
 
-Go 1.22+ is required. The only dependencies are the standard library and
-`golang.org/x/term` (bridge terminal detection), so `go build` works offline.
-
-### Unit and integration tests
-
-```bash
-go test -race ./...                       # everything (198 tests, a few minutes)
-go test -race ./internal/daemon/          # the largest package
-go test -run TestAttach ./internal/daemon/  # one test
-go test -count=2 ./protocol/          # catch state leaking between runs
-```
-
-- **No real `pi` is needed.** `internal/fakepi` is a deterministic stand-in
-  (with `FAKEPI_*` knobs for turn length, delay, rejection and UI requests) and
-  `internal/testutil` builds it on demand. `internal/gwtest` holds the shared
-  daemon harness for tests that go over real sockets.
-- Tests never touch `~/.pi` and must not write inside the repository: use
-  `t.TempDir()` for state directories and copies.
-- Two backpressure tests stream tens of megabytes, which is why the full suite
-  takes minutes rather than seconds.
-- `cmd/pi-gatewayd/main_test.go` parses `packaging/pi-gatewayd.service` and
-  fails if the shipped unit drifts from the daemon's flags and signals, so
-  change both together.
+`gwclient/testserver_test.go` is a wire-level fixture for Go client API tests;
+it does not run or reimplement the production daemon. The TypeScript tests own
+server/runtime behavior coverage.
 
 ### End-to-end suites (Emacs + pilish)
 
-`test/e2e/` drives the real stack: Emacs + pilish → `pi-gateway` →
-`pi-gatewayd` → `pi`. [`test/e2e/README.md`](../test/e2e/README.md) lists the
-cases and the coverage of each suite.
+`test/e2e/` drives Emacs + pilish → TypeScript bridge → TypeScript daemon → Pi
+SDK. The local provider avoids credentials and external inference. See
+[`test/e2e/README.md`](../test/e2e/README.md) for requirements and coverage.
 
 ```bash
-./test/e2e/run.sh --lane fake --suite both   # fake pi only: free and fast
-./test/e2e/run.sh --lane all  --suite both   # also drives the real model
+./test/e2e/run.sh --suite both
+./test/e2e/run.sh --only abort
 ```
 
-- The **real lane spends model quota** and needs a working pi model
-  configuration; it is opt-in. Run it when a change touches spawning, resume
-  and replay, hibernation, daemon restart, or the bridge's argument surface.
-- Isolation: each run copies the agent directory to a temporary one, mints its
-  own tokens, picks free ports, and writes nothing into the repository or into
-  the user's `~/.pi`.
-- Artifacts: `/tmp/pi-gateway-e2e.*/` — `summary.txt`, `logs/<lane>-<suite>.log`
-  and one `daemon.log` per daemon, plus `restart-daemon.sh` for restart cases.
-- The suites exist to catch integration bugs the unit tests cannot see. Both
-  bugs they found so far (the session working directory and pi's short option
-  aliases) are recorded in the [decision log](#decision-log).
+Each run uses isolated state/session directories and random ports, and writes
+nothing into the repository or the user's Pi configuration. Artifacts live in
+`/tmp/pi-gateway-e2e.*/` with suite logs and a generated `restart-daemon.sh`.
+The suites cover client reconnect, session lifecycle, the bridge argv surface,
+and the local-provider Pi SDK path.
 
 ## Development conventions
 
@@ -738,16 +748,16 @@ cases and the coverage of each suite.
 - **Every fix gets a regression test**, and the test is checked to fail with
   the fix reverted. Prefer a test that cannot pass vacuously (assert the real
   observable, not a proxy).
-- **Keep the invariants.** One pi process per session (sole writer on the
-  session file); one capability check per command, driven by the single table
-  in `protocol/roles.go`; canonical lowercase command types only;
-  terminal events never dropped; both listeners loopback-only; token files
-  `0600`; never shadow the real `pi`.
-- **Test helpers are shared, not copied.** `internal/testutil` (raw protocol
-  client, fake-pi build) and `internal/gwtest` (daemon harness) exist so tests
-  exercise the same paths as production.
-- **Commits** use an imperative subject and a body that says why, what was
-  rejected, and the evidence (test counts, end-to-end matrix). Keep the tree
-  clean and push to `origin/main`.
+- **Keep the invariants.** One Pi SDK `AgentSession` per gateway session (sole
+  writer on the session file); one capability check per command, driven by the
+  protocol-v1 table; canonical lowercase command types only; terminal events
+  never dropped; both listeners loopback-only; token files `0600`; never shadow
+  the real `pi` executable.
+- **Test helpers respect ownership.** TypeScript runtime behavior is tested by
+  `typescript/test/`; `gwclient/testserver_test.go` is only a protocol fixture
+  for the retained Go client API, not a daemon implementation.
+- **Commits and publication** require explicit authorization. When authorized,
+  use an imperative subject and include why, rejected alternatives, and
+  verification evidence.
 - **Flag unrequested additions** as reversible, and report judgment calls
   rather than silently widening scope.

@@ -1,52 +1,43 @@
 #!/usr/bin/env bash
-# End-to-end test runner: real Emacs + pilish -> pi-gateway -> pi-gatewayd -> pi.
+# End-to-end test runner: Emacs + pilish -> TypeScript bridge -> daemon -> Pi SDK.
 #
 # Usage: test/e2e/run.sh [options]
-#   --lane LANE     fake | real | all        (default: all)
-#   --suite SUITE   a | b | both             (default: both)
+#   --suite SUITE   a | b | both (default: both)
 #   --only REGEXP   ERT selector (regexp) applied to the selected suites
-#   --build         force a rebuild of the binaries
 #   --no-deps       skip pilish dependency installation
 #   --rm            remove the run directory afterwards
 #   -h, --help
 #
 # Environment overrides:
 #   PILISH_DIR      pilish checkout (default: /home/pi/work/performance-fix-2)
-#   PI_BIN          pi executable the daemons manage (default: pi on PATH)
 #   EMACS           emacs executable (default: emacs)
 #   E2E_ROOT        run directory (default: mktemp -d)
 #   ELPA_CACHE      package dir for pilish deps (default: /tmp/pi-gateway-e2e-elpa)
 #
-# Layout of a run directory:
-#   bin/                 freshly built pi-gateway and pi-gatewayd
-#   agent/               isolated pi agent dir (auth/models copied, 0600)
-#   work/                daemon working directory (test "project")
-#   d/<name>/            one daemon: cmd.sh, daemon.log, pid, port, state/
-#   daemons.json         registry the Elisp suites read
-#   logs/                ERT output per lane and suite
-#   summary.txt          per-case matrix
+# The daemon resolves `pi` from PATH. The local provider keeps tests offline.
+# Layout: bin/ wrappers, agent/ isolated config, d/<name>/ daemons, logs/, summary.txt.
 
 set -euo pipefail
 
 E2E_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$E2E_DIR/../.." && pwd)
 PILISH_DIR=${PILISH_DIR:-/home/pi/work/performance-fix-2}
-PI_BIN=${PI_BIN:-$(command -v pi || true)}
+PI_BIN=$(command -v pi || true)
+NODE=$(command -v node || true)
 EMACS=${EMACS:-emacs}
 ELPA_CACHE=${ELPA_CACHE:-/tmp/pi-gateway-e2e-elpa}
-LANE=all
 SUITE=both
 ONLY=${ONLY:-}
-FORCE_BUILD=0
 INSTALL_DEPS=1
 CLEANUP=0
+PROVIDER_PID=""
+declare -a DAEMON_NAMES=()
+declare -A DAEMON_ADDR=() DAEMON_DEBUG=() DAEMON_PID=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --lane) LANE=$2; shift 2 ;;
     --suite) SUITE=$2; shift 2 ;;
     --only) ONLY=$2; shift 2 ;;
-    --build) FORCE_BUILD=1; shift ;;
     --no-deps) INSTALL_DEPS=0; shift ;;
     --rm) CLEANUP=1; shift ;;
     -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -65,27 +56,59 @@ say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+stop_processes() {
+  local name pid
+  for name in "${DAEMON_NAMES[@]}"; do
+    pid=$(cat "$E2E_ROOT/d/$name/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      note "stopped $name (pid $pid)"
+    fi
+  done
+  DAEMON_NAMES=()
+  if [ -n "$PROVIDER_PID" ] && kill -0 "$PROVIDER_PID" 2>/dev/null; then
+    kill "$PROVIDER_PID" 2>/dev/null || true
+    wait "$PROVIDER_PID" 2>/dev/null || true
+    note "stopped local provider (pid $PROVIDER_PID)"
+  fi
+  PROVIDER_PID=""
+}
+
+cleanup_on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  stop_processes
+  exit "$status"
+}
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 say "preflight"
 [ -d "$PILISH_DIR" ] || die "pilish checkout not found: $PILISH_DIR (set PILISH_DIR)"
-[ -x "$PILISH_DIR/test/support/fake_pi.py" ] || die "pilish fake-pi missing under $PILISH_DIR"
-[ -n "$PI_BIN" ] && [ -x "$PI_BIN" ] || die "pi executable not found (set PI_BIN)"
+[ -n "$NODE" ] && [ -x "$NODE" ] || die "node not found on PATH"
+"$NODE" -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)' \
+  || die "Node.js >=22.19.0 is required"
+[ -n "$PI_BIN" ] && [ -x "$PI_BIN" ] || die "pi executable not found on PATH"
 command -v "$EMACS" >/dev/null || die "emacs not found"
 command -v python3 >/dev/null || die "python3 not found"
 command -v npm >/dev/null || note "npm missing (only needed for a fresh pilish dep install)"
 note "repo         $REPO"
 note "pilish       $PILISH_DIR"
+note "node         $("$NODE" --version)"
 note "pi           $PI_BIN ($("$PI_BIN" --version 2>/dev/null | head -1))"
 note "emacs        $($EMACS --version | head -1)"
 note "run dir      $E2E_ROOT"
 
-say "build"
+say "entrypoint wrappers"
 mkdir -p "$BIN" "$LOGS" "$WORK"
-if [ "$FORCE_BUILD" = 1 ] || [ ! -x "$BIN/pi-gatewayd" ] || [ -n "$(find "$REPO/cmd" "$REPO/internal" -newer "$BIN/pi-gatewayd" -name '*.go' -print -quit 2>/dev/null)" ]; then
-  ( cd "$REPO" && go build -o "$BIN/pi-gatewayd" ./cmd/pi-gatewayd && go build -o "$BIN/pi-gateway" ./cmd/pi-gateway )
-  note "built pi-gatewayd and pi-gateway"
-else
-  note "binaries up to date"
-fi
+printf '#!/usr/bin/env bash\nexec node --experimental-strip-types %q "$@"\n' \
+  "$REPO/typescript/bin/pi-gatewayd.ts" >"$BIN/pi-gatewayd"
+printf '#!/usr/bin/env bash\nexec node --experimental-strip-types %q "$@" --model gateway-e2e/echo --thinking off --tools read --extension %q --no-skills --no-prompt-templates --no-themes --no-context-files\n' \
+  "$REPO/typescript/bin/pi-gateway.ts" "$E2E_DIR/fixtures/e2e-command-extension.ts" >"$BIN/pi-gateway"
+chmod +x "$BIN/pi-gatewayd" "$BIN/pi-gateway"
+note "created TypeScript entrypoint wrappers"
 
 say "pilish dependencies"
 if [ "$INSTALL_DEPS" = 1 ]; then
@@ -98,32 +121,31 @@ if [ "$INSTALL_DEPS" = 1 ]; then
   fi
 fi
 
-say "isolated pi agent dir"
-mkdir -p "$AGENT"
-for f in auth.json models.json; do
-  [ -f "$HOME/.pi/agent/$f" ] || die "missing ~/.pi/agent/$f"
-  cp "$HOME/.pi/agent/$f" "$AGENT/$f"
+say "isolated Pi agent dir and local provider"
+mkdir -p "$AGENT/sessions"
+"$NODE" --experimental-strip-types "$REPO/typescript/test/support/local-openai-provider.ts" \
+  "$E2E_ROOT/provider.port" >"$LOGS/provider.log" 2>&1 &
+PROVIDER_PID=$!
+provider_deadline=$((SECONDS + 10))
+while [ ! -s "$E2E_ROOT/provider.port" ]; do
+  kill -0 "$PROVIDER_PID" 2>/dev/null || { tail -20 "$LOGS/provider.log"; die "local provider exited during startup"; }
+  [ $SECONDS -lt $provider_deadline ] || die "local provider did not publish its port"
+  sleep 0.05
 done
-chmod 600 "$AGENT/auth.json"
-python3 - "$HOME/.pi/agent/settings.json" "$AGENT/settings.json" <<'PY'
-import json, sys
-src, dst = sys.argv[1], sys.argv[2]
-data = json.load(open(src))
-data.pop("packages", None)          # keep the run free of unrelated extensions
-data.pop("lastChangelogVersion", None)
-json.dump(data, open(dst, "w"), indent=2)
-PY
-note "agent dir $AGENT (auth copied 0600, npm extensions disabled)"
+provider_port=$(cat "$E2E_ROOT/provider.port")
+cat >"$AGENT/models.json" <<EOF
+{"providers":{"gateway-e2e":{"baseUrl":"http://127.0.0.1:$provider_port/v1","api":"openai-completions","apiKey":"local-test-key","models":[{"id":"echo","name":"Local E2E","contextWindow":8192,"maxTokens":256}]}}}
+EOF
+printf '{"retry":{"enabled":false}}\n' >"$AGENT/settings.json"
+note "agent dir $AGENT (isolated local provider; no credentials or external model calls)"
 
 free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
 }
 
-# start_daemon NAME PI_COMMAND [extra daemon args...]
-declare -a DAEMON_NAMES=()
-declare -A DAEMON_ADDR=() DAEMON_DEBUG=() DAEMON_PID=()
+# start_daemon NAME [extra daemon args...]
 start_daemon() {
-  local name=$1 pi_cmd=$2; shift 2
+  local name=$1; shift
   local dir
   local state
   local port
@@ -141,51 +163,30 @@ start_daemon() {
   {
     printf '#!/usr/bin/env bash\n# generated by run.sh: restarts %s identically\n' "$name"
     printf 'cd %q\n' "$WORK"
-    printf 'exec env PI_CODING_AGENT_DIR=%q %q --pi %q --state-dir %q --port %s --session-dir %q --tokens-file %q --log-level debug --log-format text --debug-addr 127.0.0.1:0' \
-      "$AGENT" "$BIN/pi-gatewayd" "$pi_cmd" "$state" "$port" "$AGENT/sessions" "$state/tokens.json"
+    printf 'exec env PI_CODING_AGENT_DIR=%q PI_CODING_AGENT_SESSION_DIR=%q %q --state-dir %q --port %s --session-dir %q --tokens-file %q --log-level debug --log-format text --debug-addr 127.0.0.1:0' \
+      "$AGENT" "$AGENT/sessions" "$BIN/pi-gatewayd" "$state" "$port" "$AGENT/sessions" "$state/tokens.json"
     printf ' %q' "$@"
     printf '\n'
   } >"$dir/cmd.sh"
   chmod +x "$dir/cmd.sh"
   bash "$dir/cmd.sh" >"$dir/daemon.log" 2>&1 &
   echo $! >"$dir/pid"
+  DAEMON_NAMES+=("$name")
   local deadline=$((SECONDS + 20))
   while [ ! -s "$state/port" ] || [ ! -s "$state/debug-port" ]; do
     [ $SECONDS -lt $deadline ] || { tail -20 "$dir/daemon.log"; die "daemon $name did not start"; }
     sleep 0.1
   done
-  DAEMON_NAMES+=("$name")
   DAEMON_ADDR[$name]="127.0.0.1:$(cat "$state/port")"
   DAEMON_DEBUG[$name]="127.0.0.1:$(cat "$state/debug-port")"
   DAEMON_PID[$name]=$(cat "$dir/pid")
   note "$name: ${DAEMON_ADDR[$name]} (debug ${DAEMON_DEBUG[$name]}, pid ${DAEMON_PID[$name]})"
 }
 
-fake_wrapper() {
-  local scenario=$1 wrapper=$E2E_ROOT/pi-fake-$scenario
-  {
-    printf '#!/bin/sh\n'
-    # The daemon probes `<pi> --version` at startup; the fake harness has no
-    # such flag, so answer it here (the string is opaque to the daemon).
-    printf 'if [ "$1" = "--version" ]; then echo "0.0.0-e2e-%s"; exit 0; fi\n' "$scenario"
-    printf 'exec %q %q --scenario %q "$@"\n' \
-      "$(command -v python3)" "$PILISH_DIR/test/support/fake_pi.py" "$scenario"
-  } >"$wrapper"
-  chmod +x "$wrapper"
-  printf '%s' "$wrapper"
-}
-
 say "daemons"
-if [ "$LANE" = all ] || [ "$LANE" = real ]; then
-  start_daemon real "$PI_BIN"
-  # A second real daemon with aggressive idle reaping for the hibernation case.
-  start_daemon hibernate "$PI_BIN" --idle-timeout 2s --short-grace 2s
-fi
-if [ "$LANE" = all ] || [ "$LANE" = fake ]; then
-  for scenario in prompt-lifecycle extension-confirm tool-read-contract; do
-    start_daemon "$scenario" "$(fake_wrapper "$scenario")"
-  done
-fi
+start_daemon local
+# A second daemon with aggressive idle reaping for the hibernation case.
+start_daemon hibernate --idle-timeout 2s --short-grace 2s
 
 python3 - "$E2E_ROOT" "${DAEMON_NAMES[@]}" <<'PY'
 import json, os, sys
@@ -253,9 +254,15 @@ SH
 chmod +x "$E2E_ROOT/restart-daemon.sh"
 
 run_emacs() {
-  # run_emacs LOG SUITE_FILES... ; lane comes from $LANE_RUN
+  # run_emacs LOG SUITE_FILES... ; shared Pilish contracts use the fake-named backend.
   local log=$1; shift
-  local backend=$LANE_RUN
+  local backends=fake
+  local expected_ert_count=0
+  if [[ "${1:-}" == */pilish-suites.el ]]; then
+    expected_ert_count=17
+  elif [[ "${1:-}" == */gateway-cases.el ]]; then
+    expected_ert_count=9
+  fi
   say "suite $* (lane $LANE_RUN)"
   set +e
   env -u DISPLAY \
@@ -268,7 +275,7 @@ run_emacs() {
     E2E_LANE="$LANE_RUN" \
     E2E_SELECTOR="$ONLY" \
     PI_RUN_INTEGRATION=1 \
-    PI_INTEGRATION_BACKENDS="$backend" \
+    PI_INTEGRATION_BACKENDS="$backends" \
     PI_CODING_AGENT_DIR="$AGENT" \
     "$EMACS" --batch -Q \
       -L "$PILISH_DIR" -L "$PILISH_DIR/test" \
@@ -277,9 +284,24 @@ run_emacs() {
   local status=$?
   set -e
   grep -E '^ +(passed|FAILED|skipped) ' "$log" | sed 's/^ */   /' || true
+  if [ $status -eq 0 ] && [ "$expected_ert_count" -gt 0 ] && [ -z "$ONLY" ]; then
+    local passed_count
+    passed_count=$(grep -Ec "^   passed +[0-9]+/$expected_ert_count " "$log" || true)
+    if [ "$passed_count" -ne "$expected_ert_count" ] || grep -q '^   skipped ' "$log" || ! grep -q "^Ran $expected_ert_count tests, $expected_ert_count results as expected, 0 unexpected " "$log"; then
+      status=1
+      note "expected $expected_ert_count passing TypeScript local ERT cases; found $passed_count passed (see $log)"
+    fi
+  fi
   if [ $status -ne 0 ]; then
+    printf '\nE2E_RUN_STATUS=failed\n' >>"$log"
     note "FAILED (see $log)"
-    grep -A15 -E '^ +(FAILED|ERROR) ' "$log" | head -60 || true
+    if grep -q -E '^ +(FAILED|ERROR) ' "$log"; then
+      grep -A15 -E '^ +(FAILED|ERROR) ' "$log" | head -60
+    else
+      tail -60 "$log"
+    fi
+  else
+    printf '\nE2E_RUN_STATUS=ok\n' >>"$log"
   fi
   return $status
 }
@@ -294,26 +316,20 @@ run_lane() {
     run_emacs "$LOGS/$LANE_RUN-b.log" "$E2E_DIR/gateway-cases.el" || FAILED=1
   fi
 }
-[ "$LANE" = all ] || [ "$LANE" = fake ] && run_lane fake
-[ "$LANE" = all ] || [ "$LANE" = real ] && run_lane real
+run_lane local
 
 say "teardown"
-for name in "${DAEMON_NAMES[@]}"; do
-  pid=$(cat "$E2E_ROOT/d/$name/pid" 2>/dev/null || true)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    note "stopped $name (pid $pid)"
-  fi
-done
+stop_processes
 
 {
   printf 'pi-gateway end-to-end run %s\n' "$(date -Is)"
-  printf 'pilish=%s pi=%s lanes=%s suite=%s only=%s\n\n' \
-    "$PILISH_DIR" "$("$PI_BIN" --version 2>/dev/null | head -1)" "$LANE" "$SUITE" "${ONLY:-<all>}"
+  printf 'pilish=%s node=%s pi=%s suite=%s only=%s\n\n' \
+    "$PILISH_DIR" "$("$NODE" --version)" "$("$PI_BIN" --version 2>/dev/null | head -1)" "$SUITE" "${ONLY:-<all>}"
   for log in "$LOGS"/*.log; do
     [ -f "$log" ] || continue
+    grep -q 'E2E_RUN_STATUS=' "$log" || continue
     printf '## %s\n' "$(basename "$log" .log)"
-    if grep -qE '^ +FAILED ' "$log"; then
+    if grep -q 'E2E_RUN_STATUS=failed' "$log"; then
       printf 'status: FAILED\n'
     else
       printf 'status: ok\n'

@@ -1,4 +1,4 @@
-# pi-gateway — a session daemon and `pi` replacement
+# pi-gateway — a TypeScript session daemon and `pi` replacement
 
 ## Purpose
 
@@ -60,8 +60,8 @@ process dies with its client. Evidence from the installed
 multi-client parallelism. So: **true parallel turns on one session are not
 possible without changing pi.** What *is* possible — and what this design
 provides — is **concurrent participation with a single ordered view**, by
-keeping exactly one pi process as the session's sole writer and multiplexing
-many clients around it.
+keeping exactly one Pi SDK `AgentSession` as the session's sole writer and
+multiplexing many clients around it.
 
 Prior art that solves a related part of the problem: `marcfargas/pi-server`
 and `tryingET/pi-server` (detach/reconnect, one client at a time). This project
@@ -75,9 +75,10 @@ survives client death, and non-pi integrations.
 | [`docs/design.md`](docs/design.md) | Full architecture, invariants, arbitration, replay, failure modes |
 | [`docs/protocol.md`](docs/protocol.md) | Client-facing wire protocol (pi-compatible + thin gateway envelope) |
 | [`docs/development.md`](docs/development.md) | Decision log, implementation status, repository layout, building and testing |
-| [`test/e2e/README.md`](test/e2e/README.md) | The Emacs + pilish end-to-end suites (fake-pi and real-model lanes) |
-| [`cmd/pi-gatewayd`](cmd/pi-gatewayd) | daemon: owns pi sessions, serves the gateway protocol on loopback TCP |
-| [`cmd/pi-gateway`](cmd/pi-gateway) | bridge: the binary UIs spawn in place of `pi` |
+| [`test/e2e/README.md`](test/e2e/README.md) | The Emacs + pilish local-provider end-to-end suites |
+| [`typescript/bin/pi-gatewayd.ts`](typescript/bin/pi-gatewayd.ts) | TypeScript daemon: owns Pi SDK sessions and serves the gateway protocol on loopback TCP |
+| [`typescript/bin/pi-gateway.ts`](typescript/bin/pi-gateway.ts) | TypeScript bridge: the executable UIs spawn in place of `pi` |
+| [`gwclient`](gwclient) | retained Go protocol client library, with `examples/chat` as a runnable example |
 
 ## TL;DR of the design
 
@@ -90,14 +91,14 @@ survives client death, and non-pi integrations.
                                                              ├─ PromptQueue: daemon-owned per-client FIFO
                                                              └─ UIBroker: extension_ui_request routing
                                                              ▼
-                                               pi --mode rpc --session X
-                                               (survives client disconnects)
+                                          Pi SDK AgentSession for session X
+                                          (survives client disconnects)
 ```
 
 - Clients speak pi's RPC protocol verbatim; a thin `gw_*` envelope adds
   multi-client features for non-pi integrations.
-- One pi process per session ⇒ pi's invariants are preserved, and the session
-  file has exactly one writer.
+- One Pi SDK `AgentSession` per gateway session ⇒ Pi's session invariants are
+  preserved, and the session file has exactly one writer.
 - A session outlives its clients: the daemon keeps pi running across ssh
   drops, and clients re-attach.
 - All commands are linearized by the actor; all events get a global `seq`.
@@ -121,7 +122,8 @@ optional and not started. The per-area table and the reasoning belong to
 ### Build
 
 ```bash
-go build ./cmd/pi-gatewayd ./cmd/pi-gateway
+# Requires Node.js >=22.19.0 and `pi` available on PATH.
+npm install --global ./typescript
 ```
 
 ### Run the daemon
@@ -131,8 +133,8 @@ The daemon owns the pi sessions. On first start it creates its token under
 discover it through; `--state-dir` moves that directory.
 
 ```bash
-./pi-gatewayd --pi /usr/local/bin/pi                 # text logs at info level
-./pi-gatewayd --log-format json --log-level debug    # structured, verbose
+pi-gatewayd                                          # text logs at info level
+pi-gatewayd --log-format json --log-level debug      # structured, verbose
 ```
 
 ### Run it as a systemd user unit
@@ -153,8 +155,8 @@ accepted and consumed, and the accepted pi parameters are forwarded to the
 daemon.
 
 ```bash
-./pi-gateway --mode rpc --approve   # what a UI runs
-./pi-gateway --version              # the managed pi version, answered by the daemon
+pi-gateway --mode rpc --approve     # what a UI runs
+pi-gateway --version                # the Pi version, answered by the daemon
 ```
 
 Point `pilish-executable` (local) at the `pi-gateway` binary, or the layer's
@@ -275,9 +277,9 @@ long-lived bot it also provides:
   steering/follow-up modes, compaction, auto-retry, `bash` (with streamed
   `BashUpdate` callbacks), entries/tree/forks/stats/export, and
   `set_session_name`.
-- **Releasing and destroying sessions** — `StopSession` stops pi and keeps the
-  file (a later attach respawns it), `DeleteSession` stops pi and removes it
-  (irreversible). Both refuse a running turn unless `force` is set; a delete
+- **Releasing and destroying sessions** — `StopSession` disposes the SDK
+  session and keeps the file (a later attach restores it), `DeleteSession`
+  disposes the SDK session and removes the file (irreversible). Both refuse a running turn unless `force` is set; a delete
   also notifies every attached client with
   `gw_session_state{state:"deleted"}` and unbinds them without closing their
   connections, and `gwclient` clears `Session()` so the next command cannot
@@ -287,7 +289,9 @@ A bot that creates its own sessions needs a token with `admin` (see
 [Restricted tokens](#restricted-tokens)); one that only attaches to sessions it
 finds in the catalog can use `operator`.
 
-A runnable interactive CLI is [`examples/chat`](examples/chat):
+The TypeScript runtime requires Node.js >=22.19.0 and resolves the `pi`
+executable from `PATH`; the daemon has no `--pi` override. A runnable Go
+client example remains available at [`examples/chat`](examples/chat):
 `go run ./examples/chat` gives streaming rendering, `!queue`/`!steer`/`!abort`,
 and `/name` for commands, prompt templates and skills.
 
@@ -302,7 +306,6 @@ and `/name` for commands, prompt templates and skills.
 | `--state-dir <dir>` | `~/.config/pi-gateway` | where `token`, `tokens.json`, `port`, `debug-port` and the per-session `spawn/` records live |
 | `--token-file <path>` | `<state>/token` | token file (mode `0600`) |
 | `--tokens-file <path>` | `<state>/tokens.json` | restricted-token file (mode `0600`) |
-| `--pi <path>` | `pi` | the pi binary to manage |
 | `--idle-timeout <dur>` | `15m` | keep a session warm this long after the last client detaches |
 | `--short-grace <dur>` | `10s` | grace for a session that never received a message and has no clients |
 | `--session-dir <dir>` | — | extra session directory to scan for the catalog (repeatable) |
@@ -318,8 +321,8 @@ and `/name` for commands, prompt templates and skills.
 | `--token-caps <csv>` | — | explicit capability list instead of a role |
 | `--version` | — | print the daemon's own version |
 
-`SIGINT`/`SIGTERM` stop all sessions (abort, close stdin, grace, then `SIGKILL`);
-`SIGHUP` re-reads `tokens.json` without restarting. Both listeners refuse
+`SIGINT`/`SIGTERM` dispose all managed Pi SDK sessions; `SIGHUP` re-reads
+`tokens.json` without restarting. Both listeners refuse
 non-loopback addresses. The state directory also follows `PI_GATEWAY_CONFIG_DIR`
 for the daemon (and `XDG_CONFIG_HOME` when that is unset).
 

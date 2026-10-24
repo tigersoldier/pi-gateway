@@ -32,8 +32,8 @@
   (setq load-path (cons pilish-dir load-path)))
 (require 'pilish)
 
-(defvar e2e-lane (intern (or (getenv "E2E_LANE") "real"))
-  "Lane under test: `real' (real pi) or `fake' (scenario-driven fake pi).")
+(defvar e2e-lane (intern (or (getenv "E2E_LANE") "local"))
+  "Lane under test: `real' (real pi), `fake' (scenario fake Pi), or `local' (TypeScript SDK plus scripted provider).")
 
 (defvar e2e-gateway-bin (getenv "E2E_GATEWAY_BIN")
   "Path to the pi-gateway bridge binary under test.")
@@ -57,7 +57,7 @@
   "Return the daemon record for NAME (a string) or nil."
   (alist-get (intern name) (e2e-daemons)))
 
-(defvar e2e-lane-daemons '((real . "real") (fake . "prompt-lifecycle"))
+(defvar e2e-lane-daemons '((local . "local"))
   "Daemon registry entry that serves each lane in the gateway cases.")
 
 (defun e2e-lane-daemon ()
@@ -241,7 +241,7 @@ failure message."
     row))
 
 (defun e2e-live-sessions (&optional daemon)
-  "Return the number of sessions with a live pi process."
+  "Return the number of sessions with an active Pi SDK runtime."
   (let* ((status (e2e-status daemon))
          (sessions (alist-get 'sessions status)))
     (alist-get 'live sessions)))

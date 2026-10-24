@@ -4,108 +4,92 @@ Guidance for coding agents working in this repository.
 
 ## What this is
 
-`pi-gateway` is a Go replacement for the `pi` executable for third-party UIs.
-`pi-gatewayd` is a background daemon that owns `pi --mode rpc` sessions;
-`pi-gateway` is the bridge a UI spawns instead of `pi` (Emacs `pilish` over
-ssh/TRAMP, or a non-pi integration speaking the same protocol). Exactly one
-`pi` process per session is the sole writer of the session file, many clients
-attach concurrently, and a session outlives the clients connected to it.
+`pi-gatewayd` and `pi-gateway` are the TypeScript production daemon and bridge
+for Pi sessions. The daemon uses Pi's SDK in-process and owns one SDK
+`AgentSession` per gateway session; the bridge is spawned by UIs in place of
+`pi`. The exported Go `protocol`, `config`, `piargs`, and `gwclient` packages
+and `examples/chat` remain supported for Go integrations. There is no Go
+production daemon or bridge.
 
-Read before changing behaviour, in this order:
+Read before changing behavior, in this order:
 
-1. [`docs/development.md`](docs/development.md) — decision log (canonical),
-   implementation status, repository layout, conventions.
+1. [`docs/development.md`](docs/development.md) — implementation status,
+   decision log, repository layout, and conventions.
 2. [`docs/design.md`](docs/design.md) — architecture, invariants, failure modes.
-3. [`docs/protocol.md`](docs/protocol.md) — the client-facing wire contract.
+3. [`docs/protocol.md`](docs/protocol.md) — client-facing wire contract.
+4. [`docs/test-parity.md`](docs/test-parity.md) — source assertion mapping.
 
-[`README.md`](README.md) is user-facing (purpose, usage, CLI reference); do not
-put development detail or the decision log back into it.
+[`README.md`](README.md) is user-facing (purpose, installation, CLI reference).
 
 ## Commands
 
 | What | Command |
 |---|---|
-| Build | `go build ./...` |
-| Format (must print nothing) | `gofmt -l .` |
-| Vet | `go vet ./...` |
-| All tests (a few minutes) | `go test -race ./...` |
-| One package | `go test -race ./internal/daemon/` |
-| One test | `go test -run TestAttach ./internal/daemon/` |
-| End-to-end, fake pi (free) | `./test/e2e/run.sh --lane fake --suite both` |
-| End-to-end, real model | `./test/e2e/run.sh --lane all --suite both` |
+| TypeScript tests | `cd typescript && npm test` |
+| TypeScript static check | `cd typescript && npm run typecheck` |
+| Retained Go packages | `go test -race ./...` |
+| Go static check | `go vet ./...` |
+| Go formatting | `gofmt -l .` |
+| Pilish E2E, local provider only | `./test/e2e/run.sh --suite both --no-deps` |
 
-The real-model end-to-end lane **spends model quota** and needs a working pi
-model configuration. Run it only when a change touches spawning, resume/replay,
-hibernation, daemon restart, or the bridge's argument surface, and prefer
-asking the operator first. Case list and coverage: [`test/e2e/README.md`](test/e2e/README.md).
+Node.js >=22.19.0 is required. E2E uses an isolated loopback provider and does
+not read user credentials or send remote model inference. The daemon resolves
+`pi` from `PATH`; there is no `--pi` CLI override. Do not add a real-model lane
+or live service dependency to tests.
 
 ## Rules
 
-- **Docs first.** A behaviour change starts as a decision: record it in the
-  [decision log](docs/development.md#decision-log) with its evidence, update
-  `docs/design.md` / `docs/protocol.md`, then change code.
-- **Every fix gets a regression test**, and it must be checked to fail with the
-  fix reverted. Assert the real observable, not a proxy that can pass
-  vacuously.
-- **Never break these invariants.** One `pi` process per session (sole writer of
-  the session file); one capability check per command, driven by the single
-  table in `protocol/roles.go`; canonical lowercase command types only;
-  terminal event frames are never dropped; both listeners stay loopback-only;
-  token files are `0600`; never shadow the real `pi` (UIs are configured to
-  point at the bridge instead).
-- **Keep tests hermetic.** Use `internal/fakepi` (no real pi needed),
-  `t.TempDir()` for state, and never read or write `~/.pi`, never write inside
-  the repository, never require the network.
-- **Move paired files together.** `packaging/pi-gatewayd.service` is parsed by
-  `cmd/pi-gatewayd/main_test.go`; a new pi parameter needs
-  `piargs` (every accepted spelling), `docs/protocol.md` §4.3 and the
-  README reference table.
-- **Commits:** imperative subject; the body says why, what was rejected, and the
-  evidence (test counts, end-to-end matrix). Keep the tree clean and push to
-  `origin/main`.
-- **Flag unrequested additions** as reversible, and report judgment calls
-  instead of silently widening scope.
+- **Preserve protocol v1.** The Go protocol package remains the source reference
+  for wire shapes and capability behavior. This is an implementation replacement,
+  not authorization to add message fields, commands, permissions, or lifecycle
+  IDs. The TypeScript omission of the former Go `--pi` flag is an accepted CLI
+  exception; do not claim strict CLI parity.
+- **Docs first.** For behavior changes, update the decision/status docs and the
+  relevant design/protocol sections before changing code.
+- **Every fix gets a regression test.** Assert the observable behavior and avoid
+  vacuous tests. TypeScript server behavior belongs in `typescript/test/`; the
+  Go `gwclient/testserver_test.go` fixture only exercises the Go client API and
+  is not a daemon implementation.
+- **Keep tests hermetic.** Use temporary directories and local providers. Do not
+  read or write `~/.pi`, require network access, contact Slack, or invoke remote
+  model inference.
+- **Keep the invariants.** One SDK session per gateway session and one writer
+  per session file; one capability check per command; canonical lowercase
+  command types; terminal events never dropped; both listeners loopback-only;
+  token files `0600`; never shadow the real `pi` executable.
+- **Keep packaging and CLI tests aligned.** `packaging/pi-gatewayd.service`,
+  TypeScript CLI tests, and the user-facing README must describe the same
+  runtime and options.
+- **Commits/publication require explicit authorization.** Do not commit, push,
+  open a PR, or deploy unless the operator explicitly requests it.
 
 ## Where things live
 
 | Path | Owns |
 |---|---|
-| `cmd/pi-gatewayd` | daemon entry point: flags, signals, listeners, token wiring |
-| `cmd/pi-gateway` | bridge entry point: argv, relay, exit codes |
-| `protocol` | strict JSONL codec, message types, id namespacing, capability table (exported) |
-| `config` | state/token/port paths, discovery, token roles, provisioning (exported) |
-| `piargs` | accepted pi parameters and spawn-parameter comparison (exported) |
-| `gwclient` | exported client library for integrations and bots (dial, hello, typed commands/events, cursor and reconnect, UI-request classification) |
-| `examples/chat` | runnable example CLI built only on `gwclient` (streaming, queue/steer/abort, commands/skills) |
-| `internal/client` | bridge implementation (token/port discovery, relay, non-RPC modes) |
-| `internal/daemon` | session table, attach/rebinding, spawn-parameter checks, per-connection fan-out, stop/delete lifecycle (tombstoned paths) |
-| `internal/session` | `SessionActor`, `Hub` (event log and replay ring), `PromptQueue`, `PiProcess` |
-| `internal/catalog` | session-file scanning, name resolution, durable leaf ids |
-| `internal/debughttp` | read-only `/status` `/catalog` `/metrics` |
-| `internal/gwlog`, `internal/metrics` | structured logging, Prometheus-text metrics |
-| `internal/fakepi`, `internal/testutil`, `internal/gwtest` | test fake pi, protocol client, daemon harness |
-| `packaging` | systemd user unit |
+| `typescript/bin/` | TypeScript daemon and bridge entry points |
+| `typescript/src/` | SDK runtime, actor/hub/queue, Pi-RPC adapter, bridge, catalog, config, debug HTTP, logging, metrics |
+| `typescript/test/` | runtime, protocol, lifecycle, CLI, and executable tests |
+| `protocol/` | retained Go JSONL codec, messages, and capability table |
+| `config/` | retained Go token/port paths, discovery, and provisioning |
+| `piargs/` | retained Go Pi argument parser |
+| `gwclient/` | retained public Go client and wire test fixture |
+| `examples/chat/` | runnable Go integration example |
+| `packaging/` | systemd user unit |
+| `test/e2e/` | Emacs + pilish suites against the TypeScript executables |
+| `docs/` | protocol, design, parity map, and development guide |
 
 ## Pitfalls
 
-- `testutil.Conn.WaitFor` / `WaitType` / `WaitResponse` **consume and discard**
-  frames that do not match. When a test must observe interleaved events, drain
-  the connection continuously (the `frameLog` helper in
-  `internal/daemon/coverage_test.go` shows the pattern).
-- New sessions are spawned in the client's working directory (`gw_hello.cwd`,
-  `gw_new_session{cwd}`), but a session whose file already exists is respawned
-  in the directory recorded in its header (`catalog.HeaderCwd`): hibernation and
-  daemon restarts ignore the attaching client's directory.
-- pi writes the session file on the **first message**, not at startup, so a
-  freshly created session has no file on disk yet.
-- A crashed actor must transition through `setState` so the snapshot is
-  published; assigning the state field directly leaves the session looking live
-  and un-revivable on re-attach.
-- The bridge refuses pi options it does not own, and only `--version`/`--help`
-  are answered outside RPC mode.
-- `gw_delete_session` tombstones the canonical path for the daemon's lifetime:
-  a repeat delete and any attach naming that path answer `unknown_session`, and
-  a connection it unbinds refuses session-scoped commands until the client
-  attaches or creates a session explicitly (the bridge turns that into a
-  pi-shaped error and closes the UI stream). The file is removed only after the
-  actor finishes, because pi flushes its session file while shutting down.
+- The TypeScript daemon embeds Pi's SDK; it does not run `pi --mode rpc` as a
+  child process. Runtime arguments configure the SDK session. `pi` on `PATH` is
+  used to locate the installed SDK/version, not to select a CLI override.
+- New sessions use the requesting client's working directory; restored sessions
+  use the directory recorded with the session file.
+- A Pi SDK failure marks the actor crashed. Do not automatically recreate it;
+  explicit reattach performs lazy recovery.
+- `gw_delete_session` tombstones the canonical path for the daemon lifetime;
+  stale connections are unbound and cannot silently create a replacement.
+- The Pilish E2E runner uses only the local scripted provider. Its fake-named
+  shared contract selection still runs against the real SDK and TypeScript
+  daemon/bridge, not a fake-Pi subprocess.
