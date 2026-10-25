@@ -30,10 +30,10 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
-# The daemon resolves `pi` through PATH. npm-style installs often live outside
-# a user unit's PATH; uncomment and adjust, or pass --pi explicitly:
+# The daemon resolves both Node.js (>=22.19.0) and `pi` through PATH.
+# npm-style installs often live outside a user unit's PATH; uncomment and
+# adjust this to include their install directories:
 #Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-#Environment=RUST_LOG=info
 
 [Install]
 WantedBy=default.target

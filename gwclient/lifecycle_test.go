@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
-	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
@@ -20,7 +19,7 @@ import (
 func TestDeleteSessionClearsBinding(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bot.jsonl")
-	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	addr, _ := startTestDaemon(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -94,7 +93,7 @@ func TestDeleteSessionClearsBinding(t *testing.T) {
 func TestStopSessionClearsBinding(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stop.jsonl")
-	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	addr, _ := startTestDaemon(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

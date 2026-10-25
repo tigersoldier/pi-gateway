@@ -4,6 +4,10 @@ This document is the client-facing wire protocol for the settled design in
 `docs/design.md` and the decision log in `docs/development.md`. It supersedes
 draft 1.
 
+The production daemon is TypeScript and embeds Pi's SDK in-process. References
+below to a live Pi process describe the logical Pi session runtime visible to
+clients; they do not imply that the daemon launches a `pi` child process.
+
 - Framing: **strict JSONL, LF (`\n`) only**. Strip a trailing `\r`. Do not
   split on U+2028/U+2029. One JSON object per line, in both directions.
 - Encoding: UTF-8 JSON.
@@ -28,12 +32,12 @@ draft 1.
 ## 0. Roles and topology
 
 ```text
- third-party UI ── raw pi JSONL (stdio) ──► pi-gateway (bridge) ── gw protocol ──► pi-gatewayd (daemon) ── pi RPC ──► pi
-                                                  (a client)                       (owns pi, sole writer)
+ third-party UI ── raw pi JSONL (stdio) ──► pi-gateway (bridge) ── gw protocol ──► pi-gatewayd (daemon) ──► Pi SDK
+                                                  (a client)                       (owns session, sole writer)
  integrations (e.g. Slack bot, separate repo) ── gw protocol ──────────────────────────┘
 ```
 
-| Role | Command | Owns pi? | Speaks |
+| Role | Command | Owns Pi session? | Speaks |
 |---|---|---|---|
 | **daemon** | `pi-gatewayd` | yes | gateway protocol (`gw_hello` + `gw_*`) |
 | **bridge** | `pi-gateway` | no | gateway protocol upstream, **raw pi RPC** downstream |
@@ -161,8 +165,8 @@ message.
   Omit it for the fresh-session/rebind flow (pilish does this).
 - `piArgs` carries the pi parameters the UI was invoked with (already filtered
   by the client to the accepted set; see §4.3).
-- `cwd` is the client's working directory. A **new** session's pi process is
-  spawned there, so the session belongs to the project the UI is looking at.
+- `cwd` is the client's working directory. A **new** session's SDK runtime is
+  initialized there, so the session belongs to the project the UI is looking at.
   It must be an absolute existing directory, otherwise the handshake fails with
   `bad_frame`; omitting it (or sending `""`) means "the daemon's own
   directory", which keeps bare protocol clients working. For a session created
@@ -242,7 +246,9 @@ A second `gw_hello` on the same connection is `bad_frame`.
   `gw_reload_session{addPiArgs}`. An older daemon sends no `features` array at
   all, and a client must then fall back to probing or version checks.
 - `session` is `{path, name, id}` when the connection is bound at hello, else
-  `null`.
+  `null`. If a valid hello's requested session cannot be attached, the daemon
+  sends this unbound welcome followed by `gw_error`; clients must treat that
+  sequence as a failed attach.
 - `resyncRequired: true` means the requested cursor is not replayable; the
   daemon follows with `gw_snapshot` and the client discards local transcript
   state.
@@ -319,7 +325,7 @@ Response data:
 ]}
 ```
 
-`live` means a pi process is attached; non-live sessions exist only as files.
+`live` means a Pi SDK session is active; non-live sessions exist only as files.
 Rows are ordered live sessions first, then by `lastActivity` descending — the
 same order `/catalog` returns.
 
@@ -371,8 +377,8 @@ Attach is pi's `switch_session`, intercepted by the daemon:
 - The daemon resolves the target (path first, then name), joins it if live,
   loads it if hibernated, and **rebinds the connection** (hub subscription and
   command target).
-- If the session has no live pi process, the daemon spawns one. The
-  session's **recorded spawn configuration** (§4.3) is re-applied: recorded
+- If the session has no live SDK session, the daemon initializes one from the
+  session file. The session's **recorded spawn configuration** (§4.3) is re-applied: recorded
   spawn-only values win, the requester's values fill in the keys the record
   never set, and the requester's runtime parameters are applied as usual. A
   session created with `--append-system-prompt` therefore keeps that prompt
@@ -400,14 +406,14 @@ Attach is pi's `switch_session`, intercepted by the daemon:
 ### 3.5 Hibernation
 
 - After the **last** client detaches and the agent has settled, a session stays
-  warm for a configurable grace period (default 15 minutes), then pi is
-  stopped. The session file remains.
-- pi is **never** stopped mid-turn. If the last client detaches during a turn,
-  the timer starts when `agent_settled` arrives.
+  warm for a configurable grace period (default 15 minutes), then its SDK
+  session is disposed. The session file remains.
+- The SDK session is **never** disposed mid-turn. If the last client detaches
+  during a turn, the timer starts when `agent_settled` arrives.
 - A session that was created but never received a message and has no clients is
   stopped after a short grace (seconds), not the idle timeout.
-- The next attach respawns pi and loads the file; extensions/skills are freshly
-  loaded.
+- The next attach creates a fresh SDK session from the file; extensions/skills
+  are freshly loaded.
 
 ### 3.6 Reload
 
@@ -445,8 +451,8 @@ daemon operation:
   a replacement timeout stops the replacement. A late `get_state` cannot commit
   the new configuration. If pi reports ready but the sidecar cannot be saved,
   the command returns
-  `spawn_config_persist_failed`: the live process and in-memory record use the
-  new configuration, but it is not durable. After storage is repaired, retry
+  `spawn_config_persist_failed`: the live SDK session and in-memory record use
+  the new configuration, but it is not durable. After storage is repaired, retry
   the same addition to persist it. Requires `spawn_config_additive` and the
   same `control` capability.
 
@@ -467,8 +473,8 @@ exactly what pilish's `/new` expects.
 
 ### 3.8 Fork and clone (`fork`, `clone`)
 
-pi's `fork {entryId}` and `clone` create a **new session file** and switch the
-live pi process to it (`runtimeHost.fork` then `rebindSession`), so they cannot
+Pi's `fork {entryId}` and `clone` create a **new session file** and switch the
+live SDK session to it (`runtimeHost.fork` then `rebindSession`), so they cannot
 be forwarded to a shared session.
 
 - **Sole client:** forwarded to the session's pi. The daemon adopts the newly
@@ -478,8 +484,8 @@ be forwarded to a shared session.
   no other client is ever moved. `pilish-fork` is therefore unavailable while
   another client is attached.
 
-`clone` forks at the pi process's current in-memory leaf, which is not always
-persisted to the file; that is why isolation on a scratch process is not used.
+`clone` forks at the SDK session's current in-memory leaf, which is not always
+persisted to the file; that is why isolation on a scratch session is not used.
 
 ### 3.9 Prompt queue (daemon-owned)
 
@@ -520,7 +526,7 @@ terms of the daemon queue and pi's turn:
 
 ### 3.10 Stopping and deleting a session
 
-Two `admin` control commands release a session's pi process and, for delete,
+Two `admin` control commands release a session's SDK runtime and, for delete,
 destroy its file. Both are session-scoped and answered on the requester's own
 connection, like `gw_reload_session`:
 
@@ -568,15 +574,15 @@ Stop semantics:
   deleted session. A concurrent attach either completes first (and then
   receives the terminal event and is unbound) or resolves after the deletion
   (`unknown_session`); there is no third state.
-- Idle: pi is stopped immediately and the file is kept, so a later attach
-  respawns pi and reloads it (§3.4).
+- Idle: the SDK session is disposed immediately and the file is kept, so a
+  later attach recreates it from the file (§3.4).
 - Running turn without `force`: refused with `session_busy`; nothing is
   stopped and the file is untouched.
-- Running turn with `force`: pi is sent `abort`, and if the turn does not
-  settle within the stop grace (default 5s) pi is stopped anyway. A bot's
+- Running turn with `force`: the SDK receives `abort`, and if the turn does not
+  settle within the stop grace (default 5s) the session is disposed anyway. A bot's
   `/delete` is therefore never held hostage by a runaway turn.
 - The daemon-owned queue and forwarded steers are discarded and
-  `gw_queue{pending:[]}` is published **before** pi stops, so no queued prompt
+  `gw_queue{pending:[]}` is published **before** the SDK session is disposed, so no queued prompt
   can restart a turn in a session that is going away.
 
 Delete semantics:
@@ -620,8 +626,8 @@ Notification:
 | `gw_list_sessions` | `{filter}` | session catalog |
 | `gw_new_session` | `{name?, cwd?, piArgs?, tags?}` | explicit create + bind |
 | `gw_reload_session` | `{session?, force?, piArgs?, addPiArgs?}` | restart with replacement or additive spawn config |
-| `gw_stop_session` | `{session?, force?}` | stop pi, keep the session file (§3.10) |
-| `gw_delete_session` | `{session?, force?}` | stop pi, delete the session file (§3.10) |
+| `gw_stop_session` | `{session?, force?}` | dispose the Pi SDK session, keep its file (§3.10) |
+| `gw_delete_session` | `{session?, force?}` | dispose the Pi SDK session, delete its file (§3.10) |
 | `gw_ping` | `{}` | liveness |
 | `gw_bye` | `{}` | graceful disconnect |
 

@@ -1,7 +1,7 @@
-# Design: `pi-gateway` — a pi session daemon and `pi` replacement
+# Design: `pi-gateway` — a Pi SDK session daemon and `pi` replacement
 
-Status: implemented (M1–M3; mid-turn attach provisional) · Target: Go 1.22+ ·
-Depends on: `pi --mode rpc`
+Status: implemented (M1–M3; mid-turn attach provisional) · Target: Node.js >=22.19.0 ·
+Depends on: Pi's `@earendil-works/pi-coding-agent` SDK
 
 > **Reading order.** `docs/development.md` → *Decision log* is the canonical decision
 > log, and `docs/protocol.md` draft 2 is the authoritative protocol. This whole
@@ -17,9 +17,9 @@ pi UIs — in particular Emacs `pilish` connecting over TRAMP/ssh — can invoke
 pi's place, backed by a **background service** that owns sessions and outlives
 any client connection.
 
-- **G1 — survive client death.** A client is spawned per connection (for
-  example over ssh). When it dies (ssh drop, editor close), the session and its
-  pi process keep running on the server; a later client re-attaches.
+- **G1 — survive client death.** A bridge is spawned per connection (for
+  example over ssh). When it dies (ssh drop, editor close), the session's SDK
+  runtime keeps running on the server; a later client re-attaches.
 - **G2 — pi-compatible.** A UI that spawns `pi --mode rpc` can spawn the client
   instead and see pristine pi RPC on stdio, with no UI changes.
 - **G3 — many clients, one session.** Several clients (pilish, a Slack bot,
@@ -43,13 +43,13 @@ the session. We want those N clients to:
 
 ```text
   Emacs/pilish ──ssh/TRAMP──► client process ─┐
-  Slack bot (separate repo) ──────────────────┼── loopback TCP ──► pi-gateway serve (daemon)
+  Slack bot (separate repo) ──────────────────┼── loopback TCP ──► pi-gatewayd (daemon)
   other integrations ─────────────────────────┘   (localhost only)         │
                                                                           ▼
-                                                          pi --mode rpc --session X
+                                                 Pi SDK AgentSession (in-process)
 ```
 
-The daemon owns every pi process and is the only writer to each session file.
+The daemon owns each Pi SDK session and is the only writer to its session file.
 Clients are thin: they translate their transport/protocol to the gateway and
 hold no session state. This is what lets a session survive an ssh drop and lets
 multiple integrations share it.
@@ -78,9 +78,9 @@ Settled deployment facts:
   `~/.config/pi-gateway/port`; the client prefers that file and falls back to
   `127.0.0.1:7331` (`--server` overrides).
 - Sessions **hibernate on an idle timeout**: after the last client detaches and
-  the agent settles, pi keeps running for a configurable grace period (default
-  15 minutes), then stops; the session file remains and pi is respawned on the
-  next attach. Pi is never stopped mid-turn.
+  the agent settles, its SDK session stays active for a configurable grace
+  period (default 15 minutes), then is disposed; the session file remains and a
+  fresh SDK session is created on the next attach. It is never disposed mid-turn.
 - Cross-client concurrency is **queue** semantics: any client may prompt, the
   daemon runs prompts FIFO one turn at a time, and a mid-turn prompt queues as
   a follow-up instead of being rejected.
@@ -104,7 +104,7 @@ Settled deployment facts:
   belong to the integration's own code, not the gateway.
 - The daemon **rebinds** a connection on `switch_session` (server-side); the
   bridge stays a dumb relay.
-- Daemon restart is **lazy**: no pi processes are started at boot; the next
+- Daemon restart is **lazy**: no SDK sessions are opened at boot; the next
   attach loads the session file. In-flight turns are lost on daemon restart.
 - **Packaging is configuration, not shadowing.** UIs point their pi-executable
   setting at the client (`pilish-executable`, `pilish/remote-executables`). The
@@ -193,7 +193,7 @@ Consequences to design for:
 
 | Capability | Feasible? | How |
 |---|---|---|
-| A session survives its client's death | ✅ | the daemon owns pi; a later client re-attaches |
+| A session survives its client's death | ✅ | the daemon owns the SDK session; a later client re-attaches |
 | N clients attached at once | ✅ | one ordered event log per session, fan-out to all |
 | All clients see the same ordered stream | ✅ | `gw_seq` from a single Hub per session |
 | Any client may prompt | ✅ | daemon-owned per-client FIFO queue |
@@ -201,9 +201,9 @@ Consequences to design for:
 | Late join / reconnect with replay | ✅ | ring buffer + `resume.sinceSeq`; `gw_snapshot` fallback |
 | Attach by path or name, list, create | ✅ | catalog + server-side `switch_session` rebinding |
 | **Two LLM turns truly in parallel** | ❌ | pi has one agent loop, one context, one leaf |
-| Two pi processes on one session file | ❌ (unsafe) | one writer per file, enforced by the daemon |
+| Two SDK sessions on one session file | ❌ (unsafe) | one writer per file, enforced by the daemon |
 
-**Rule: the daemon never runs two pi processes against one session file.**
+**Rule: the daemon never owns two Pi SDK sessions against one session file.**
 Parallelism is expressed as *concurrent prompt submission + daemon queueing*,
 not concurrent turns. If parallel agents are needed, run separate sessions
 (separate files) and coordinate at a higher layer; that is out of scope.
@@ -216,14 +216,14 @@ deliberately provisional and revisited after implementation.
 
 ## 3. Architecture
 
-Two binaries:
+Two TypeScript entry points:
 
-- **`pi-gatewayd`** — the daemon. Owns sessions and every pi process, listens
-  on loopback TCP, authenticates clients, and speaks the gateway protocol.
-  Runs as a systemd user service.
+- **`pi-gatewayd`** — the daemon. Owns Pi SDK sessions, listens on loopback
+  TCP, authenticates clients, and speaks the gateway protocol. Runs as a
+  systemd user service.
 - **`pi-gateway`** — the client bridge. A UI spawns it in place of `pi`; it
   performs `gw_hello` on the UI's behalf, consumes `gw_*` traffic, strips
-  gateway fields, and exposes pristine raw pi RPC on stdio.
+  gateway fields, and exposes pristine Pi RPC on stdio.
 
 ```text
   Emacs/pilish ──ssh/TRAMP──► pi-gateway (client) ─┐
@@ -231,45 +231,40 @@ Two binaries:
   other integrations ──────────────────────────────┘   (token auth)          │
                                                         ┌────────────────────┴──────────────────┐
                                                         │ Per session:                          │
-                                                        │   SessionActor  (sole pi writer)      │
+                                                        │   SessionActor  (sole SDK owner)      │
                                                         │   Hub           (ordered log + replay)│
                                                         │   PromptQueue   (per-client FIFO)     │
                                                         │   UIBroker      (dialog routing)      │
                                                         └────────────────────┬──────────────────┘
                                                                              ▼
-                                                              pi --mode rpc --session X
+                                                   Pi SDK AgentSession for session X (in-process)
 ```
 
 The client never spawns pi and never owns a session. Several clients — bridges
 and direct integrations — can be attached to the same session at once.
 
-### 3.1 Processes and goroutines
+### 3.1 Runtime components and asynchronous work
 
-Per **session**:
+The TypeScript daemon embeds Pi's SDK; it does not launch a `pi` child process
+or relay the SDK through child stdin/stdout. Per **session**:
 
-| Goroutine | Responsibility |
+| Component | Responsibility |
 |---|---|
-| `SessionActor` | Single loop. Linearizes commands, drives the prompt queue, writes to pi stdin, handles rebinding and control messages. All state transitions happen here. |
-| `piReader` | Reads pi stdout, strict-LF JSONL decode, assigns `seq`, hands records to the Hub. Never blocks on slow clients. |
-| `piStderr` | Drains stderr into a bounded log (diagnostics + crash reason). |
-| `piWriter` | Serializes writes to pi stdin. |
+| `SessionActor` | Serializes session state transitions, commands, queue work, rebinding, and lifecycle operations around one SDK session. |
+| Pi SDK adapter | Maps SDK session creation, RPC commands, extension UI, and events to the gateway's Pi-RPC-shaped frames. |
+| `Hub` | Assigns event sequence numbers, retains replay history, and fans records out to subscribers without letting a slow client block session work. |
+| `PromptQueue` / UI broker | Owns queued prompts and extension-dialog routing for the session. |
 
-Per **client connection**:
-
-| Goroutine | Responsibility |
-|---|---|
-| `connReader` | Decode JSONL, validate size/rate, hand commands to the bound actor. |
-| `connWriter` | Drain a bounded queue to the socket with coalescing and drop policy. |
-
-The Hub is a mutex-protected structure plus per-subscriber channels. `Publish`
-is called only from `piReader` (pi events) and the actor (gateway events), so
-ordering stays trivial.
+Per **client connection**, asynchronous read/write tasks decode JSONL, correlate
+responses, and drain bounded/coalesced outbound queues. The actor publishes
+gateway lifecycle events to the Hub; SDK callbacks feed the same ordered event
+path. There are no `piReader`, `piWriter`, or `piStderr` child-process pipes.
 
 ### 3.2 Ownership invariants
 
-> For a given session file, exactly one `SessionActor` and exactly one
-> `PiProcess` exist. All writes to pi stdin and all reads from pi stdout pass
-> through that actor/hub pair.
+> For a given session file, exactly one `SessionActor` and exactly one Pi SDK
+> `AgentSession` exist. All SDK commands and events pass through that
+> actor/adapter pair.
 >
 > A connection is bound to at most one session at a time, and a binding changes
 > only inside the actor (server-side rebinding, §4.2).
@@ -312,14 +307,10 @@ Two paths, both file-backed:
   session, records the creating client's identity/tags (exposed in the
   catalog), and binds the requester to it.
 
-A created session spawns:
-
-```text
-pi --mode rpc --session <file> [accepted piArgs...]
-```
-
-The **working directory of a session is the creating client's**, carried in
-`gw_hello.cwd` (or `gw_new_session.cwd`) and used as pi's spawn directory. The
+A created session opens one Pi SDK `AgentSession` using the session file and
+accepted spawn configuration. The **working directory of a session is the
+creating client's**, carried in `gw_hello.cwd` (or `gw_new_session.cwd`) and
+used as the SDK session's working directory. The
 UI is the only party that knows which project it is looking at, and a
 daemon-side directory would file every session under whatever directory the
 service happened to start in. The value must be an absolute existing
@@ -341,8 +332,8 @@ marker itself is not surfaced in the catalog yet.
 then:
 
 1. joins the live actor if the session is warm;
-2. loads the session file (spawn + `--session`, using the attaching client's
-   accepted parameters) if it is hibernated or absent;
+2. opens a Pi SDK session from the session file and accepted parameters if it
+   is hibernated or absent;
 3. rebinds the requesting connection;
 4. synthesizes pi's response (`success` + `data.cancelled`) instead of
    forwarding it to the current pi.
@@ -353,15 +344,15 @@ fails with `ambiguous_session`.
 ### 4.3 Hibernation and orphan reaping
 
 - After the **last** client detaches and the agent has settled, a session stays
-  warm for a configurable grace period (default 15 minutes), then pi is stopped
-  gracefully. The session file remains.
-- pi is **never** stopped mid-turn: if the last client detaches during a turn,
-  the timer starts at `agent_settled`.
+  warm for a configurable grace period (default 15 minutes), then its SDK
+  session is disposed. The session file remains.
+- The SDK session is **never** disposed mid-turn: if the last client detaches
+  during a turn, the timer starts at `agent_settled`.
 - A session with **no messages and no clients** (typically created by pilish's
   revive path, which sends `get_state` and immediately `switch_session`) is
   stopped after a **short grace (seconds)**, not the full idle timeout.
-- The next attach respawns pi and reloads the file; extensions/skills are
-  freshly loaded.
+- The next attach opens a fresh SDK session from the file; extensions/skills
+  are freshly loaded.
 
 ### 4.4 Reload
 
@@ -375,8 +366,9 @@ refreshes state/history but does not restart pi. Restarting pi is explicit:
 - Refused with `reload_busy` while other clients are attached or a turn is
   running, unless `force: true`. An in-flight attach returns `reload_busy` even
   with `force` so it cannot bind across the restart.
-- On success pi is stopped and respawned with the session's recorded spawn
-  config; attached clients get `gw_session_state{state:"restarting"}` then
+- On success the current SDK session is disposed and recreated with the
+  session's recorded spawn config; attached clients get
+  `gw_session_state{state:"restarting"}` then
   `{state:"ready"}` and refresh their own view (the event log and ring survive
   the restart, so no replay or snapshot is forced).
 - `gw_reload_session{addPiArgs}` is an optional generic additive operation for
@@ -385,7 +377,7 @@ refreshes state/history but does not restart pi. Restarting pi is explicit:
   `piargs` validator, merges list-valued options idempotently, and rejects
   conflicting singleton values. It always uses an unforced restart: active
   turns, any other attached client, or an in-flight attach cause `reload_busy`,
-  even when `force` was requested. Before stopping Pi, the actor snapshots
+  even when `force` was requested. Before disposing the SDK session, the actor snapshots
   current runtime settings from its serialized `get_state`, so live
   model/provider/thinking/name changes are not replaced with startup argv. The
   actor also retains acknowledged runtime-setting changes, so an additive
@@ -403,33 +395,33 @@ refreshes state/history but does not restart pi. Restarting pi is explicit:
 
 ### 4.5 Daemon restart
 
-Re-adoption is **lazy**: the daemon starts with no pi processes and no
-persistent registry. The next attach loads the session file. In-flight turns
+Re-adoption is **lazy**: the daemon starts with no SDK sessions and no
+persistent registry. The next attach opens a session from the file. In-flight turns
 are lost on daemon restart (accepted).
 
 ### 4.6 pi crash
 
-`piReader` sees EOF or a non-zero exit; the actor:
+The SDK adapter reports a failed session or request; the actor:
 
 1. publishes `gw_session_state{state:"crashed", reason, exitCode}`;
 2. fails pending requests and drains the prompt queue with `session_crashed`;
 3. leaves the session file intact for re-attach.
 
 **Settled: the daemon does not auto-respawn.** A crashed session stays
-registered but dead until the next `attach`/`switch_session`, which respawns pi
-and resumes from the session file (lazy re-adoption, §4.5); clients that stayed
-attached get `gw_session_state{state:"crashed"}` and resync when it comes back.
-Auto-respawning a crash loop would burn the operator's model quota without a
-client asking for it.
+registered but dead until the next `attach`/`switch_session`, which opens a
+new SDK session from the file (lazy re-adoption, §4.5); clients that stayed
+attached get `gw_session_state{state:"crashed"}` and resync when a client
+explicitly reattaches. Automatically recreating a failed SDK session could burn
+model quota without a client asking for it.
 
 ### 4.7 Graceful shutdown
 
-`SIGTERM` on the daemon: stop accepting connections, `abort` each session,
-close pi stdin, wait with a timeout, then `SIGKILL`.
+`SIGTERM` on the daemon: stop accepting connections, abort each active turn,
+wait for the bounded shutdown grace, then dispose every SDK session.
 
 ### 4.8 Stop and delete
 
-`gw_stop_session` releases a session's pi process while keeping the file;
+`gw_stop_session` disposes a session's SDK runtime while keeping the file;
 `gw_delete_session` does the same and removes the file. Both are `admin`,
 session-scoped, answered on the requester's own connection, and specified on
 the wire in `docs/protocol.md` §3.10.
@@ -442,12 +434,12 @@ the wire in `docs/protocol.md` §3.10.
   `session_attached` for a stop with other clients attached without `force`.
   Deleting never blocks on attached clients — one stale UI must not make a
   session undeletable — so they are notified and unbound instead.
-- A forced stop sends pi `abort` and waits for `agent_settled` up to
-  `defaultStopGrace` (5s), then stops pi regardless. The daemon queue is
+- A forced stop sends `abort` through the SDK and waits for `agent_settled` up
+  to `defaultStopGrace` (5s), then disposes the SDK session regardless. The daemon queue is
   discarded and republished empty before pi stops, so no queued prompt can
   restart a turn.
-- Deletion happens in the daemon **after** `Actor.Finished()` — pi is reaped
-  and has flushed its file — and removes exactly the canonical file, plus its
+- Deletion happens in the daemon **after** the actor and SDK session finish
+  flushing the file, and removes exactly the canonical file, plus its
   encoded-cwd directory when that is empty. The path is then tombstoned for
   the daemon's lifetime: a repeat attach or delete answers `unknown_session`.
   The tombstone also closes the window between the actor stopping and the file
@@ -459,7 +451,7 @@ the wire in `docs/protocol.md` §3.10.
   a deletion refuses later session-scoped commands until the client attaches
   or creates a session explicitly; the bridge turns that into a pi-shaped
   error and closes the UI stream.
-- A stop keeps the file, so the next attach respawns pi (§4.3); its terminal
+- A stop keeps the file, so the next attach recreates an SDK session (§4.3); its terminal
   event is `gw_session_state{state:"stopped", reason:"requested"|"forced"}`.
 
 ---
@@ -551,7 +543,7 @@ one client are never broadcast to others.
 | `fork`, `clone` | sole client: forward, adopt the new file, rebind; shared: `shared_session` error |
 | `abort` | forward to pi; stops the shared turn; daemon queue remains |
 | `clear_queue` | clear the daemon queue **and** pi's steer queue; return all cleared text |
-| `gw_reload_session` | stop and respawn pi for a session (§4.4) |
+| `gw_reload_session` | dispose and recreate the SDK session (§4.4) |
 
 Everything else in pi's command surface is forwarded verbatim with `id`
 rewritten.
@@ -629,7 +621,7 @@ Fan-out to a slow client must never stall pi:
   are merged to at most one record per flush interval (default 50 ms) or 8 KB.
 - **Terminal events are never dropped** — the gateway's own lifecycle and
   control frames (`gw_*`) are terminal as well, so the guarantee covers the
-  complete list in `internal/session/hub.go`; pi's are `message_end`,
+  complete list in the TypeScript Hub; Pi SDK events include `message_end`,
   `tool_execution_end`,
   `turn_end`, `agent_end`, `agent_settled`, `response`, `extension_ui_request`.
   If a queue is saturated with terminal events, the connection is closed with
@@ -637,7 +629,7 @@ Fan-out to a slow client must never stall pi:
 - **Lossy clients** may opt into `allowLossy`; non-terminal deltas are dropped
   when full and the daemon sends `gw_lag{oldestSeq, headSeq}` to trigger a
   resync.
-- `piReader` never blocks on the Hub; durability lives in the session file.
+- SDK event callbacks never block on the Hub; durability lives in the session file.
 
 ---
 
@@ -795,39 +787,28 @@ See `docs/protocol.md` draft 2 for the exact message set.
 
 ---
 
-## 12. Go package layout
+## 12. Runtime and client package layout
 
 ```text
-cmd/pi-gatewayd/       daemon main: flags, signals, systemd unit entry point
-cmd/pi-gateway/        client main: the bridge UIs spawn in place of `pi`
-gwclient/              exported client library: dial, handshake, commands,
-                       events, reconnect/resume, typed helpers
-examples/chat/         example interactive CLI built only on gwclient
-protocol/              JSONL codec, gateway messages, compat helpers
-config/                token/port file paths, defaults, discovery
-piargs/                accepted pi parameter parsing (shared daemon <-> client)
-internal/daemon/       listener, auth, connection table, binding/rebinding
-internal/session/      SessionActor, Hub, PromptQueue, UIBroker, PiProcess
-internal/catalog/      session catalog: file scan + live index, name resolution
-internal/client/       bridge: gateway <-> raw pi, id restore, gw_* filtering
-internal/debughttp/    read-only /status, /catalog, /metrics HTTP endpoints
-internal/gwlog/        structured logging (text or JSON via log/slog)
-internal/metrics/      Prometheus-text counters, gauges, metric names
-internal/fakepi/       fake pi used by the end-to-end tests
-internal/gwtest/       shared daemon harness for end-to-end tests
-internal/testutil/     test helpers: build fake pi, raw protocol client
+typescript/bin/          TypeScript daemon and bridge entry points
+typescript/src/          SDK runtime, session actor/hub/queue, Pi-RPC adapter,
+                         bridge, catalog, config, debug HTTP, logging, metrics
+typescript/test/         runtime, protocol, lifecycle, CLI, and executable tests
+protocol/                retained Go JSONL codec, messages, roles, capability table
+config/                  retained Go token/port paths, discovery, provisioning
+piargs/                  retained Go Pi argument parser
+gwclient/                retained public Go gateway client and wire test fixture
+examples/chat/           runnable Go integration example
+packaging/               systemd user unit
+test/e2e/                Emacs + pilish local-provider ERT suites
 ```
 
-`protocol/`, `config/`, `piargs/` and `gwclient/` are deliberately **outside
-`internal/`**: a separate integration repository (for example the Slack bot)
-implements its client against them, and Go forbids importing `internal/...`
-across modules. `gwclient` is the supported programmatic client; the bridge in
-`internal/client` remains the stdio adapter for pi UIs.
-
-M1, M2, and M3 implement this layout, plus `packaging/pi-gatewayd.service` for
-the systemd user unit. The prototype that predated the settled
-design (a single binary with `serve`/`connect` subcommands and floor
-arbitration) has been removed.
+The TypeScript package owns the production daemon and bridge. It uses Pi's SDK
+in-process and keeps one SDK session per gateway session. The public Go
+`protocol/`, `config/`, `piargs/`, and `gwclient/` packages remain outside
+`internal/` so integrations in other Go modules can import them; `examples/chat`
+continues to demonstrate the Go client API. There is no Go daemon or bridge in
+the production tree.
 
 ---
 
@@ -885,24 +866,29 @@ arbitration) has been removed.
   unit keeps `Type=simple`, `Restart=on-failure`, `ExecReload` SIGHUP and
   `KillSignal=SIGTERM`.
 - **Single-writer invariant**: attaching while a reload is mid-restart joins the
-  reloading actor; assert one pi process and one catalog row for the session
+  reloading actor; assert one SDK session and one catalog row for the session
   file, and that runtime parameters applied on attach are attributed to the
   attaching client.
-- **Session directory**: a new session runs pi in the client's `cwd`; a
-  respawned session uses the directory recorded in its header.
-- **Race detector**: `go test -race` on all packages.
+- **Session directory**: a new SDK session uses the client's `cwd`; a restored
+  session uses the directory recorded in its header.
+- **TypeScript runtime**: `npm test` and `npm run typecheck` from `typescript/`;
+  lifecycle, protocol, security, backpressure, executable, and local-provider
+  tests run without external model inference.
+- **Retained Go clients**: `go test -race ./...` checks the public protocol,
+  client, and example packages. The client tests use a wire-level fixture, not
+  the retired Go daemon.
 
 ---
 
 ## 14. Roadmap
 
-1. **M1 — core daemon and client (implemented).** Two binaries; token/port
-   discovery; loopback TCP listener with auth; session actor (Hub, PromptQueue,
-   PiProcess); `gw_hello`/`gw_welcome`; pi command/event passthrough with id
-   namespacing; server-side `switch_session` and `new_session` rebinding;
-   daemon-owned queue; spawn-param conflict checks and runtime-parameter
-   application; replay and `gw_snapshot` resync; bridge on stdio; hibernation
-   and orphan reaping.
+1. **M1 — core daemon and client (implemented).** TypeScript daemon and bridge;
+   token/port discovery; loopback TCP listener with auth; session actor (Hub,
+   PromptQueue, Pi SDK `AgentSession`); `gw_hello`/`gw_welcome`; Pi-RPC command
+   and event adaptation with id namespacing; server-side `switch_session` and
+   `new_session` rebinding; daemon-owned queue; spawn-param conflict checks and
+   runtime-parameter application; replay and `gw_snapshot` resync; bridge on
+   stdio; hibernation and orphan reaping.
 2. **M2 — sessions and multi-client (implemented).** Catalog and name
    resolution; `gw_new_session`; `gw_reload_session`; `fork`/`clone` policy;
    extension UI broker; presence and `gw_state_changed`; kind tagging;

@@ -17,15 +17,15 @@
 (load (expand-file-name "e2e-common.el"
                         (file-name-directory (or load-file-name buffer-file-name))))
 
-(defun e2e-prompt-text (real-text)
-  "Return REAL-TEXT for the real lane and a scenario-safe text otherwise."
-  (if (eq e2e-lane 'real) real-text "e2e prompt"))
+(defun e2e-prompt-text (_real-text)
+  "Return the deterministic prompt used by the local provider."
+  "e2e prompt")
 
 ;;;; 1. Session survival across a client drop (the ssh-disconnect case)
 
 (ert-deftest gateway-e2e-client-death-survives-turn ()
   "A dropped client must not end the turn or the session."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (a (e2e-start daemon))
          path)
@@ -35,7 +35,7 @@
           (e2e-prompt a (e2e-prompt-text "/no_think Count from 1 to 60 slowly"))
           ;; Drop the client while the turn is running, like an ssh hangup.
           (e2e-kill a)
-          (ert-info ("the daemon keeps the session and its pi process")
+          (ert-info ("the daemon keeps the session and its SDK runtime")
             (e2e-wait-row path (lambda (row) (alist-get 'live row)) 15
                           "the dropped client's session stays live" daemon))
           (let ((b (e2e-start daemon)))
@@ -58,7 +58,7 @@
 
 (ert-deftest gateway-e2e-two-clients-share-one-session ()
   "A second client attaches to a live session and both see later turns."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (a (e2e-start daemon))
          (b nil)
@@ -89,8 +89,8 @@
 
 (ert-deftest gateway-e2e-daemon-restart-reattach ()
   "A restarted daemon re-adopts the session file and resumes its history."
-  ;; The scenario fake has no --session resume, so this is real-pi only.
-  (e2e-require-lane 'real)
+  ;; The scenario fake has no --session resume; the local SDK lane does.
+  (e2e-require-lane 'real 'local)
   (let* ((daemon (e2e-lane-daemon))
          (a (e2e-start daemon))
          path count)
@@ -121,8 +121,8 @@
 ;;;; 4. Hibernation and respawn
 
 (ert-deftest gateway-e2e-hibernation-respawns ()
-  "An idle session is reaped and the next attach respawns pi with its history."
-  (e2e-require-lane 'real)
+  "An idle session is reaped and the next attach restores its SDK session."
+  (e2e-require-lane 'real 'local)
   (let* ((daemon (e2e-daemon "hibernate"))
          (a (e2e-start daemon))
          path count)
@@ -133,7 +133,7 @@
           (setq count (plist-get (e2e-wait-messages a 2 120) :messageCount))
           (e2e-stop a)
           (setq a nil)
-          (ert-info ("idle timeout stops pi")
+          (ert-info ("idle timeout disposes the SDK session")
             (should (= 0 (e2e-wait-live 0 30 daemon))))
           (let ((b (e2e-start daemon)))
             (unwind-protect
@@ -154,7 +154,7 @@
 
 (ert-deftest gateway-e2e-cli-version-help-and-mode ()
   "`--version' is answered by the daemon; `--help' is client-local."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (version (alist-get 'piVersion (e2e-status daemon))))
     (ert-info ("--version reports the managed pi version")
@@ -183,7 +183,7 @@
 
 (ert-deftest gateway-e2e-client-failure-modes ()
   "Missing daemon, bad token and unreadable token fail fast and loudly."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (closed (format "127.0.0.1:%d" (e2e-free-port)))
          (bad-token (make-temp-file "e2e-bad-token" nil "not-the-token\n")))
@@ -218,7 +218,7 @@
 
 (ert-deftest gateway-e2e-restricted-token-roles ()
   "An observer token may read but not prompt, mutate, or run bash."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (observer (alist-get 'observerToken daemon))
          (registered-before (alist-get 'registered (alist-get 'sessions (e2e-status daemon)))))
@@ -252,7 +252,7 @@
 (ert-deftest gateway-e2e-spawn-param-conflict ()
   "A differing value for a recorded spawn key is refused; a key the live
 session never recorded is ignored and still attaches (docs/protocol.md 4.3)."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (a (e2e-start daemon (list "--session-dir" (make-temp-file "e2e-a" t))))
          (b (e2e-start daemon (list "--session-dir" (make-temp-file "e2e-b" t))))
@@ -277,7 +277,7 @@ session never recorded is ignored and still attaches (docs/protocol.md 4.3)."
 
 (ert-deftest gateway-e2e-session-follows-client-directory ()
   "A new session runs pi in the client's directory, not the daemon's."
-  (e2e-require-lane 'real 'fake)
+  (e2e-require-lane 'real 'fake 'local)
   (let* ((daemon (e2e-lane-daemon))
          (project (make-temp-file "e2e-project" t))
          (a (e2e-start daemon nil project))

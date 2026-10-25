@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
-	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
@@ -17,7 +16,7 @@ import (
 // report the gw_error instead of returning an unbound client whose next
 // command would create a second session.
 func TestAttachConflictReturnsError(t *testing.T) {
-	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	addr, _ := startTestDaemon(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -113,7 +112,7 @@ func TestPromptCarriesImages(t *testing.T) {
 // advance the session, and checks the reconnect replays exactly the missed
 // turn before going live again.
 func TestReconnectResumesFromCursor(t *testing.T) {
-	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	addr, _ := startTestDaemon(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
@@ -200,7 +199,7 @@ func TestReconnectResumesFromCursor(t *testing.T) {
 // checks the snapshot reports the boundary the pump used, so the client's
 // cursor does not stay stuck at the old daemon generation's sequence.
 func TestResyncSnapshotCarriesWatermark(t *testing.T) {
-	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	addr, _ := startTestDaemon(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 

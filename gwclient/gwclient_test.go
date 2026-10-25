@@ -4,14 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
-	"github.com/tigersoldier/pi-gateway/internal/gwtest"
 	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
@@ -21,7 +18,7 @@ const testToken = "gwclient-test-token"
 // the client configuration before Dial.
 func dial(t *testing.T, mutate func(*gwclient.Config)) *gwclient.Client {
 	t.Helper()
-	addr, _ := gwtest.StartDaemon(t, testToken, nil)
+	addr, _ := startTestDaemon(t)
 	return dialTo(t, addr, mutate)
 }
 
@@ -141,7 +138,6 @@ func TestDoReturnsResponseError(t *testing.T) {
 }
 
 func TestFollowUpAndGetCommands(t *testing.T) {
-	t.Setenv("FAKEPI_COMMANDS", "1")
 	c := dial(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -192,10 +188,8 @@ func TestCloseClosesEvents(t *testing.T) {
 }
 
 func TestExtensionDialogRoundTrip(t *testing.T) {
-	t.Setenv("FAKEPI_UI_REQUEST", "1")
-	received := filepath.Join(t.TempDir(), "ui-responses.jsonl")
-	t.Setenv("FAKEPI_UI_RESPONSE_FILE", received)
-	c := dial(t, nil)
+	addr, gateway := startTestDaemon(t)
+	c := dialTo(t, addr, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -229,19 +223,16 @@ func TestExtensionDialogRoundTrip(t *testing.T) {
 	if err := c.RespondUI(ctx, dialogID, map[string]any{"confirmed": true}); err != nil {
 		t.Fatalf("RespondUI: %v", err)
 	}
-	// Real pi writes no response for extension_ui_response, so delivery is
-	// proved by the frame the fake records, not by a response event.
+	// extension_ui_response is fire-and-forget; verify the wire frame reached
+	// the fixture rather than expecting a response event.
 	deadline = time.After(15 * time.Second)
-	for {
-		data, _ := os.ReadFile(received)
-		if strings.Contains(string(data), `"id":"`+dialogID+`"`) {
-			return
+	select {
+	case raw := <-gateway.uiAnswers:
+		if !strings.Contains(string(raw), `"id":"`+dialogID+`"`) || !strings.Contains(string(raw), `"confirmed":true`) {
+			t.Fatalf("recorded UI answer = %s", raw)
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("the dialog answer never reached pi (recorded %q)", data)
-		case <-time.After(20 * time.Millisecond):
-		}
+	case <-deadline:
+		t.Fatal("the dialog answer never reached the gateway")
 	}
 }
 
