@@ -64,8 +64,8 @@ function fakeModules(overrides: {
   existingSession?: boolean;
   trustRequired?: boolean;
   trustDecision?: boolean | null;
-} = {}): { modules: PiSdkModules; captured: { manager?: string; sessionOptions?: RpcObject; serviceOptions?: RpcObject; apiKey?: string; trust?: RpcObject; offline?: string; skipVersion?: string; trustResolution?: RpcObject; modelPatterns?: string[] } } {
-  const captured: { manager?: string; sessionOptions?: RpcObject; serviceOptions?: RpcObject; apiKey?: string; trust?: RpcObject; offline?: string; skipVersion?: string; trustResolution?: RpcObject; modelPatterns?: string[] } = {};
+} = {}): { modules: PiSdkModules; captured: { manager?: string; sessionOptions?: RpcObject; serviceOptions?: RpcObject; apiKey?: string; trust?: RpcObject; offline?: string; skipVersion?: string; subagentsPackageRoots?: Array<string | undefined>; trustResolution?: RpcObject; modelPatterns?: string[] } } {
+  const captured: { manager?: string; sessionOptions?: RpcObject; serviceOptions?: RpcObject; apiKey?: string; trust?: RpcObject; offline?: string; skipVersion?: string; subagentsPackageRoots?: Array<string | undefined>; trustResolution?: RpcObject; modelPatterns?: string[] } = {};
   const session = new RuntimeTestSession();
   const sessionManager = {
     getLeafId: () => null,
@@ -111,6 +111,8 @@ function fakeModules(overrides: {
         captured.serviceOptions = options;
         captured.offline = process.env.PI_OFFLINE;
         captured.skipVersion = process.env.PI_SKIP_VERSION_CHECK;
+        captured.subagentsPackageRoots ??= [];
+        captured.subagentsPackageRoots.push(process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT);
         return services;
       },
       createAgentSessionFromServices: async (options: RpcObject) => {
@@ -238,6 +240,34 @@ test("SDK runtime applies offline mode only during serialized startup", async ()
     if (oldSkipVersion === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
     else process.env.PI_SKIP_VERSION_CHECK = oldSkipVersion;
   }
+});
+
+test("SDK runtime exposes the resolved Pi package root only during extension startup", async () => {
+  const envName = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
+  const oldRoot = process.env[envName];
+  process.env[envName] = "/host/pi-sdk";
+  try {
+    const { modules, captured } = fakeModules();
+    const runtime = await createPiSdkRuntimeFromModules({ cwd: "/project", env: {} }, modules, "/managed/pi-sdk");
+    assert.deepEqual(captured.subagentsPackageRoots, ["/managed/pi-sdk"]);
+    assert.equal(process.env[envName], "/host/pi-sdk", "initial setup restores the host environment");
+
+    await runtime.newSession();
+    assert.deepEqual(captured.subagentsPackageRoots, ["/managed/pi-sdk", "/managed/pi-sdk"]);
+    assert.equal(process.env[envName], "/host/pi-sdk", "replacement setup also restores the host environment");
+  } finally {
+    if (oldRoot === undefined) delete process.env[envName];
+    else process.env[envName] = oldRoot;
+  }
+});
+
+test("SDK runtime preserves an explicit subagents package root", async () => {
+  const { modules, captured } = fakeModules();
+  await createPiSdkRuntimeFromModules({
+    cwd: "/project",
+    env: { PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT: " /custom/pi-sdk " },
+  }, modules, "/managed/pi-sdk");
+  assert.deepEqual(captured.subagentsPackageRoots, ["/custom/pi-sdk"]);
 });
 
 test("SDK runtime applies API keys to models selected by --models", async () => {

@@ -260,6 +260,14 @@ responses, and drain bounded/coalesced outbound queues. The actor publishes
 gateway lifecycle events to the Hub; SDK callbacks feed the same ordered event
 path. There are no `piReader`, `piWriter`, or `piStderr` child-process pipes.
 
+The runtime resolves all SDK modules from the package selected for the `pi`
+executable. During SDK startup it exposes that package root to extensions as
+`PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`, unless a nonblank explicit value
+is configured. The process-wide environment update is serialized with other SDK
+startup and restored afterward; replacement sessions use the same scope. This
+lets extensions that need the embedded Pi package locate it without adding a
+client-facing setting or protocol field.
+
 ### 3.2 Ownership invariants
 
 > For a given session file, exactly one `SessionActor` and exactly one Pi SDK
