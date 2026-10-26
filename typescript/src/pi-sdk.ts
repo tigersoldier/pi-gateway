@@ -30,7 +30,10 @@ export async function resolvePiSdkLocation(piBin = "pi", env: NodeJS.ProcessEnv 
 }
 
 export async function loadPiSdk(piBin = "pi", env: NodeJS.ProcessEnv = process.env): Promise<Record<string, unknown>> {
-  const location = await resolvePiSdkLocation(piBin, env);
+  return loadPiSdkAtLocation(await resolvePiSdkLocation(piBin, env));
+}
+
+export async function loadPiSdkAtLocation(location: PiSdkLocation): Promise<Record<string, unknown>> {
   const module: unknown = await import(pathToFileURL(location.entrypoint).href);
   if (!isRecord(module)) throw new Error(`invalid Pi SDK module at ${location.entrypoint}`);
   return module;
@@ -41,7 +44,13 @@ export async function loadPiSdkSubmodule(
   piBin = "pi",
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<Record<string, unknown>> {
-  const location = await resolvePiSdkLocation(piBin, env);
+  return loadPiSdkSubmoduleAtLocation(relativePath, await resolvePiSdkLocation(piBin, env));
+}
+
+export async function loadPiSdkSubmoduleAtLocation(
+  relativePath: string,
+  location: PiSdkLocation,
+): Promise<Record<string, unknown>> {
   const modulePath = resolve(location.packageRoot, relativePath);
   if (!modulePath.startsWith(`${location.packageRoot}${sep}`)) {
     throw new Error(`Pi SDK module path is outside the package: ${JSON.stringify(relativePath)}`);

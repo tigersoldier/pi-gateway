@@ -1,8 +1,20 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { loadPiSdk, loadPiSdkSubmodule } from "./pi-sdk.ts";
+import {
+  loadPiSdkAtLocation,
+  loadPiSdkSubmoduleAtLocation,
+  resolvePiSdkLocation,
+} from "./pi-sdk.ts";
 import { PiArgsSpec } from "./piargs.ts";
 import type { RpcObject, RpcSession, RpcSessionRuntime } from "./rpc-adapter.ts";
+
+const SUBAGENTS_PACKAGE_ROOT_ENV = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
+type StartupEnvironmentKey = "PI_OFFLINE" | "PI_SKIP_VERSION_CHECK" | typeof SUBAGENTS_PACKAGE_ROOT_ENV;
+type StartupEnvironmentValues = {
+  offline: string | null | undefined;
+  skipVersion: string | null | undefined;
+  subagentsPackageRoot: string | null | undefined;
+};
 
 let startupEnvironmentTail: Promise<void> = Promise.resolve();
 
@@ -28,13 +40,14 @@ export interface PiSdkModules {
 export async function createPiSdkRuntime(options: PiSdkRuntimeOptions): Promise<RpcSessionRuntime> {
   const piBin = options.piBin ?? "pi";
   const env = options.env ?? process.env;
+  const location = await resolvePiSdkLocation(piBin, env);
   const [sdk, modelResolver, themeModule, settingsManager, trustManager, projectTrust] = await Promise.all([
-    loadPiSdk(piBin, env),
-    loadPiSdkSubmodule("dist/core/model-resolver.js", piBin, env),
-    loadPiSdkSubmodule("dist/modes/interactive/theme/theme.js", piBin, env),
-    loadPiSdkSubmodule("dist/core/settings-manager.js", piBin, env),
-    loadPiSdkSubmodule("dist/core/trust-manager.js", piBin, env),
-    loadPiSdkSubmodule("dist/core/project-trust.js", piBin, env),
+    loadPiSdkAtLocation(location),
+    loadPiSdkSubmoduleAtLocation("dist/core/model-resolver.js", location),
+    loadPiSdkSubmoduleAtLocation("dist/modes/interactive/theme/theme.js", location),
+    loadPiSdkSubmoduleAtLocation("dist/core/settings-manager.js", location),
+    loadPiSdkSubmoduleAtLocation("dist/core/trust-manager.js", location),
+    loadPiSdkSubmoduleAtLocation("dist/core/project-trust.js", location),
   ]);
   return createPiSdkRuntimeFromModules(options, {
     sdk,
@@ -43,20 +56,25 @@ export async function createPiSdkRuntime(options: PiSdkRuntimeOptions): Promise<
     settingsManager,
     trustManager,
     projectTrust,
-  });
+  }, env[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim() || location.packageRoot);
 }
 
 /** Build a runtime from SDK exports; injection keeps lifecycle tests deterministic. */
 export function createPiSdkRuntimeFromModules(
   options: PiSdkRuntimeOptions,
   modules: PiSdkModules,
+  resolvedPackageRoot?: string,
 ): Promise<RpcSessionRuntime> {
   const piArgs = options.piArgs ?? new PiArgsSpec();
   const env = options.env;
   const offline = lastValue(piArgs, "offline") === "true";
   const offlineValue = env === undefined ? (offline ? "1" : undefined) : offline ? "1" : env.PI_OFFLINE ?? null;
   const skipVersionValue = env === undefined ? (offline ? "1" : undefined) : offline ? "1" : env.PI_SKIP_VERSION_CHECK ?? null;
-  const startupEnvironment = { offline: offlineValue, skipVersion: skipVersionValue };
+  const startupEnvironment: StartupEnvironmentValues = {
+    offline: offlineValue,
+    skipVersion: skipVersionValue,
+    subagentsPackageRoot: env?.[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim() || resolvedPackageRoot,
+  };
   return withStartupEnvironment(startupEnvironment, () =>
     createPiSdkRuntimeInternal(options, modules, startupEnvironment));
 }
@@ -64,7 +82,7 @@ export function createPiSdkRuntimeFromModules(
 async function createPiSdkRuntimeInternal(
   options: PiSdkRuntimeOptions,
   modules: PiSdkModules,
-  startupEnvironment: { offline: string | null | undefined; skipVersion: string | null | undefined },
+  startupEnvironment: StartupEnvironmentValues,
 ): Promise<RpcSessionRuntime> {
   const piArgs = options.piArgs ?? new PiArgsSpec();
   const cwd = resolve(options.cwd);
@@ -199,7 +217,7 @@ async function createPiSdkRuntimeInternal(
 }
 
 async function withStartupEnvironment<T>(
-  values: { offline: string | null | undefined; skipVersion: string | null | undefined },
+  values: StartupEnvironmentValues,
   run: () => Promise<T>,
 ): Promise<T> {
   const previous = startupEnvironmentTail;
@@ -208,23 +226,27 @@ async function withStartupEnvironment<T>(
   await previous;
   const oldOffline = process.env.PI_OFFLINE;
   const oldSkipVersion = process.env.PI_SKIP_VERSION_CHECK;
-  applyEnvironmentValue("PI_OFFLINE", values.offline);
-  applyEnvironmentValue("PI_SKIP_VERSION_CHECK", values.skipVersion);
-  try { return await run(); }
-  finally {
+  const oldSubagentsPackageRoot = process.env[SUBAGENTS_PACKAGE_ROOT_ENV];
+  try {
+    applyEnvironmentValue("PI_OFFLINE", values.offline);
+    applyEnvironmentValue("PI_SKIP_VERSION_CHECK", values.skipVersion);
+    applyEnvironmentValue(SUBAGENTS_PACKAGE_ROOT_ENV, values.subagentsPackageRoot);
+    return await run();
+  } finally {
     restoreEnvironmentValue("PI_OFFLINE", oldOffline);
     restoreEnvironmentValue("PI_SKIP_VERSION_CHECK", oldSkipVersion);
+    restoreEnvironmentValue(SUBAGENTS_PACKAGE_ROOT_ENV, oldSubagentsPackageRoot);
     release();
   }
 }
 
-function applyEnvironmentValue(name: "PI_OFFLINE" | "PI_SKIP_VERSION_CHECK", value: string | null | undefined): void {
+function applyEnvironmentValue(name: StartupEnvironmentKey, value: string | null | undefined): void {
   if (value === undefined) return;
   if (value === null) delete process.env[name];
   else process.env[name] = value;
 }
 
-function restoreEnvironmentValue(name: "PI_OFFLINE" | "PI_SKIP_VERSION_CHECK", value: string | undefined): void {
+function restoreEnvironmentValue(name: StartupEnvironmentKey, value: string | undefined): void {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
 }

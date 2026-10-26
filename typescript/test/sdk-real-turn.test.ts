@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -59,11 +59,20 @@ test("real Pi SDK completes a local model turn, settles provider errors, and rec
     response.end("data: [DONE]\n\n");
   });
 
+  const packageRoot = (await resolvePiSdkLocation(piBin)).packageRoot;
+  const originalPackageRoot = process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
   const root = await mkdtemp(join(tmpdir(), "pi-gateway-sdk-turn-"));
   const agentDir = join(root, "agent");
-  await mkdir(agentDir);
+  const extensionPath = join(root, "capture-pi-root.ts");
+  const capturedRootPath = join(root, "extension-pi-root.txt");
   let runtime: RpcSessionRuntime | undefined;
   try {
+    await mkdir(agentDir);
+    await writeFile(extensionPath, `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(capturedRootPath)}, process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT ?? "");
+export default function () {}
+`);
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const address = server.address() as AddressInfo;
@@ -81,13 +90,17 @@ test("real Pi SDK completes a local model turn, settles provider errors, and rec
 
     runtime = await createPiSdkRuntime({
       piBin,
+      env: { ...process.env, PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT: "" },
       cwd: root,
       agentDir,
       piArgs: parsePiArgs([
-        "--no-session", "--model", "gateway-smoke/echo", "--thinking", "off", "--no-tools",
-        "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+        "--no-session", "--extension", extensionPath, "--approve",
+        "--model", "gateway-smoke/echo", "--thinking", "off", "--no-tools",
+        "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
       ]),
     });
+    assert.equal(await readFile(capturedRootPath, "utf8"), packageRoot, "extensions see the selected Pi SDK root during startup");
+    assert.equal(process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT, originalPackageRoot, "startup restores the process environment");
     const settled: RpcObject[] = [];
     runtime.session.subscribe((event) => {
       if (event.type === "agent_settled") settled.push(event);

@@ -98,6 +98,12 @@ should be treated as provisional unless it is explicitly marked so.
   re-sends `--approve` on every reload.) **Confirmed:** runtime parameter
   changes are session-global, and every client is notified with
   `gw_state_changed`.
+- **In-process extension host discovery** (runtime requirement). The SDK
+  runtime exposes the selected Pi package root to extensions as
+  `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` while startup services load. A
+  nonblank explicit value wins; the process environment is serialized and
+  restored after startup, including replacement sessions, so initialization
+  cannot leak per-session settings. This adds no protocol field or CLI option.
 - **HTTP debug endpoint** (operator). **Two ports, no auth on the debug port.**
   The session listener stays raw TCP + JSONL; a separate loopback HTTP listener
   serves read-only `debug/status/metrics/catalog`. It requires **no token**
