@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { resolvePiSdkLocation } from "../src/pi-sdk.ts";
 import { createPiSdkRuntime } from "../src/sdk-runtime.ts";
@@ -65,14 +66,17 @@ test("real Pi SDK completes a local model turn, settles provider errors, and rec
   const agentDir = join(root, "agent");
   const extensionPath = join(root, "capture-pi-root.ts");
   const capturedRootPath = join(root, "extension-pi-root.txt");
+  const lateModulePath = join(root, "late-pi-root.mjs");
   let runtime: RpcSessionRuntime | undefined;
   try {
     await mkdir(agentDir);
     await writeFile(extensionPath, `
 import { writeFileSync } from "node:fs";
-writeFileSync(${JSON.stringify(capturedRootPath)}, process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT ?? "");
+const packageRootEnv = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
+writeFileSync(${JSON.stringify(capturedRootPath)}, process.env[packageRootEnv] ?? "");
 export default function () {}
 `);
+    await writeFile(lateModulePath, 'export const capturedRoot = process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT ?? "";\n');
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const address = server.address() as AddressInfo;
@@ -88,6 +92,7 @@ export default function () {}
     }));
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false } }));
 
+    delete process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
     runtime = await createPiSdkRuntime({
       piBin,
       env: { ...process.env, PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT: "" },
@@ -100,7 +105,9 @@ export default function () {}
       ]),
     });
     assert.equal(await readFile(capturedRootPath, "utf8"), packageRoot, "extensions see the selected Pi SDK root during startup");
-    assert.equal(process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT, originalPackageRoot, "startup restores the process environment");
+    assert.equal(process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT, packageRoot, "the selected root remains available after startup");
+    const lateModule = await import(pathToFileURL(lateModulePath).href) as { capturedRoot: string };
+    assert.equal(lateModule.capturedRoot, packageRoot, "modules imported after startup still see the selected root");
     const settled: RpcObject[] = [];
     runtime.session.subscribe((event) => {
       if (event.type === "agent_settled") settled.push(event);
@@ -132,6 +139,8 @@ export default function () {}
     }
   } finally {
     await runtime?.dispose();
+    if (originalPackageRoot === undefined) delete process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
+    else process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT = originalPackageRoot;
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });
