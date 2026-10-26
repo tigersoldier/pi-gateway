@@ -242,7 +242,7 @@ test("SDK runtime applies offline mode only during serialized startup", async ()
   }
 });
 
-test("SDK runtime exposes the resolved Pi package root only during extension startup", async () => {
+test("injected SDK runtime retains the resolved Pi package root after service initialization", async () => {
   const envName = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
   const oldRoot = process.env[envName];
   process.env[envName] = "/host/pi-sdk";
@@ -250,24 +250,32 @@ test("SDK runtime exposes the resolved Pi package root only during extension sta
     const { modules, captured } = fakeModules();
     const runtime = await createPiSdkRuntimeFromModules({ cwd: "/project", env: {} }, modules, "/managed/pi-sdk");
     assert.deepEqual(captured.subagentsPackageRoots, ["/managed/pi-sdk"]);
-    assert.equal(process.env[envName], "/host/pi-sdk", "initial setup restores the host environment");
+    assert.equal(process.env[envName], "/managed/pi-sdk", "initial setup retains the resolved host root");
 
     await runtime.newSession();
     assert.deepEqual(captured.subagentsPackageRoots, ["/managed/pi-sdk", "/managed/pi-sdk"]);
-    assert.equal(process.env[envName], "/host/pi-sdk", "replacement setup also restores the host environment");
+    assert.equal(process.env[envName], "/managed/pi-sdk", "replacement setup retains the resolved host root");
   } finally {
     if (oldRoot === undefined) delete process.env[envName];
     else process.env[envName] = oldRoot;
   }
 });
 
-test("SDK runtime preserves an explicit subagents package root", async () => {
-  const { modules, captured } = fakeModules();
-  await createPiSdkRuntimeFromModules({
-    cwd: "/project",
-    env: { PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT: " /custom/pi-sdk " },
-  }, modules, "/managed/pi-sdk");
-  assert.deepEqual(captured.subagentsPackageRoots, ["/custom/pi-sdk"]);
+test("SDK runtime retains an explicit subagents package root", async () => {
+  const envName = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
+  const oldRoot = process.env[envName];
+  try {
+    const { modules, captured } = fakeModules();
+    await createPiSdkRuntimeFromModules({
+      cwd: "/project",
+      env: { [envName]: " /custom/pi-sdk " },
+    }, modules, "/managed/pi-sdk");
+    assert.deepEqual(captured.subagentsPackageRoots, ["/custom/pi-sdk"]);
+    assert.equal(process.env[envName], "/custom/pi-sdk");
+  } finally {
+    if (oldRoot === undefined) delete process.env[envName];
+    else process.env[envName] = oldRoot;
+  }
 });
 
 test("SDK runtime applies API keys to models selected by --models", async () => {

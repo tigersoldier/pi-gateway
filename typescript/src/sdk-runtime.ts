@@ -41,6 +41,9 @@ export async function createPiSdkRuntime(options: PiSdkRuntimeOptions): Promise<
   const piBin = options.piBin ?? "pi";
   const env = options.env ?? process.env;
   const location = await resolvePiSdkLocation(piBin, env);
+  const resolvedPackageRoot = env[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim()
+    || process.env[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim()
+    || location.packageRoot;
   const [sdk, modelResolver, themeModule, settingsManager, trustManager, projectTrust] = await Promise.all([
     loadPiSdkAtLocation(location),
     loadPiSdkSubmoduleAtLocation("dist/core/model-resolver.js", location),
@@ -56,7 +59,7 @@ export async function createPiSdkRuntime(options: PiSdkRuntimeOptions): Promise<
     settingsManager,
     trustManager,
     projectTrust,
-  }, env[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim() || location.packageRoot);
+  }, resolvedPackageRoot);
 }
 
 /** Build a runtime from SDK exports; injection keeps lifecycle tests deterministic. */
@@ -226,16 +229,15 @@ async function withStartupEnvironment<T>(
   await previous;
   const oldOffline = process.env.PI_OFFLINE;
   const oldSkipVersion = process.env.PI_SKIP_VERSION_CHECK;
-  const oldSubagentsPackageRoot = process.env[SUBAGENTS_PACKAGE_ROOT_ENV];
   try {
     applyEnvironmentValue("PI_OFFLINE", values.offline);
     applyEnvironmentValue("PI_SKIP_VERSION_CHECK", values.skipVersion);
+    // Extensions may defer imports until after startup, so retain this process-wide host root.
     applyEnvironmentValue(SUBAGENTS_PACKAGE_ROOT_ENV, values.subagentsPackageRoot);
     return await run();
   } finally {
     restoreEnvironmentValue("PI_OFFLINE", oldOffline);
     restoreEnvironmentValue("PI_SKIP_VERSION_CHECK", oldSkipVersion);
-    restoreEnvironmentValue(SUBAGENTS_PACKAGE_ROOT_ENV, oldSubagentsPackageRoot);
     release();
   }
 }
