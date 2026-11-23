@@ -675,7 +675,7 @@ client queued or had forwarded.
 
 Accepted set, with pi's short aliases: trust (`--approve`/`-a`,
 `--no-approve`/`-na`), extensions (`-e`/`--extension`, `--no-extensions`/
-`-ne`), resource/tool toggles (`--skill`, `--no-skills`/`-ns`,
+`-ne`, `--no-mcp`), resource/tool toggles (`--skill`, `--no-skills`/`-ns`,
 `--prompt-template`, `--no-prompt-templates`/`-np`, `--theme`, `--no-themes`,
 `--no-context-files`/`-nc`, `--tools`/`-t`, `--exclude-tools`/`-xt`,
 `--no-builtin-tools`/`-nbt`, `--no-tools`/`-nt`, `--system-prompt`,

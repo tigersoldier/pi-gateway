@@ -2,9 +2,16 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import {
   loadPiSdkAtLocation,
+  loadPiSdkBuiltinRegistryAtLocation,
   loadPiSdkSubmoduleAtLocation,
   resolvePiSdkLocation,
 } from "./pi-sdk.ts";
+import {
+  resolveBuiltinExtensions,
+  type BuiltinExtensionEntry,
+  type BuiltinExtensionResolution,
+  type BuiltinRegistrySnapshot,
+} from "./builtin-extensions.ts";
 import { PiArgsSpec } from "./piargs.ts";
 import type { RpcObject, RpcSession, RpcSessionRuntime } from "./rpc-adapter.ts";
 
@@ -35,22 +42,32 @@ export interface PiSdkModules {
   settingsManager?: Record<string, unknown>;
   trustManager?: Record<string, unknown>;
   projectTrust?: Record<string, unknown>;
+  /** CLI built-in extension registry snapshot; absent only for injected test runtimes. */
+  builtinRegistry?: BuiltinRegistrySnapshot;
 }
 
 export async function createPiSdkRuntime(options: PiSdkRuntimeOptions): Promise<RpcSessionRuntime> {
   const piBin = options.piBin ?? "pi";
   const env = options.env ?? process.env;
+  // Built-in extensions resolve their config (mcp.json, OAuth credentials, and
+  // the MCP log) through Pi's process-wide getAgentDir(), not the resource
+  // loader's agentDir. Keep an explicit agent directory visible to them; the
+  // daemon uses one agent directory per process.
+  if (options.agentDir !== undefined) {
+    process.env.PI_CODING_AGENT_DIR = resolveCliPath(options.agentDir, process.cwd());
+  }
   const location = await resolvePiSdkLocation(piBin, env);
   const resolvedPackageRoot = env[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim()
     || process.env[SUBAGENTS_PACKAGE_ROOT_ENV]?.trim()
     || location.packageRoot;
-  const [sdk, modelResolver, themeModule, settingsManager, trustManager, projectTrust] = await Promise.all([
+  const [sdk, modelResolver, themeModule, settingsManager, trustManager, projectTrust, builtinRegistry] = await Promise.all([
     loadPiSdkAtLocation(location),
     loadPiSdkSubmoduleAtLocation("dist/core/model-resolver.js", location),
     loadPiSdkSubmoduleAtLocation("dist/modes/interactive/theme/theme.js", location),
     loadPiSdkSubmoduleAtLocation("dist/core/settings-manager.js", location),
     loadPiSdkSubmoduleAtLocation("dist/core/trust-manager.js", location),
     loadPiSdkSubmoduleAtLocation("dist/core/project-trust.js", location),
+    loadPiSdkBuiltinRegistryAtLocation(location),
   ]);
   return createPiSdkRuntimeFromModules(options, {
     sdk,
@@ -59,6 +76,7 @@ export async function createPiSdkRuntime(options: PiSdkRuntimeOptions): Promise<
     settingsManager,
     trustManager,
     projectTrust,
+    builtinRegistry,
   }, resolvedPackageRoot);
 }
 
@@ -89,6 +107,8 @@ async function createPiSdkRuntimeInternal(
 ): Promise<RpcSessionRuntime> {
   const piArgs = options.piArgs ?? new PiArgsSpec();
   const cwd = resolve(options.cwd);
+  const builtinExtensions = resolveBuiltinExtensions(modules.builtinRegistry, modules.sdk);
+  reportBuiltinExtensionFallback(modules, builtinExtensions);
   const agentDir = options.agentDir ?? stringResult(callSync(modules.sdk, "getAgentDir", []), "getAgentDir");
   const sessionDirArg = lastValue(piArgs, "session-dir");
   const sessionDir = options.sessionDir ?? (sessionDirArg ? resolveCliPath(sessionDirArg, cwd) : undefined);
@@ -115,7 +135,7 @@ async function createPiSdkRuntimeInternal(
     const serviceOptions: RpcObject = {
       cwd: runtimeCwd,
       agentDir: runtimeAgentDir,
-      resourceLoaderOptions: resourceLoaderOptions(piArgs, cwd),
+      resourceLoaderOptions: resourceLoaderOptions(piArgs, cwd, builtinExtensions.entries),
     };
     let runtimeSettingsManager: unknown;
     if (modules.settingsManager) {
@@ -253,17 +273,57 @@ function restoreEnvironmentValue(name: StartupEnvironmentKey, value: string | un
   else process.env[name] = value;
 }
 
-function resourceLoaderOptions(args: PiArgsSpec, initialCwd: string): RpcObject {
+let builtinExtensionWarningReported = false;
+
+/**
+ * SDK hosts must opt in to the CLI's built-in extensions. Report a degraded
+ * resolution once per process so a missing or changed registry does not fail
+ * silently; injected test runtimes (no registry snapshot) stay quiet.
+ */
+function reportBuiltinExtensionFallback(
+  modules: PiSdkModules,
+  resolution: BuiltinExtensionResolution,
+): void {
+  if (builtinExtensionWarningReported || modules.builtinRegistry === undefined || resolution.source === "registry") {
+    return;
+  }
+  builtinExtensionWarningReported = true;
+  const detail = resolution.problem ? `: ${resolution.problem}` : "";
+  if (resolution.source === "public-factories") {
+    console.warn(
+      `pi-gateway: Pi's built-in extension registry is unavailable${detail}; `
+      + `registered the public built-in extensions instead (${resolution.entries.map((entry) => entry.name).join(", ")}). `
+      + "Built-ins without a public factory, such as llama.cpp, stay unavailable.",
+    );
+  } else {
+    console.warn(
+      `pi-gateway: Pi's built-in extension registry is unavailable${detail}; `
+      + "gateway sessions have no built-in MCP, codemode, or tool-search support.",
+    );
+  }
+}
+
+function resourceLoaderOptions(
+  args: PiArgsSpec,
+  initialCwd: string,
+  builtinExtensions: readonly BuiltinExtensionEntry[],
+): RpcObject {
   const options: RpcObject = {};
   const extensions = resourcePaths(args, "extension", initialCwd);
   const skills = resourcePaths(args, "skill", initialCwd);
   const prompts = resourcePaths(args, "prompt-template", initialCwd);
   const themes = resourcePaths(args, "theme", initialCwd);
+  // Named `builtin: true` entries make the loader treat them like the CLI's
+  // built-in extensions: enabled by default, filtered by the `extensions`
+  // setting, `--no-extensions`, and `--no-mcp`, and replaceable by a user
+  // extension that registers the same command or tool.
+  if (builtinExtensions.length) options.extensionFactories = [...builtinExtensions];
   if (extensions.length) options.additionalExtensionPaths = extensions;
   if (skills.length) options.additionalSkillPaths = skills;
   if (prompts.length) options.additionalPromptTemplatePaths = prompts;
   if (themes.length) options.additionalThemePaths = themes;
   if (lastValue(args, "no-extensions") === "true") options.noExtensions = true;
+  if (lastValue(args, "no-mcp") === "true") options.disabledBuiltinExtensions = ["mcp"];
   if (lastValue(args, "no-skills") === "true") options.noSkills = true;
   if (lastValue(args, "no-prompt-templates") === "true") options.noPromptTemplates = true;
   if (lastValue(args, "no-themes") === "true") options.noThemes = true;

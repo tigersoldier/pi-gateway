@@ -186,6 +186,7 @@ func TestShortAliasesMatchLongForms(t *testing.T) {
 		// Newly accepted long forms (no alias, but recorded canonically).
 		{"", "--models", "sonnet,haiku", "models"},
 		{"", "--no-themes", "", "no-themes"},
+		{"", "--no-mcp", "", "no-mcp"},
 		{"", "--offline", "", "offline"},
 		{"", "--verbose", "", "verbose"},
 	}

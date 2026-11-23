@@ -51,6 +51,7 @@ var boolFlags = map[string]string{
 	"-na":                   "no-approve",
 	"--no-extensions":       "no-extensions",
 	"-ne":                   "no-extensions",
+	"--no-mcp":              "no-mcp",
 	"--no-skills":           "no-skills",
 	"-ns":                   "no-skills",
 	"--no-prompt-templates": "no-prompt-templates",

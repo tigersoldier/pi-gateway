@@ -93,6 +93,7 @@ test("TestShortAliasesMatchLongForms", () => {
     ["-n", "--name", "work", KEY_NAME],
     ["", "--models", "sonnet,haiku", "models"],
     ["", "--no-themes", "", "no-themes"],
+    ["", "--no-mcp", "", "no-mcp"],
     ["", "--offline", "", "offline"],
     ["", "--verbose", "", "verbose"],
   ] as const;
