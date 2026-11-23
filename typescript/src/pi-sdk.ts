@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { access, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { BuiltinRegistrySnapshot } from "./builtin-extensions.ts";
 
 const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
@@ -63,6 +64,24 @@ export async function loadPiSdkSubmoduleAtLocation(
   const module: unknown = await import(pathToFileURL(modulePath).href);
   if (!isRecord(module)) throw new Error(`invalid Pi SDK module at ${modulePath}`);
   return module;
+}
+
+/**
+ * Load the CLI's built-in extension registry when the installed Pi exposes it.
+ * `dist/extensions/index.js` is not a package export, so a missing module or a
+ * changed bundle layout is reported instead of thrown: the runtime falls back
+ * to the public factories rather than refusing to create sessions.
+ */
+export async function loadPiSdkBuiltinRegistryAtLocation(location: PiSdkLocation): Promise<BuiltinRegistrySnapshot> {
+  try {
+    const module = await loadPiSdkSubmoduleAtLocation("dist/extensions/index.js", location);
+    if (!("builtInExtensions" in module)) {
+      return { error: "dist/extensions/index.js does not export builtInExtensions" };
+    }
+    return { extensions: module.builtInExtensions };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "cannot load dist/extensions/index.js" };
+  }
 }
 
 async function resolveExecutable(command: string, pathValue: string): Promise<string> {

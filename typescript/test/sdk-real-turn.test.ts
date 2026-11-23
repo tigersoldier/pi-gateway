@@ -62,6 +62,7 @@ test("real Pi SDK completes a local model turn, settles provider errors, and rec
 
   const packageRoot = (await resolvePiSdkLocation(piBin)).packageRoot;
   const originalPackageRoot = process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   const root = await mkdtemp(join(tmpdir(), "pi-gateway-sdk-turn-"));
   const agentDir = join(root, "agent");
   const extensionPath = join(root, "capture-pi-root.ts");
@@ -141,6 +142,8 @@ export default function () {}
     await runtime?.dispose();
     if (originalPackageRoot === undefined) delete process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
     else process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT = originalPackageRoot;
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });

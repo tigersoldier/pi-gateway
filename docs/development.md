@@ -644,6 +644,25 @@ entry remains deliberately provisional (live-only).
   strict CLI parity is not claimed. The runtime may inject an SDK path in tests
   without adding a CLI override.
 
+- **SDK sessions load the CLI's built-in extensions** (resolved). Pi's SDK does
+  not add built-in extensions to an in-process session; the CLI does. Without
+  them, gateway sessions ignored `mcp.json` and had no `codemode` or
+  `tool_search`. The runtime passes the CLI's `builtInExtensions` registry
+  (`llama.cpp`, `codemode`, `tool-search`, `mcp`) to the resource loader as
+  named `builtin: true` entries, so they follow the same `extensions` setting,
+  `--no-extensions`, `--no-mcp`, replacement, and hidden-listing rules as a CLI
+  session. The registry is not a package export: its shape is validated and a
+  missing or changed registry falls back to the public
+  `createCodemodeExtension`, `createToolSearchExtension`, and
+  `createMcpExtension` factories (without `llama.cpp`) with a one-time warning;
+  if those are absent too, the runtime warns and continues without built-ins.
+  `--no-mcp` is now an accepted spawn parameter and maps to
+  `disabledBuiltinExtensions: ["mcp"]`. An explicit `agentDir` is exported as
+  `PI_CODING_AGENT_DIR` because built-in extensions resolve `mcp.json`, OAuth
+  credentials, and their log through Pi's process-wide `getAgentDir()`; the
+  daemon uses one agent directory per process. Extension-registered CLI flags
+  remain a separate gap.
+
 The v0.1.0 library review also named gaps that are **not** library fixes and
 stay open as separate decisions:
 

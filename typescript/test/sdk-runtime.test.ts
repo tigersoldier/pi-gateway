@@ -64,6 +64,8 @@ function fakeModules(overrides: {
   existingSession?: boolean;
   trustRequired?: boolean;
   trustDecision?: boolean | null;
+  builtinRegistry?: { extensions?: unknown; error?: string };
+  sdkExports?: Record<string, unknown>;
 } = {}): { modules: PiSdkModules; captured: { manager?: string; sessionOptions?: RpcObject; serviceOptions?: RpcObject; apiKey?: string; trust?: RpcObject; offline?: string; skipVersion?: string; subagentsPackageRoots?: Array<string | undefined>; trustResolution?: RpcObject; modelPatterns?: string[] } } {
   const captured: { manager?: string; sessionOptions?: RpcObject; serviceOptions?: RpcObject; apiKey?: string; trust?: RpcObject; offline?: string; skipVersion?: string; subagentsPackageRoots?: Array<string | undefined>; trustResolution?: RpcObject; modelPatterns?: string[] } = {};
   const session = new RuntimeTestSession();
@@ -101,6 +103,7 @@ function fakeModules(overrides: {
   };
   const modules: PiSdkModules = {
     sdk: {
+      ...overrides.sdkExports,
       getAgentDir: () => "/test/agent",
       SessionManager: {
         create: (_cwd: string, sessionDir?: string) => { captured.manager = `create:${sessionDir ?? "default"}`; return sessionManager; },
@@ -131,6 +134,7 @@ function fakeModules(overrides: {
       resolveModelScope: async (patterns: string[]) => { captured.modelPatterns = patterns; return overrides.scope ?? []; },
     },
     theme: { name: "test-theme" },
+    builtinRegistry: overrides.builtinRegistry,
     settingsManager: {
       SettingsManager: {
         create: (_cwd: string, _agentDir: string, options: RpcObject) => {
@@ -332,4 +336,62 @@ test("SDK runtime selects scoped models, API keys, and in-memory sessions", asyn
   assert.equal(captured.sessionOptions?.thinkingLevel, "high");
   assert.deepEqual(captured.sessionOptions?.scopedModels, [{ model: selected, thinkingLevel: "high" }]);
   assert.equal(runtime.session.sessionName, "named");
+});
+
+async function withCapturedWarnings<T>(run: () => Promise<T>): Promise<{ result: T; warnings: string[] }> {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    return { result: await run(), warnings };
+  } finally {
+    console.warn = original;
+  }
+}
+
+test("SDK runtime registers the CLI built-in extension registry", async () => {
+  const registry = [
+    { name: "codemode", factory: () => {}, builtin: true, replaceable: true },
+    { name: "mcp", factory: () => {}, builtin: true, replaceable: true },
+  ];
+  const { modules, captured } = fakeModules({ builtinRegistry: { extensions: registry } });
+  await createPiSdkRuntimeFromModules({
+    cwd: "/project",
+    piArgs: parsePiArgs(["--no-mcp", "--no-extensions"]),
+  }, modules);
+  const options = captured.serviceOptions?.resourceLoaderOptions as RpcObject;
+  assert.deepEqual(options.extensionFactories, registry);
+  assert.deepEqual(options.disabledBuiltinExtensions, ["mcp"]);
+  assert.equal(options.noExtensions, true);
+});
+
+test("SDK runtime falls back to public built-in extension factories and reports it", async () => {
+  const { modules, captured } = fakeModules({
+    builtinRegistry: { error: "dist/extensions/index.js is missing" },
+    sdkExports: {
+      createMcpExtension: () => () => {},
+      createCodemodeExtension: () => () => {},
+      createToolSearchExtension: () => () => {},
+    },
+  });
+  const { warnings } = await withCapturedWarnings(() =>
+    createPiSdkRuntimeFromModules({ cwd: "/project" }, modules));
+  const entries = (captured.serviceOptions?.resourceLoaderOptions as RpcObject).extensionFactories as RpcObject[];
+  assert.deepEqual(entries.map((entry) => [entry.name, entry.builtin, entry.replaceable]), [
+    ["codemode", true, true],
+    ["tool-search", true, true],
+    ["mcp", true, true],
+  ]);
+  assert.equal(warnings.length, 1, "a degraded built-in registry is reported once");
+  assert.match(warnings[0]!, /registered the public built-in extensions instead/);
+  assert.match(warnings[0]!, /llama\.cpp/);
+});
+
+test("SDK runtime ignores a built-in registry whose shape changed", async () => {
+  const { modules, captured } = fakeModules({
+    builtinRegistry: { extensions: [{ name: "mcp", factory: "changed", builtin: true }] },
+  });
+  await withCapturedWarnings(() => createPiSdkRuntimeFromModules({ cwd: "/project" }, modules));
+  const options = captured.serviceOptions?.resourceLoaderOptions as RpcObject;
+  assert.equal(Object.hasOwn(options, "extensionFactories"), false);
 });

@@ -44,6 +44,7 @@ test("a new daemon restores Pi session history and accepts another turn", { skip
   });
 
   const root = await mkdtemp(join(tmpdir(), "pi-gateway-daemon-restart-"));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   const agentDir = join(root, "agent");
   const sessionDir = join(root, "sessions");
   const piArgs = ["--model", "gateway-restart/echo", "--thinking", "off", "--no-tools", "--no-extensions",
@@ -108,6 +109,8 @@ test("a new daemon restores Pi session history and accepts another turn", { skip
     secondPeer?.close();
     await first?.shutdown();
     await second?.shutdown();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });
   }

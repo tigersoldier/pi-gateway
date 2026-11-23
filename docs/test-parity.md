@@ -67,14 +67,21 @@ behavioral parity.
   a rejected prompt after successful preflight marks the actor crashed, avoids
   automatic restart, preserves acknowledged runtime settings for additive
   reload, rejects stale UI answers, and re-adopts only on explicit attach. In
-  addition, `sdk-real-turn.test.ts` drives the installed Pi 1.3.0 SDK through a
+  addition, `sdk-real-turn.test.ts` drives the installed Pi 1.6.0 SDK through a
   loopback OpenAI-compatible endpoint: a streamed success, an HTTP 401 that
   settles as an SDK error, and a successful turn afterward. `daemon-restart.test.ts`
   uses a local provider to verify that a separate daemon restores persisted Pi
   history and accepts another turn. These exercise real SDK session/request
   paths without external credentials or model inference.
+- `sdk-builtin-extensions.test.ts` drives the installed SDK through
+  `SdkRpcAdapter` with a temporary agent directory and a local stdio MCP
+  fixture. The first turn's model request declares `mcp__probe__echo` from
+  `mcp.json`; `--no-mcp` and `--no-extensions` remove it. The runtime exports
+  the test's explicit `agentDir` as `PI_CODING_AGENT_DIR` because Pi's MCP
+  extension resolves its config through `getAgentDir()`, and the test restores
+  the previous value. It uses only a loopback provider and local subprocesses.
 - The map documents assertion coverage; it is not itself proof of strict CLI
-  parity. Post-cutover validation passed: `cd typescript && npm test` (222/222),
+  parity. Post-cutover validation passed: `cd typescript && npm test` (238/238),
   `cd typescript && npm run typecheck`, `go test -race ./...` for retained Go
   packages, and `test/e2e/run.sh --suite both --no-deps --rm` (suite A 17/17,
   suite B 9/9). The Pilish ERT suite uses the TypeScript daemon/bridge and local

@@ -269,6 +269,20 @@ scoped SDK startup completes. Other startup-only environment changes remain
 serialized and restored. This lets extensions locate the embedded Pi package
 without adding a client-facing setting or protocol field.
 
+The same resolved package supplies the CLI's built-in extension registry,
+which the runtime passes to the resource loader as named `builtin: true`
+entries (`llama.cpp`, `codemode`, `tool-search`, `mcp`). SDK sessions therefore
+load, filter, replace, and hide them exactly like a CLI session: `mcp.json` is
+read on `session_start`, `codemode`/`tool_search` are registered inactive for
+MCP to activate, and `--no-extensions`, `--no-mcp`, and `-builtin:<name>`
+apply. The registry is a private package module, so its shape is validated and
+a missing or changed registry falls back to the public built-in factories
+without failing session creation (see the decision log in
+`docs/development.md`). An explicit agent directory is also exported as
+`PI_CODING_AGENT_DIR`, because the built-in MCP extension resolves its config
+through Pi's process-wide `getAgentDir()` rather than the resource loader's
+`agentDir`.
+
 ### 3.2 Ownership invariants
 
 > For a given session file, exactly one `SessionActor` and exactly one Pi SDK
